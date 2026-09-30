@@ -2,7 +2,7 @@ manifestVersion: 1
 id: anjalo-hermes
 category: media
 name: Hermes Music
-version: "1.0.1"
+version: "1.0.2"
 tagline: Request a song and it lands in your music library
 description: >-
   A simple song request page. Anyone on your network types a song name; a helper running
