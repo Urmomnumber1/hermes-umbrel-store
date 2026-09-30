@@ -3,39 +3,66 @@
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Hermes Music</title>
 <link rel="icon" href="https://raw.githubusercontent.com/Urmomnumber1/hermes-umbrel-store/main/anjalo-hermes/icon.png">
 <style>
-:root{color-scheme:dark;--bg:#05080f;--panel:#0a1120;--fg:#cfe0ff;--mut:#5f7aa8;--acc:#3b82f6;--hi:#bfdbfe;--bd:#1b3560}
+:root{color-scheme:dark;--bg:#041a26;--side:#062231;--panel:#02080d;--fg:#d6e6f5;--mut:#5f8aa8;--acc:#3b82f6;--hi:#bfdbfe;--bd:#0f3a52}
 *{box-sizing:border-box}
-body{margin:0;min-height:100vh;background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,"Cascadia Mono",Consolas,Menlo,monospace}
-main{max-width:640px;margin:0 auto;padding:40px 16px}
-h1{margin:0 0 2px;font-size:1.6rem;letter-spacing:.08em;text-transform:uppercase;color:var(--hi)}
-.sub{color:var(--mut);margin:0 0 24px;text-transform:uppercase;letter-spacing:.12em;font-size:.75rem}
-.box{border:1px solid var(--bd);background:var(--panel)}
-form{display:flex;align-items:center;padding:0 0 0 12px}
-form span{color:var(--acc)}
-input{flex:1;min-width:0;padding:14px 10px;border:0;outline:0;background:transparent;color:var(--fg);font:inherit}
+body{margin:0;height:100vh;display:flex;background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,"Cascadia Mono",Consolas,Menlo,monospace}
+aside{width:250px;flex:none;background:var(--side);border-right:1px solid var(--bd);display:flex;flex-direction:column}
+.brand{padding:18px 20px;border-bottom:1px solid var(--bd);font-weight:800;font-size:1.05rem;line-height:1.1;letter-spacing:.06em;color:var(--hi);text-transform:uppercase}
+nav{padding:8px 0;flex:1}
+nav div{padding:11px 20px;letter-spacing:.14em;text-transform:uppercase;font-size:.8rem;color:var(--mut)}
+nav div.on{color:var(--hi);border-left:2px solid var(--acc);background:rgba(59,130,246,.1);padding-left:18px}
+.foot{padding:14px 20px;border-top:1px solid var(--bd);font-size:.75rem;color:var(--mut)}
+.foot b{color:var(--hi);font-weight:600}
+section{flex:1;min-width:0;display:flex;flex-direction:column}
+header{padding:16px 24px;border-bottom:1px solid var(--bd);font-weight:700;letter-spacing:.06em;color:var(--hi)}
+.body{flex:1;overflow:auto;padding:20px 24px}
+.term{background:var(--panel);border:1px solid var(--bd);border-radius:10px;padding:20px;max-width:1000px}
+pre{margin:0 0 6px;font:inherit;font-size:clamp(4px,1vw,10px);line-height:1.15;overflow:hidden;white-space:pre}
+.tag{color:var(--mut);margin:0 0 18px;font-size:.8rem}
+form{display:flex;align-items:center;gap:10px;border-top:1px solid var(--bd);padding-top:14px}
+form span{color:var(--acc);font-weight:700}
+input{flex:1;min-width:0;padding:6px 0;border:0;outline:0;background:transparent;color:var(--fg);font:inherit}
 input::placeholder{color:var(--mut)}
-button{align-self:stretch;padding:0 18px;border:0;border-left:1px solid var(--bd);background:transparent;color:var(--acc);font:inherit;letter-spacing:.1em;text-transform:uppercase;cursor:pointer}
+button{padding:6px 14px;border:1px solid var(--bd);border-radius:6px;background:transparent;color:var(--acc);font:inherit;letter-spacing:.1em;text-transform:uppercase;font-size:.75rem;cursor:pointer}
 button:hover{background:var(--acc);color:#fff}
-#msg{color:var(--mut);min-height:1.5em;margin:10px 0}
-ul{list-style:none;margin:0;padding:0}
-li{display:flex;gap:12px;padding:10px 12px;border-top:1px solid var(--bd)}
-li:first-child{border-top:0}
-.s{flex:none;width:7.5em;text-transform:uppercase;letter-spacing:.08em;font-size:.75rem;padding-top:2px;color:var(--mut)}
+#msg{color:var(--mut);min-height:1.5em;margin:8px 0 0;font-size:.8rem}
+ul{list-style:none;margin:10px 0 0;padding:0}
+li{display:flex;gap:12px;padding:7px 0;border-top:1px solid rgba(15,58,82,.6)}
+.s{flex:none;width:8em;text-transform:uppercase;letter-spacing:.08em;font-size:.72rem;padding-top:2px;color:var(--mut)}
 .done{color:#4ade80}.failed{color:#f87171}.working{color:var(--acc)}
 small{display:block;color:var(--mut)}
-.empty{padding:14px 12px;color:var(--mut)}
-</style></head><body><main>
-<h1>Hermes Music</h1>
-<p class="sub">Request a song</p>
-<div class="box"><form id="f"><span>&#10095;</span><input id="q" placeholder="song name and artist" maxlength="200" required autofocus autocomplete="off"><button>Request</button></form></div>
-<p id="msg"></p>
-<div class="box"><ul id="l"></ul></div>
-</main>
+.empty{color:var(--mut)}
+@media(max-width:760px){aside{display:none}.body{padding:14px}pre{display:none}.m{display:block!important}}
+.m{display:none;font-weight:800;font-size:1.3rem;letter-spacing:.06em;color:var(--hi);margin-bottom:4px}
+</style></head><body>
+<aside>
+  <div class="brand">Hermes<br>Music</div>
+  <nav><div class="on">&gt;_ Requests</div></nav>
+  <div class="foot">Queue: <b id="qc">0</b> waiting<br>Nous Research &middot; Hermes</div>
+</aside>
+<section>
+  <header>Requests</header>
+  <div class="body"><div class="term">
+<div class="m">HERMES-MUSIC</div>
+<pre>
+<span style="color:#bfdbfe;font-weight:700">██╗  ██╗███████╗██████╗ ███╗   ███╗███████╗███████╗      ███╗   ███╗██╗   ██╗███████╗██╗ ██████╗
+██║  ██║██╔════╝██╔══██╗████╗ ████║██╔════╝██╔════╝      ████╗ ████║██║   ██║██╔════╝██║██╔════╝</span>
+<span style="color:#60a5fa">███████║█████╗  ██████╔╝██╔████╔██║█████╗  ███████╗█████╗██╔████╔██║██║   ██║███████╗██║██║
+██╔══██║██╔══╝  ██╔══██╗██║╚██╔╝██║██╔══╝  ╚════██║╚════╝██║╚██╔╝██║██║   ██║╚════██║██║██║</span>
+<span style="color:#3b82f6">██║  ██║███████╗██║  ██║██║ ╚═╝ ██║███████╗███████║      ██║ ╚═╝ ██║╚██████╔╝███████║██║╚██████╗
+╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝╚══════╝╚══════╝      ╚═╝     ╚═╝ ╚═════╝ ╚══════╝╚═╝ ╚═════╝</span></pre>
+    <p class="tag">&#9834; Messenger of the Digital Gods &middot; request a song and it lands in the library</p>
+    <form id="f"><span>&#10095;</span><input id="q" placeholder="song name and artist" maxlength="200" required autofocus autocomplete="off"><button>Request</button></form>
+    <p id="msg"></p>
+    <ul id="l"></ul>
+  </div></div>
+</section>
 <script>
-const l = document.getElementById("l"), msg = document.getElementById("msg"), q = document.getElementById("q");
+const l = document.getElementById("l"), msg = document.getElementById("msg"), q = document.getElementById("q"), qc = document.getElementById("qc");
 const label = { pending: "queued", working: "downloading", done: "added", failed: "failed" };
 async function load() {
   const r = await (await fetch("api/requests")).json();
+  qc.textContent = r.filter((i) => i.status === "pending" || i.status === "working").length;
   l.innerHTML = "";
   if (!r.length) { const e = document.createElement("li"); e.className = "empty"; e.textContent = "No requests yet."; l.append(e); return; }
   for (const i of r) {
