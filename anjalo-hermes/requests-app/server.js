@@ -210,6 +210,76 @@ async function scanLibrary() {
   }
 }
 const inLibrary = (artist, title) => library.keys.has(songKey(artist, title));
+
+// ---------- /duplicate: find copies of the same song, keep the best one ----------
+// Same artist + title AND lengths within 3 seconds. Removed copies are moved to /music/.duplicates (hidden,
+// skipped by the scan and by Navidrome), so nothing is lost until that folder is deleted.
+const TRASH = path.join(MUSIC, ".duplicates");
+let dupPlan = null;
+async function probeInfo(file) {
+  const r = await run("ffprobe", ["-v", "quiet", "-print_format", "json", "-show_entries", "format=duration,bit_rate,size", file], { timeout: 20000 });
+  try { const f = JSON.parse(r.out).format; return { d: Number(f.duration) || 0, br: Number(f.bit_rate) || 0, size: Number(f.size) || 0 }; }
+  catch { return { d: 0, br: 0, size: 0 }; }
+}
+async function scanDuplicates() {
+  if (!library.scanned) throw new Error(library.scanning ? "still scanning the library - try again in a minute" : "the library hasn't been scanned yet");
+  const groups = new Map();
+  for (const [file, c] of Object.entries(libCache)) {
+    const k = songKey(c.a || c.aa, c.t), [a, t] = k.split("|");
+    if (!a || !t) continue;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(file);
+  }
+  const plan = [];
+  for (const files of groups.values()) {
+    if (files.length < 2 || files.length > 25) continue; // 25+ "copies" is a tagging problem, not duplicates
+    const info = [];
+    for (const f of files) if (fs.existsSync(f)) info.push({ f, ...(await probeInfo(f)) });
+    info.sort((x, y) => x.d - y.d);
+    let cluster = [];
+    const flush = () => {
+      if (cluster.length > 1) {
+        cluster.sort((x, y) => (y.br - x.br) || (y.size - x.size)); // keep the highest bitrate, then the biggest file
+        plan.push({ keep: cluster[0], remove: cluster.slice(1) });
+      }
+      cluster = [];
+    };
+    for (const x of info) {
+      if (cluster.length && (!x.d || !cluster[0].d || x.d - cluster[0].d > 3)) flush();
+      cluster.push(x);
+    }
+    flush();
+  }
+  dupPlan = { at: Date.now(), plan };
+  return plan;
+}
+function removeDuplicates() {
+  if (!dupPlan || Date.now() - dupPlan.at > 30 * 60 * 1000) throw new Error("run /duplicate first (the last check is missing or older than 30 minutes)");
+  let moved = 0;
+  const failed = [];
+  for (const g of dupPlan.plan) {
+    for (const x of g.remove) {
+      const rel = path.relative(MUSIC, x.f);
+      if (rel.startsWith("..")) continue;
+      const to = path.join(TRASH, rel);
+      try {
+        fs.mkdirSync(path.dirname(to), { recursive: true });
+        fs.renameSync(x.f, to); // same disk, so this is a move, not a copy
+        delete libCache[x.f];
+        moved++;
+        for (let d = path.dirname(x.f); d.startsWith(MUSIC + "/") && d !== MUSIC; d = path.dirname(d)) { // tidy now-empty folders
+          try { fs.rmdirSync(d); } catch { break; }
+        }
+      } catch (e) {
+        failed.push(`${rel}: ${e.code || e.message}`);
+      }
+    }
+  }
+  fs.writeFileSync(LIBCACHE, JSON.stringify(libCache));
+  library.files = Object.keys(libCache).length;
+  dupPlan = null;
+  return { moved, failed };
+}
 setInterval(() => { if (ready() && Date.now() - library.lastScan > 30 * 60 * 1000) scanLibrary(); }, 20000);
 
 // ---------- iTunes (free, no key) ----------
@@ -300,7 +370,7 @@ async function deezerArtist(item, id, name) {
   // no track counts in this list: a "Deluxe"/expanded edition stands in for "more tracks"
   const pick = newestAlbums(wanted, (a) => a.title, (a) => (/deluxe|expanded|complete|edition/i.test(a.title) ? 1 : 0), (a) => a.release_date);
   if (!pick.length) return { status: "failed", note: "no albums found (try enabling singles & EPs in Config)" };
-  insertChildren(item, pick.map((a) => ({ type: "album", query: a.title, deezerId: a.id })));
+  insertChildren(item, pick.map((a) => ({ type: "album", query: a.title, deezerId: a.id, kind: dzReleaseType(a) })));
   return { status: "working", artist: name, title: `${pick.length} release${pick.length === 1 ? "" : "s"}` };
 }
 
@@ -706,7 +776,7 @@ async function expandArtist(item) {
     .sort((a, b) => (b.collectionExplicitness === "explicit") - (a.collectionExplicitness === "explicit")); // explicit edition wins ties
   const pick = newestAlbums(albums, (c) => c.collectionName, (c) => c.trackCount, (c) => c.releaseDate);
   if (!pick.length) return { status: "failed", note: "no albums found (try enabling singles & EPs in Config)" };
-  insertChildren(item, pick.map((c) => ({ type: "album", query: c.collectionName, collectionId: c.collectionId })));
+  insertChildren(item, pick.map((c) => ({ type: "album", query: c.collectionName, collectionId: c.collectionId, kind: releaseType(c.collectionName) })));
   return { status: "working", artist: artist.artistName, title: `${pick.length} release${pick.length === 1 ? "" : "s"}` };
 }
 
@@ -803,6 +873,24 @@ http.createServer(async (req, res) => {
   }
 
   if (get && p === "/api/config") return send(res, 200, publicConfig());
+  if (post && p === "/api/duplicates/scan") {
+    try {
+      const plan = await scanDuplicates();
+      const kbps = (x) => (x.br ? Math.round(x.br / 1000) + " kbps" : "");
+      return send(res, 200, {
+        groups: plan.length, files: plan.reduce((n, g) => n + g.remove.length, 0),
+        list: plan.slice(0, 60).map((g) => ({
+          keep: { path: path.relative(MUSIC, g.keep.f), kbps: kbps(g.keep) },
+          remove: g.remove.map((x) => ({ path: path.relative(MUSIC, x.f), kbps: kbps(x) })),
+        })),
+      });
+    } catch (e) { return send(res, 400, { error: e.message }); }
+  }
+  if (post && p === "/api/duplicates/remove") {
+    const b = await readBody(req);
+    if (config.pin && String(b.currentPin || "") !== config.pin) return send(res, 403, { error: "wrong PIN - use /duplicate confirm YOURPIN" });
+    try { return send(res, 200, removeDuplicates()); } catch (e) { return send(res, 400, { error: e.message }); }
+  }
   if (get && p === "/api/downtify/test") { // checks the address, the login and the shared folder
     try {
       const h = await fetch(`${dtBase()}/api/health`, { signal: AbortSignal.timeout(10000) }).catch(() => null);
@@ -821,6 +909,16 @@ http.createServer(async (req, res) => {
     const list = items.filter((i) => !i.parent).slice(-50).reverse().map(({ id, type, query, status, title, artist, note, created }) => {
       const r = { id, type: type || "song", query, status, title, artist, note, created };
       if (r.type !== "song") r.progress = songStats(id);
+      if (r.type === "artist") { // how many albums / EPs / singles are finished
+        r.releases = {};
+        for (const k of items) {
+          if (k.parent !== id || k.type !== "album") continue;
+          const s = (r.releases[k.kind || "album"] ??= { done: 0, failed: 0, total: 0 });
+          s.total++;
+          if (k.status === "done") s.done++;
+          else if (k.status === "failed") s.failed++;
+        }
+      }
       return r;
     });
     return send(res, 200, list);

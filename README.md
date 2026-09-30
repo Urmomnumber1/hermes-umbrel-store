@@ -20,6 +20,8 @@ Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbr
 ## Using it
 - Type a song name (add the artist for best results).
 - `/album NAME` downloads a whole album, `/artist NAME` an artist's albums (limits in Config).
+- `/duplicate` lists copies of the same song (same artist, title and length) and keeps the best-quality one;
+  `/duplicate confirm` (plus your PIN, if set) moves the extras to the hidden `.duplicates` folder in your music folder.
 - Songs already in the music folder are skipped: the app indexes the folder's tags on start and every 30 minutes.
 - Tags and covers come from iTunes or Deezer; songs neither knows are saved as singles named after the song.
 
