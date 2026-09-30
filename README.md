@@ -1,19 +1,22 @@
 # Hermes Music (Umbrel community app store)
 
-Anyone on your network requests a song on a web page; Claude Code (on your PC) finds it,
-downloads it, and copies it to your Umbrel music library so Navidrome / Feishin can play it.
+A song request page that runs entirely on your Umbrel. Anyone on your network requests a song,
+Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbrel music folder
+(`Downloads/music`), where Navidrome picks it up for Feishin.
 
-## Pieces
-- `anjalo-hermes/` - the Umbrel app (request page + queue, port 3340). Install it from the community store.
-- `worker/song-worker.ps1` - runs on your PC. Uses `claude -p` (your Claude Code login) to identify each song,
-  then yt-dlp downloads it and scp copies it to `~/umbrel/data/storage/downloads/music`.
-- `worker/setup-ssh.ps1` - one-time SSH key setup so the copy needs no password.
+## Setup
+1. Add this repo as a community app store in Umbrel and install **Hermes Music**.
+2. Open it (or `http://<umbrel-ip>:3340`). The first start installs ffmpeg, yt-dlp and Claude Code
+   in the background; the Worker line shows when it's ready.
+3. Open **Config** and pick a provider:
+   - **Claude Code**: on any computer with Claude Code, run `claude setup-token`, then paste the token
+     into Config. Uses your Claude subscription.
+   - **Local model**: enter your OpenAI-compatible server's base URL (for example `http://<umbrel-ip>:11434/v1`
+     for Ollama) and model name.
+4. Set a PIN in Config so only you can change settings.
+5. Make sure Navidrome's music folder is `Downloads/music`.
 
-## Setup (PC)
-1. Install yt-dlp and ffmpeg: `winget install yt-dlp.yt-dlp` and `winget install Gyan.FFmpeg`
-2. `powershell -ExecutionPolicy Bypass -File worker\setup-ssh.ps1` (enter your Umbrel password once)
-3. `powershell -ExecutionPolicy Bypass -File worker\song-worker.ps1` and leave it running.
-
-The PC must be on for songs to be picked up; requests wait in the queue otherwise.
-Only download music you're entitled to; ripping from YouTube may violate its terms and copyright law where you live.
-The worker endpoints on the request page are not password protected (LAN only); do not expose port 3340 to the internet.
+## Notes
+- The page has no login (guests use it); keep port 3340 off the internet.
+- Secrets (Claude token, API key) are stored in the app's data folder on the Umbrel and never sent to the page.
+- Only download music you're entitled to; ripping from YouTube may violate its terms and copyright law where you live.

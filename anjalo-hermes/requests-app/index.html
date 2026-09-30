@@ -3,81 +3,268 @@
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Hermes Music</title>
 <link rel="icon" href="https://raw.githubusercontent.com/Urmomnumber1/hermes-umbrel-store/main/anjalo-hermes/icon.png">
 <style>
-:root{color-scheme:dark;--bg:#041a26;--side:#062231;--panel:#02080d;--fg:#d6e6f5;--mut:#5f8aa8;--acc:#3b82f6;--hi:#bfdbfe;--bd:#0f3a52}
+:root{color-scheme:dark;--bg:#041a26;--side:#062231;--panel:#02080d;--fg:#d6e6f5;--mut:#5f8aa8;--acc:#3b82f6;--hi:#bfdbfe;--bd:#0f3a52;--box:#1d4f8f}
 *{box-sizing:border-box}
 body{margin:0;height:100vh;display:flex;background:var(--bg);color:var(--fg);font:14px/1.5 ui-monospace,"Cascadia Mono",Consolas,Menlo,monospace}
 aside{width:250px;flex:none;background:var(--side);border-right:1px solid var(--bd);display:flex;flex-direction:column}
 .brand{padding:18px 20px;border-bottom:1px solid var(--bd);font-weight:800;font-size:1.05rem;line-height:1.1;letter-spacing:.06em;color:var(--hi);text-transform:uppercase}
 nav{padding:8px 0;flex:1}
-nav div{padding:11px 20px;letter-spacing:.14em;text-transform:uppercase;font-size:.8rem;color:var(--mut)}
-nav div.on{color:var(--hi);border-left:2px solid var(--acc);background:rgba(59,130,246,.1);padding-left:18px}
+nav a{display:block;padding:11px 20px;letter-spacing:.14em;text-transform:uppercase;font-size:.8rem;color:var(--mut);cursor:pointer;text-decoration:none}
+nav a:hover{color:var(--hi)}
+nav a.on{color:var(--hi);border-left:2px solid var(--acc);background:rgba(59,130,246,.1);padding-left:18px}
 .foot{padding:14px 20px;border-top:1px solid var(--bd);font-size:.75rem;color:var(--mut)}
 .foot b{color:var(--hi);font-weight:600}
 section{flex:1;min-width:0;display:flex;flex-direction:column}
 header{padding:16px 24px;border-bottom:1px solid var(--bd);font-weight:700;letter-spacing:.06em;color:var(--hi)}
 .body{flex:1;overflow:auto;padding:20px 24px}
 .term{background:var(--panel);border:1px solid var(--bd);border-radius:10px;padding:20px;max-width:1000px}
-.logo{display:block;width:100%;max-width:720px;height:auto;margin:0 0 10px}
-.tag{color:var(--mut);margin:0 0 18px;font-size:.8rem}
-form{display:flex;align-items:center;gap:10px;border-top:1px solid var(--bd);padding-top:14px}
-form span{color:var(--acc);font-weight:700}
-input{flex:1;min-width:0;padding:6px 0;border:0;outline:0;background:transparent;color:var(--fg);font:inherit}
+.logo{display:block;width:100%;max-width:720px;height:auto;margin:0 0 14px}
+.m{display:none;font-weight:800;font-size:1.3rem;letter-spacing:.06em;color:var(--hi);margin-bottom:10px}
+
+/* welcome box */
+.welcome{border:1px solid var(--box);border-radius:6px;padding:16px 20px;display:grid;grid-template-columns:210px 1fr;gap:24px;margin-bottom:18px}
+.art{display:block;width:170px;height:auto;margin:0 auto 10px}
+.lft{font-size:.78rem;color:var(--mut);word-break:break-word}
+.lft b{color:var(--hi);font-weight:600}
+.rt h2{margin:0 0 10px;font-size:.95rem;text-align:center;color:var(--hi);letter-spacing:.03em}
+.rt .sec{margin-top:8px}
+.rt .k{color:var(--hi);font-weight:700}
+.rt .d{color:var(--mut)}
+.on-dot{color:#4ade80}.off-dot{color:#f87171}
+
+/* terminal log + prompt */
+#log{margin:0;font-size:.9rem}
+.ln{display:flex;gap:10px;padding:1px 0;white-space:pre-wrap;word-break:break-word}
+.t{color:var(--mut);flex:none}
+.s{flex:none;min-width:8.5em;color:var(--mut)}
+.pending .s{color:var(--mut)}.working .s{color:var(--acc)}.done .s{color:#4ade80}.failed .s{color:#f87171}
+.sys{color:var(--mut)}.echo{color:var(--fg)}.echo::before{content:"\276F  ";color:var(--acc);font-weight:700}
+.ok{color:#4ade80}.err{color:#f87171}
+small{color:var(--mut)}
+form.prompt{display:flex;align-items:center;gap:10px;margin-top:8px;border-top:1px solid var(--bd);padding-top:12px}
+form.prompt span{color:var(--acc);font-weight:700}
+form.prompt input{flex:1;min-width:0;padding:4px 0;border:0;outline:0;background:transparent;color:var(--fg);font:inherit;caret-color:var(--acc)}
 input::placeholder{color:var(--mut)}
-button{padding:6px 14px;border:1px solid var(--bd);border-radius:6px;background:transparent;color:var(--acc);font:inherit;letter-spacing:.1em;text-transform:uppercase;font-size:.75rem;cursor:pointer}
-button:hover{background:var(--acc);color:#fff}
-#msg{color:var(--mut);min-height:1.5em;margin:8px 0 0;font-size:.8rem}
-ul{list-style:none;margin:10px 0 0;padding:0}
-li{display:flex;gap:12px;padding:7px 0;border-top:1px solid rgba(15,58,82,.6)}
-.s{flex:none;width:8em;text-transform:uppercase;letter-spacing:.08em;font-size:.72rem;padding-top:2px;color:var(--mut)}
-.done{color:#4ade80}.failed{color:#f87171}.working{color:var(--acc)}
-small{display:block;color:var(--mut)}
-.empty{color:var(--mut)}
-@media(max-width:760px){aside{display:none}.body{padding:14px}.logo{display:none}.m{display:block!important}}
-.m{display:none;font-weight:800;font-size:1.3rem;letter-spacing:.06em;color:var(--hi);margin-bottom:4px}
+.hint{margin:8px 0 0;color:var(--mut);font-size:.75rem}
+
+/* config */
+.cfg h3{margin:0 0 4px;color:var(--hi);letter-spacing:.06em}
+.cfg p{margin:0 0 16px;color:var(--mut);font-size:.8rem}
+.row{display:flex;align-items:center;gap:12px;padding:9px 0;border-top:1px solid var(--bd)}
+.row label{width:15em;flex:none;color:var(--hi)}
+.row small{display:block}
+.grp{margin:20px 0 2px;color:var(--hi);font-weight:700;letter-spacing:.04em}
+input[type=text],input[type=password]{width:24em;max-width:100%}
+select,input[type=number],input[type=text],input[type=password]{background:transparent;color:var(--fg);border:1px solid var(--bd);border-radius:4px;padding:5px 8px;font:inherit}
+select option{background:#02080d}
+input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
+.btn{margin-top:14px;padding:6px 16px;border:1px solid var(--acc);border-radius:6px;background:transparent;color:var(--acc);font:inherit;letter-spacing:.1em;text-transform:uppercase;font-size:.75rem;cursor:pointer}
+.btn:hover{background:var(--acc);color:#fff}
+#cfgmsg{margin-left:12px;font-size:.8rem;color:#4ade80}
+
+@media(max-width:760px){
+  aside{display:none}.body{padding:12px}.logo{display:none}.m{display:block}
+  .welcome{grid-template-columns:1fr}.art{width:110px}
+  .row{flex-wrap:wrap}.row label{width:100%}
+}
 </style></head><body>
 <aside>
   <div class="brand">Hermes<br>Music</div>
-  <nav><div class="on">&gt;_ Requests</div></nav>
+  <nav>
+    <a data-tab="req" class="on">&gt;_ Requests</a>
+    <a data-tab="cfg">&#9881; Config</a>
+  </nav>
   <div class="foot">Queue: <b id="qc">0</b> waiting<br>Nous Research &middot; Hermes</div>
 </aside>
 <section>
-  <header>Requests</header>
-  <div class="body"><div class="term">
-<div class="m">HERMES-MUSIC</div>
-<svg class="logo" viewBox="0 0 71 7" shape-rendering="crispEdges" role="img" aria-label="Hermes Music"><rect x="0" y="0" width="1" height="1" fill="#bfdbfe"/><rect x="4" y="0" width="1" height="1" fill="#bfdbfe"/><rect x="6" y="0" width="5" height="1" fill="#bfdbfe"/><rect x="12" y="0" width="4" height="1" fill="#bfdbfe"/><rect x="18" y="0" width="1" height="1" fill="#bfdbfe"/><rect x="22" y="0" width="1" height="1" fill="#bfdbfe"/><rect x="24" y="0" width="5" height="1" fill="#bfdbfe"/><rect x="31" y="0" width="4" height="1" fill="#bfdbfe"/><rect x="42" y="0" width="1" height="1" fill="#bfdbfe"/><rect x="46" y="0" width="1" height="1" fill="#bfdbfe"/><rect x="48" y="0" width="1" height="1" fill="#bfdbfe"/><rect x="52" y="0" width="1" height="1" fill="#bfdbfe"/><rect x="55" y="0" width="4" height="1" fill="#bfdbfe"/><rect x="60" y="0" width="5" height="1" fill="#bfdbfe"/><rect x="67" y="0" width="3" height="1" fill="#bfdbfe"/><rect x="0" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="4" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="6" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="12" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="16" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="18" y="1" width="2" height="1" fill="#bfdbfe"/><rect x="21" y="1" width="2" height="1" fill="#bfdbfe"/><rect x="24" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="30" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="42" y="1" width="2" height="1" fill="#bfdbfe"/><rect x="45" y="1" width="2" height="1" fill="#bfdbfe"/><rect x="48" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="52" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="54" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="62" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="66" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="70" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="0" y="2" width="1" height="1" fill="#60a5fa"/><rect x="4" y="2" width="1" height="1" fill="#60a5fa"/><rect x="6" y="2" width="1" height="1" fill="#60a5fa"/><rect x="12" y="2" width="1" height="1" fill="#60a5fa"/><rect x="16" y="2" width="1" height="1" fill="#60a5fa"/><rect x="18" y="2" width="1" height="1" fill="#60a5fa"/><rect x="20" y="2" width="1" height="1" fill="#60a5fa"/><rect x="22" y="2" width="1" height="1" fill="#60a5fa"/><rect x="24" y="2" width="1" height="1" fill="#60a5fa"/><rect x="30" y="2" width="1" height="1" fill="#60a5fa"/><rect x="42" y="2" width="1" height="1" fill="#60a5fa"/><rect x="44" y="2" width="1" height="1" fill="#60a5fa"/><rect x="46" y="2" width="1" height="1" fill="#60a5fa"/><rect x="48" y="2" width="1" height="1" fill="#60a5fa"/><rect x="52" y="2" width="1" height="1" fill="#60a5fa"/><rect x="54" y="2" width="1" height="1" fill="#60a5fa"/><rect x="62" y="2" width="1" height="1" fill="#60a5fa"/><rect x="66" y="2" width="1" height="1" fill="#60a5fa"/><rect x="0" y="3" width="5" height="1" fill="#60a5fa"/><rect x="6" y="3" width="4" height="1" fill="#60a5fa"/><rect x="12" y="3" width="4" height="1" fill="#60a5fa"/><rect x="18" y="3" width="1" height="1" fill="#60a5fa"/><rect x="20" y="3" width="1" height="1" fill="#60a5fa"/><rect x="22" y="3" width="1" height="1" fill="#60a5fa"/><rect x="24" y="3" width="4" height="1" fill="#60a5fa"/><rect x="31" y="3" width="3" height="1" fill="#60a5fa"/><rect x="36" y="3" width="5" height="1" fill="#60a5fa"/><rect x="42" y="3" width="1" height="1" fill="#60a5fa"/><rect x="44" y="3" width="1" height="1" fill="#60a5fa"/><rect x="46" y="3" width="1" height="1" fill="#60a5fa"/><rect x="48" y="3" width="1" height="1" fill="#60a5fa"/><rect x="52" y="3" width="1" height="1" fill="#60a5fa"/><rect x="55" y="3" width="3" height="1" fill="#60a5fa"/><rect x="62" y="3" width="1" height="1" fill="#60a5fa"/><rect x="66" y="3" width="1" height="1" fill="#60a5fa"/><rect x="0" y="4" width="1" height="1" fill="#3b82f6"/><rect x="4" y="4" width="1" height="1" fill="#3b82f6"/><rect x="6" y="4" width="1" height="1" fill="#3b82f6"/><rect x="12" y="4" width="1" height="1" fill="#3b82f6"/><rect x="14" y="4" width="1" height="1" fill="#3b82f6"/><rect x="18" y="4" width="1" height="1" fill="#3b82f6"/><rect x="22" y="4" width="1" height="1" fill="#3b82f6"/><rect x="24" y="4" width="1" height="1" fill="#3b82f6"/><rect x="34" y="4" width="1" height="1" fill="#3b82f6"/><rect x="42" y="4" width="1" height="1" fill="#3b82f6"/><rect x="46" y="4" width="1" height="1" fill="#3b82f6"/><rect x="48" y="4" width="1" height="1" fill="#3b82f6"/><rect x="52" y="4" width="1" height="1" fill="#3b82f6"/><rect x="58" y="4" width="1" height="1" fill="#3b82f6"/><rect x="62" y="4" width="1" height="1" fill="#3b82f6"/><rect x="66" y="4" width="1" height="1" fill="#3b82f6"/><rect x="0" y="5" width="1" height="1" fill="#3b82f6"/><rect x="4" y="5" width="1" height="1" fill="#3b82f6"/><rect x="6" y="5" width="1" height="1" fill="#3b82f6"/><rect x="12" y="5" width="1" height="1" fill="#3b82f6"/><rect x="15" y="5" width="1" height="1" fill="#3b82f6"/><rect x="18" y="5" width="1" height="1" fill="#3b82f6"/><rect x="22" y="5" width="1" height="1" fill="#3b82f6"/><rect x="24" y="5" width="1" height="1" fill="#3b82f6"/><rect x="34" y="5" width="1" height="1" fill="#3b82f6"/><rect x="42" y="5" width="1" height="1" fill="#3b82f6"/><rect x="46" y="5" width="1" height="1" fill="#3b82f6"/><rect x="48" y="5" width="1" height="1" fill="#3b82f6"/><rect x="52" y="5" width="1" height="1" fill="#3b82f6"/><rect x="58" y="5" width="1" height="1" fill="#3b82f6"/><rect x="62" y="5" width="1" height="1" fill="#3b82f6"/><rect x="66" y="5" width="1" height="1" fill="#3b82f6"/><rect x="70" y="5" width="1" height="1" fill="#3b82f6"/><rect x="0" y="6" width="1" height="1" fill="#3b82f6"/><rect x="4" y="6" width="1" height="1" fill="#3b82f6"/><rect x="6" y="6" width="5" height="1" fill="#3b82f6"/><rect x="12" y="6" width="1" height="1" fill="#3b82f6"/><rect x="16" y="6" width="1" height="1" fill="#3b82f6"/><rect x="18" y="6" width="1" height="1" fill="#3b82f6"/><rect x="22" y="6" width="1" height="1" fill="#3b82f6"/><rect x="24" y="6" width="5" height="1" fill="#3b82f6"/><rect x="30" y="6" width="4" height="1" fill="#3b82f6"/><rect x="42" y="6" width="1" height="1" fill="#3b82f6"/><rect x="46" y="6" width="1" height="1" fill="#3b82f6"/><rect x="49" y="6" width="3" height="1" fill="#3b82f6"/><rect x="54" y="6" width="4" height="1" fill="#3b82f6"/><rect x="60" y="6" width="5" height="1" fill="#3b82f6"/><rect x="67" y="6" width="3" height="1" fill="#3b82f6"/></svg>
-    <p class="tag">&#9834; Messenger of the Digital Gods &middot; request a song and it lands in the library</p>
-    <form id="f"><span>&#10095;</span><input id="q" placeholder="song name and artist" maxlength="200" required autofocus autocomplete="off"><button>Request</button></form>
-    <p id="msg"></p>
-    <ul id="l"></ul>
-  </div></div>
+  <header id="title">Requests</header>
+  <div class="body">
+
+    <div class="term" id="v-req">
+      <div class="m">HERMES-MUSIC</div>
+      <svg class="logo" viewBox="0 0 71 7" shape-rendering="crispEdges" role="img" aria-label="Hermes Music"><rect x="0" y="0" width="1" height="1" fill="#bfdbfe"/><rect x="4" y="0" width="1" height="1" fill="#bfdbfe"/><rect x="6" y="0" width="5" height="1" fill="#bfdbfe"/><rect x="12" y="0" width="4" height="1" fill="#bfdbfe"/><rect x="18" y="0" width="1" height="1" fill="#bfdbfe"/><rect x="22" y="0" width="1" height="1" fill="#bfdbfe"/><rect x="24" y="0" width="5" height="1" fill="#bfdbfe"/><rect x="31" y="0" width="4" height="1" fill="#bfdbfe"/><rect x="42" y="0" width="1" height="1" fill="#bfdbfe"/><rect x="46" y="0" width="1" height="1" fill="#bfdbfe"/><rect x="48" y="0" width="1" height="1" fill="#bfdbfe"/><rect x="52" y="0" width="1" height="1" fill="#bfdbfe"/><rect x="55" y="0" width="4" height="1" fill="#bfdbfe"/><rect x="60" y="0" width="5" height="1" fill="#bfdbfe"/><rect x="67" y="0" width="3" height="1" fill="#bfdbfe"/><rect x="0" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="4" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="6" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="12" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="16" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="18" y="1" width="2" height="1" fill="#bfdbfe"/><rect x="21" y="1" width="2" height="1" fill="#bfdbfe"/><rect x="24" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="30" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="42" y="1" width="2" height="1" fill="#bfdbfe"/><rect x="45" y="1" width="2" height="1" fill="#bfdbfe"/><rect x="48" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="52" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="54" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="62" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="66" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="70" y="1" width="1" height="1" fill="#bfdbfe"/><rect x="0" y="2" width="1" height="1" fill="#60a5fa"/><rect x="4" y="2" width="1" height="1" fill="#60a5fa"/><rect x="6" y="2" width="1" height="1" fill="#60a5fa"/><rect x="12" y="2" width="1" height="1" fill="#60a5fa"/><rect x="16" y="2" width="1" height="1" fill="#60a5fa"/><rect x="18" y="2" width="1" height="1" fill="#60a5fa"/><rect x="20" y="2" width="1" height="1" fill="#60a5fa"/><rect x="22" y="2" width="1" height="1" fill="#60a5fa"/><rect x="24" y="2" width="1" height="1" fill="#60a5fa"/><rect x="30" y="2" width="1" height="1" fill="#60a5fa"/><rect x="42" y="2" width="1" height="1" fill="#60a5fa"/><rect x="44" y="2" width="1" height="1" fill="#60a5fa"/><rect x="46" y="2" width="1" height="1" fill="#60a5fa"/><rect x="48" y="2" width="1" height="1" fill="#60a5fa"/><rect x="52" y="2" width="1" height="1" fill="#60a5fa"/><rect x="54" y="2" width="1" height="1" fill="#60a5fa"/><rect x="62" y="2" width="1" height="1" fill="#60a5fa"/><rect x="66" y="2" width="1" height="1" fill="#60a5fa"/><rect x="0" y="3" width="5" height="1" fill="#60a5fa"/><rect x="6" y="3" width="4" height="1" fill="#60a5fa"/><rect x="12" y="3" width="4" height="1" fill="#60a5fa"/><rect x="18" y="3" width="1" height="1" fill="#60a5fa"/><rect x="20" y="3" width="1" height="1" fill="#60a5fa"/><rect x="22" y="3" width="1" height="1" fill="#60a5fa"/><rect x="24" y="3" width="4" height="1" fill="#60a5fa"/><rect x="31" y="3" width="3" height="1" fill="#60a5fa"/><rect x="36" y="3" width="5" height="1" fill="#60a5fa"/><rect x="42" y="3" width="1" height="1" fill="#60a5fa"/><rect x="44" y="3" width="1" height="1" fill="#60a5fa"/><rect x="46" y="3" width="1" height="1" fill="#60a5fa"/><rect x="48" y="3" width="1" height="1" fill="#60a5fa"/><rect x="52" y="3" width="1" height="1" fill="#60a5fa"/><rect x="55" y="3" width="3" height="1" fill="#60a5fa"/><rect x="62" y="3" width="1" height="1" fill="#60a5fa"/><rect x="66" y="3" width="1" height="1" fill="#60a5fa"/><rect x="0" y="4" width="1" height="1" fill="#3b82f6"/><rect x="4" y="4" width="1" height="1" fill="#3b82f6"/><rect x="6" y="4" width="1" height="1" fill="#3b82f6"/><rect x="12" y="4" width="1" height="1" fill="#3b82f6"/><rect x="14" y="4" width="1" height="1" fill="#3b82f6"/><rect x="18" y="4" width="1" height="1" fill="#3b82f6"/><rect x="22" y="4" width="1" height="1" fill="#3b82f6"/><rect x="24" y="4" width="1" height="1" fill="#3b82f6"/><rect x="34" y="4" width="1" height="1" fill="#3b82f6"/><rect x="42" y="4" width="1" height="1" fill="#3b82f6"/><rect x="46" y="4" width="1" height="1" fill="#3b82f6"/><rect x="48" y="4" width="1" height="1" fill="#3b82f6"/><rect x="52" y="4" width="1" height="1" fill="#3b82f6"/><rect x="58" y="4" width="1" height="1" fill="#3b82f6"/><rect x="62" y="4" width="1" height="1" fill="#3b82f6"/><rect x="66" y="4" width="1" height="1" fill="#3b82f6"/><rect x="0" y="5" width="1" height="1" fill="#3b82f6"/><rect x="4" y="5" width="1" height="1" fill="#3b82f6"/><rect x="6" y="5" width="1" height="1" fill="#3b82f6"/><rect x="12" y="5" width="1" height="1" fill="#3b82f6"/><rect x="15" y="5" width="1" height="1" fill="#3b82f6"/><rect x="18" y="5" width="1" height="1" fill="#3b82f6"/><rect x="22" y="5" width="1" height="1" fill="#3b82f6"/><rect x="24" y="5" width="1" height="1" fill="#3b82f6"/><rect x="34" y="5" width="1" height="1" fill="#3b82f6"/><rect x="42" y="5" width="1" height="1" fill="#3b82f6"/><rect x="46" y="5" width="1" height="1" fill="#3b82f6"/><rect x="48" y="5" width="1" height="1" fill="#3b82f6"/><rect x="52" y="5" width="1" height="1" fill="#3b82f6"/><rect x="58" y="5" width="1" height="1" fill="#3b82f6"/><rect x="62" y="5" width="1" height="1" fill="#3b82f6"/><rect x="66" y="5" width="1" height="1" fill="#3b82f6"/><rect x="70" y="5" width="1" height="1" fill="#3b82f6"/><rect x="0" y="6" width="1" height="1" fill="#3b82f6"/><rect x="4" y="6" width="1" height="1" fill="#3b82f6"/><rect x="6" y="6" width="5" height="1" fill="#3b82f6"/><rect x="12" y="6" width="1" height="1" fill="#3b82f6"/><rect x="16" y="6" width="1" height="1" fill="#3b82f6"/><rect x="18" y="6" width="1" height="1" fill="#3b82f6"/><rect x="22" y="6" width="1" height="1" fill="#3b82f6"/><rect x="24" y="6" width="5" height="1" fill="#3b82f6"/><rect x="30" y="6" width="4" height="1" fill="#3b82f6"/><rect x="42" y="6" width="1" height="1" fill="#3b82f6"/><rect x="46" y="6" width="1" height="1" fill="#3b82f6"/><rect x="49" y="6" width="3" height="1" fill="#3b82f6"/><rect x="54" y="6" width="4" height="1" fill="#3b82f6"/><rect x="60" y="6" width="5" height="1" fill="#3b82f6"/><rect x="67" y="6" width="3" height="1" fill="#3b82f6"/></svg>
+      <div class="welcome">
+        <div class="lft">
+          <svg class="art" viewBox="0 0 54 54" role="img" aria-label="Hermes"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#dbeafe"/><stop offset="1" stop-color="#3b82f6"/></linearGradient></defs><g fill="url(#g)"><circle cx="18.5" cy="0.5" r=".42"/><circle cx="19.5" cy="0.5" r=".42"/><circle cx="20.5" cy="0.5" r=".42"/><circle cx="21.5" cy="0.5" r=".42"/><circle cx="25.5" cy="0.5" r=".42"/><circle cx="26.5" cy="0.5" r=".42"/><circle cx="27.5" cy="0.5" r=".42"/><circle cx="28.5" cy="0.5" r=".42"/><circle cx="32.5" cy="0.5" r=".42"/><circle cx="33.5" cy="0.5" r=".42"/><circle cx="34.5" cy="0.5" r=".42"/><circle cx="35.5" cy="0.5" r=".42"/><circle cx="10.5" cy="4.5" r=".42"/><circle cx="12.5" cy="3.5" r=".42"/><circle cx="11.5" cy="4.5" r=".42"/><circle cx="12.5" cy="4.5" r=".42"/><circle cx="13.5" cy="3.5" r=".42"/><circle cx="14.5" cy="2.5" r=".42"/><circle cx="14.5" cy="3.5" r=".42"/><circle cx="13.5" cy="4.5" r=".42"/><circle cx="14.5" cy="4.5" r=".42"/><circle cx="15.5" cy="2.5" r=".42"/><circle cx="15.5" cy="3.5" r=".42"/><circle cx="16.5" cy="1.5" r=".42"/><circle cx="16.5" cy="2.5" r=".42"/><circle cx="16.5" cy="3.5" r=".42"/><circle cx="15.5" cy="4.5" r=".42"/><circle cx="16.5" cy="4.5" r=".42"/><circle cx="17.5" cy="1.5" r=".42"/><circle cx="17.5" cy="2.5" r=".42"/><circle cx="17.5" cy="3.5" r=".42"/><circle cx="18.5" cy="1.5" r=".42"/><circle cx="18.5" cy="2.5" r=".42"/><circle cx="18.5" cy="3.5" r=".42"/><circle cx="17.5" cy="4.5" r=".42"/><circle cx="18.5" cy="4.5" r=".42"/><circle cx="19.5" cy="1.5" r=".42"/><circle cx="19.5" cy="2.5" r=".42"/><circle cx="19.5" cy="3.5" r=".42"/><circle cx="20.5" cy="1.5" r=".42"/><circle cx="20.5" cy="2.5" r=".42"/><circle cx="20.5" cy="3.5" r=".42"/><circle cx="19.5" cy="4.5" r=".42"/><circle cx="20.5" cy="4.5" r=".42"/><circle cx="21.5" cy="1.5" r=".42"/><circle cx="21.5" cy="2.5" r=".42"/><circle cx="21.5" cy="3.5" r=".42"/><circle cx="21.5" cy="4.5" r=".42"/><circle cx="22.5" cy="4.5" r=".42"/><circle cx="24.5" cy="1.5" r=".42"/><circle cx="24.5" cy="2.5" r=".42"/><circle cx="24.5" cy="3.5" r=".42"/><circle cx="25.5" cy="1.5" r=".42"/><circle cx="25.5" cy="2.5" r=".42"/><circle cx="25.5" cy="3.5" r=".42"/><circle cx="26.5" cy="1.5" r=".42"/><circle cx="26.5" cy="2.5" r=".42"/><circle cx="26.5" cy="3.5" r=".42"/><circle cx="25.5" cy="4.5" r=".42"/><circle cx="26.5" cy="4.5" r=".42"/><circle cx="27.5" cy="1.5" r=".42"/><circle cx="27.5" cy="2.5" r=".42"/><circle cx="27.5" cy="3.5" r=".42"/><circle cx="28.5" cy="1.5" r=".42"/><circle cx="28.5" cy="2.5" r=".42"/><circle cx="28.5" cy="3.5" r=".42"/><circle cx="27.5" cy="4.5" r=".42"/><circle cx="28.5" cy="4.5" r=".42"/><circle cx="29.5" cy="1.5" r=".42"/><circle cx="29.5" cy="2.5" r=".42"/><circle cx="29.5" cy="3.5" r=".42"/><circle cx="32.5" cy="1.5" r=".42"/><circle cx="32.5" cy="2.5" r=".42"/><circle cx="32.5" cy="3.5" r=".42"/><circle cx="31.5" cy="4.5" r=".42"/><circle cx="32.5" cy="4.5" r=".42"/><circle cx="33.5" cy="1.5" r=".42"/><circle cx="33.5" cy="2.5" r=".42"/><circle cx="33.5" cy="3.5" r=".42"/><circle cx="34.5" cy="1.5" r=".42"/><circle cx="34.5" cy="2.5" r=".42"/><circle cx="34.5" cy="3.5" r=".42"/><circle cx="33.5" cy="4.5" r=".42"/><circle cx="34.5" cy="4.5" r=".42"/><circle cx="35.5" cy="1.5" r=".42"/><circle cx="35.5" cy="2.5" r=".42"/><circle cx="35.5" cy="3.5" r=".42"/><circle cx="36.5" cy="1.5" r=".42"/><circle cx="36.5" cy="2.5" r=".42"/><circle cx="36.5" cy="3.5" r=".42"/><circle cx="35.5" cy="4.5" r=".42"/><circle cx="36.5" cy="4.5" r=".42"/><circle cx="37.5" cy="1.5" r=".42"/><circle cx="37.5" cy="2.5" r=".42"/><circle cx="37.5" cy="3.5" r=".42"/><circle cx="38.5" cy="2.5" r=".42"/><circle cx="38.5" cy="3.5" r=".42"/><circle cx="37.5" cy="4.5" r=".42"/><circle cx="38.5" cy="4.5" r=".42"/><circle cx="39.5" cy="2.5" r=".42"/><circle cx="39.5" cy="3.5" r=".42"/><circle cx="40.5" cy="3.5" r=".42"/><circle cx="39.5" cy="4.5" r=".42"/><circle cx="40.5" cy="4.5" r=".42"/><circle cx="41.5" cy="3.5" r=".42"/><circle cx="41.5" cy="4.5" r=".42"/><circle cx="42.5" cy="4.5" r=".42"/><circle cx="43.5" cy="4.5" r=".42"/><circle cx="0.5" cy="8.5" r=".42"/><circle cx="2.5" cy="7.5" r=".42"/><circle cx="1.5" cy="8.5" r=".42"/><circle cx="2.5" cy="8.5" r=".42"/><circle cx="3.5" cy="7.5" r=".42"/><circle cx="4.5" cy="6.5" r=".42"/><circle cx="4.5" cy="7.5" r=".42"/><circle cx="3.5" cy="8.5" r=".42"/><circle cx="4.5" cy="8.5" r=".42"/><circle cx="5.5" cy="6.5" r=".42"/><circle cx="5.5" cy="7.5" r=".42"/><circle cx="6.5" cy="6.5" r=".42"/><circle cx="6.5" cy="7.5" r=".42"/><circle cx="5.5" cy="8.5" r=".42"/><circle cx="6.5" cy="8.5" r=".42"/><circle cx="7.5" cy="5.5" r=".42"/><circle cx="7.5" cy="6.5" r=".42"/><circle cx="7.5" cy="7.5" r=".42"/><circle cx="8.5" cy="5.5" r=".42"/><circle cx="8.5" cy="6.5" r=".42"/><circle cx="8.5" cy="7.5" r=".42"/><circle cx="9.5" cy="5.5" r=".42"/><circle cx="9.5" cy="6.5" r=".42"/><circle cx="10.5" cy="5.5" r=".42"/><circle cx="11.5" cy="5.5" r=".42"/><circle cx="12.5" cy="5.5" r=".42"/><circle cx="12.5" cy="7.5" r=".42"/><circle cx="11.5" cy="8.5" r=".42"/><circle cx="12.5" cy="8.5" r=".42"/><circle cx="13.5" cy="5.5" r=".42"/><circle cx="13.5" cy="6.5" r=".42"/><circle cx="13.5" cy="7.5" r=".42"/><circle cx="14.5" cy="5.5" r=".42"/><circle cx="14.5" cy="6.5" r=".42"/><circle cx="14.5" cy="7.5" r=".42"/><circle cx="13.5" cy="8.5" r=".42"/><circle cx="15.5" cy="5.5" r=".42"/><circle cx="15.5" cy="6.5" r=".42"/><circle cx="15.5" cy="7.5" r=".42"/><circle cx="16.5" cy="5.5" r=".42"/><circle cx="16.5" cy="6.5" r=".42"/><circle cx="16.5" cy="7.5" r=".42"/><circle cx="15.5" cy="8.5" r=".42"/><circle cx="16.5" cy="8.5" r=".42"/><circle cx="17.5" cy="5.5" r=".42"/><circle cx="17.5" cy="6.5" r=".42"/><circle cx="17.5" cy="7.5" r=".42"/><circle cx="18.5" cy="5.5" r=".42"/><circle cx="18.5" cy="6.5" r=".42"/><circle cx="18.5" cy="7.5" r=".42"/><circle cx="17.5" cy="8.5" r=".42"/><circle cx="19.5" cy="5.5" r=".42"/><circle cx="19.5" cy="6.5" r=".42"/><circle cx="20.5" cy="5.5" r=".42"/><circle cx="20.5" cy="6.5" r=".42"/><circle cx="20.5" cy="7.5" r=".42"/><circle cx="21.5" cy="5.5" r=".42"/><circle cx="21.5" cy="6.5" r=".42"/><circle cx="21.5" cy="7.5" r=".42"/><circle cx="22.5" cy="5.5" r=".42"/><circle cx="22.5" cy="6.5" r=".42"/><circle cx="22.5" cy="7.5" r=".42"/><circle cx="21.5" cy="8.5" r=".42"/><circle cx="22.5" cy="8.5" r=".42"/><circle cx="23.5" cy="5.5" r=".42"/><circle cx="23.5" cy="6.5" r=".42"/><circle cx="23.5" cy="7.5" r=".42"/><circle cx="23.5" cy="8.5" r=".42"/><circle cx="26.5" cy="7.5" r=".42"/><circle cx="26.5" cy="8.5" r=".42"/><circle cx="27.5" cy="7.5" r=".42"/><circle cx="27.5" cy="8.5" r=".42"/><circle cx="30.5" cy="5.5" r=".42"/><circle cx="30.5" cy="6.5" r=".42"/><circle cx="30.5" cy="7.5" r=".42"/><circle cx="30.5" cy="8.5" r=".42"/><circle cx="31.5" cy="5.5" r=".42"/><circle cx="31.5" cy="6.5" r=".42"/><circle cx="31.5" cy="7.5" r=".42"/><circle cx="32.5" cy="5.5" r=".42"/><circle cx="32.5" cy="6.5" r=".42"/><circle cx="32.5" cy="7.5" r=".42"/><circle cx="31.5" cy="8.5" r=".42"/><circle cx="32.5" cy="8.5" r=".42"/><circle cx="33.5" cy="5.5" r=".42"/><circle cx="33.5" cy="6.5" r=".42"/><circle cx="33.5" cy="7.5" r=".42"/><circle cx="34.5" cy="5.5" r=".42"/><circle cx="34.5" cy="6.5" r=".42"/><circle cx="35.5" cy="5.5" r=".42"/><circle cx="35.5" cy="6.5" r=".42"/><circle cx="35.5" cy="7.5" r=".42"/><circle cx="36.5" cy="5.5" r=".42"/><circle cx="36.5" cy="6.5" r=".42"/><circle cx="36.5" cy="7.5" r=".42"/><circle cx="36.5" cy="8.5" r=".42"/><circle cx="37.5" cy="5.5" r=".42"/><circle cx="37.5" cy="6.5" r=".42"/><circle cx="37.5" cy="7.5" r=".42"/><circle cx="38.5" cy="5.5" r=".42"/><circle cx="38.5" cy="6.5" r=".42"/><circle cx="38.5" cy="7.5" r=".42"/><circle cx="37.5" cy="8.5" r=".42"/><circle cx="38.5" cy="8.5" r=".42"/><circle cx="39.5" cy="5.5" r=".42"/><circle cx="39.5" cy="6.5" r=".42"/><circle cx="39.5" cy="7.5" r=".42"/><circle cx="40.5" cy="5.5" r=".42"/><circle cx="40.5" cy="6.5" r=".42"/><circle cx="40.5" cy="7.5" r=".42"/><circle cx="40.5" cy="8.5" r=".42"/><circle cx="41.5" cy="5.5" r=".42"/><circle cx="41.5" cy="7.5" r=".42"/><circle cx="42.5" cy="5.5" r=".42"/><circle cx="41.5" cy="8.5" r=".42"/><circle cx="42.5" cy="8.5" r=".42"/><circle cx="43.5" cy="5.5" r=".42"/><circle cx="44.5" cy="5.5" r=".42"/><circle cx="44.5" cy="6.5" r=".42"/><circle cx="45.5" cy="5.5" r=".42"/><circle cx="45.5" cy="6.5" r=".42"/><circle cx="45.5" cy="7.5" r=".42"/><circle cx="46.5" cy="5.5" r=".42"/><circle cx="46.5" cy="6.5" r=".42"/><circle cx="46.5" cy="7.5" r=".42"/><circle cx="47.5" cy="6.5" r=".42"/><circle cx="47.5" cy="7.5" r=".42"/><circle cx="48.5" cy="6.5" r=".42"/><circle cx="48.5" cy="7.5" r=".42"/><circle cx="47.5" cy="8.5" r=".42"/><circle cx="48.5" cy="8.5" r=".42"/><circle cx="49.5" cy="6.5" r=".42"/><circle cx="49.5" cy="7.5" r=".42"/><circle cx="50.5" cy="7.5" r=".42"/><circle cx="49.5" cy="8.5" r=".42"/><circle cx="50.5" cy="8.5" r=".42"/><circle cx="51.5" cy="7.5" r=".42"/><circle cx="51.5" cy="8.5" r=".42"/><circle cx="52.5" cy="8.5" r=".42"/><circle cx="53.5" cy="8.5" r=".42"/><circle cx="1.5" cy="9.5" r=".42"/><circle cx="2.5" cy="9.5" r=".42"/><circle cx="3.5" cy="9.5" r=".42"/><circle cx="4.5" cy="9.5" r=".42"/><circle cx="5.5" cy="9.5" r=".42"/><circle cx="7.5" cy="10.5" r=".42"/><circle cx="7.5" cy="11.5" r=".42"/><circle cx="8.5" cy="10.5" r=".42"/><circle cx="8.5" cy="11.5" r=".42"/><circle cx="9.5" cy="9.5" r=".42"/><circle cx="9.5" cy="10.5" r=".42"/><circle cx="9.5" cy="11.5" r=".42"/><circle cx="10.5" cy="9.5" r=".42"/><circle cx="10.5" cy="10.5" r=".42"/><circle cx="11.5" cy="9.5" r=".42"/><circle cx="11.5" cy="10.5" r=".42"/><circle cx="12.5" cy="9.5" r=".42"/><circle cx="15.5" cy="9.5" r=".42"/><circle cx="16.5" cy="9.5" r=".42"/><circle cx="20.5" cy="12.5" r=".42"/><circle cx="22.5" cy="9.5" r=".42"/><circle cx="21.5" cy="12.5" r=".42"/><circle cx="22.5" cy="12.5" r=".42"/><circle cx="23.5" cy="9.5" r=".42"/><circle cx="23.5" cy="12.5" r=".42"/><circle cx="24.5" cy="12.5" r=".42"/><circle cx="26.5" cy="9.5" r=".42"/><circle cx="25.5" cy="12.5" r=".42"/><circle cx="27.5" cy="9.5" r=".42"/><circle cx="28.5" cy="12.5" r=".42"/><circle cx="30.5" cy="9.5" r=".42"/><circle cx="29.5" cy="12.5" r=".42"/><circle cx="30.5" cy="12.5" r=".42"/><circle cx="31.5" cy="9.5" r=".42"/><circle cx="31.5" cy="12.5" r=".42"/><circle cx="32.5" cy="12.5" r=".42"/><circle cx="33.5" cy="12.5" r=".42"/><circle cx="37.5" cy="9.5" r=".42"/><circle cx="38.5" cy="9.5" r=".42"/><circle cx="41.5" cy="9.5" r=".42"/><circle cx="42.5" cy="9.5" r=".42"/><circle cx="42.5" cy="10.5" r=".42"/><circle cx="43.5" cy="9.5" r=".42"/><circle cx="43.5" cy="10.5" r=".42"/><circle cx="44.5" cy="9.5" r=".42"/><circle cx="44.5" cy="10.5" r=".42"/><circle cx="44.5" cy="11.5" r=".42"/><circle cx="45.5" cy="10.5" r=".42"/><circle cx="45.5" cy="11.5" r=".42"/><circle cx="46.5" cy="10.5" r=".42"/><circle cx="46.5" cy="11.5" r=".42"/><circle cx="48.5" cy="9.5" r=".42"/><circle cx="49.5" cy="9.5" r=".42"/><circle cx="50.5" cy="9.5" r=".42"/><circle cx="51.5" cy="9.5" r=".42"/><circle cx="52.5" cy="9.5" r=".42"/><circle cx="17.5" cy="15.5" r=".42"/><circle cx="18.5" cy="14.5" r=".42"/><circle cx="18.5" cy="15.5" r=".42"/><circle cx="17.5" cy="16.5" r=".42"/><circle cx="18.5" cy="16.5" r=".42"/><circle cx="19.5" cy="13.5" r=".42"/><circle cx="19.5" cy="14.5" r=".42"/><circle cx="19.5" cy="15.5" r=".42"/><circle cx="20.5" cy="13.5" r=".42"/><circle cx="20.5" cy="14.5" r=".42"/><circle cx="20.5" cy="15.5" r=".42"/><circle cx="19.5" cy="16.5" r=".42"/><circle cx="20.5" cy="16.5" r=".42"/><circle cx="21.5" cy="13.5" r=".42"/><circle cx="21.5" cy="14.5" r=".42"/><circle cx="21.5" cy="15.5" r=".42"/><circle cx="22.5" cy="13.5" r=".42"/><circle cx="22.5" cy="14.5" r=".42"/><circle cx="22.5" cy="15.5" r=".42"/><circle cx="21.5" cy="16.5" r=".42"/><circle cx="23.5" cy="13.5" r=".42"/><circle cx="23.5" cy="14.5" r=".42"/><circle cx="24.5" cy="13.5" r=".42"/><circle cx="24.5" cy="14.5" r=".42"/><circle cx="25.5" cy="13.5" r=".42"/><circle cx="26.5" cy="16.5" r=".42"/><circle cx="28.5" cy="13.5" r=".42"/><circle cx="27.5" cy="16.5" r=".42"/><circle cx="29.5" cy="13.5" r=".42"/><circle cx="29.5" cy="14.5" r=".42"/><circle cx="30.5" cy="13.5" r=".42"/><circle cx="30.5" cy="14.5" r=".42"/><circle cx="31.5" cy="13.5" r=".42"/><circle cx="31.5" cy="14.5" r=".42"/><circle cx="31.5" cy="15.5" r=".42"/><circle cx="32.5" cy="13.5" r=".42"/><circle cx="32.5" cy="14.5" r=".42"/><circle cx="32.5" cy="15.5" r=".42"/><circle cx="32.5" cy="16.5" r=".42"/><circle cx="33.5" cy="13.5" r=".42"/><circle cx="33.5" cy="14.5" r=".42"/><circle cx="33.5" cy="15.5" r=".42"/><circle cx="34.5" cy="13.5" r=".42"/><circle cx="34.5" cy="14.5" r=".42"/><circle cx="34.5" cy="15.5" r=".42"/><circle cx="33.5" cy="16.5" r=".42"/><circle cx="34.5" cy="16.5" r=".42"/><circle cx="35.5" cy="14.5" r=".42"/><circle cx="35.5" cy="15.5" r=".42"/><circle cx="36.5" cy="15.5" r=".42"/><circle cx="35.5" cy="16.5" r=".42"/><circle cx="36.5" cy="16.5" r=".42"/><circle cx="17.5" cy="17.5" r=".42"/><circle cx="17.5" cy="18.5" r=".42"/><circle cx="17.5" cy="19.5" r=".42"/><circle cx="18.5" cy="17.5" r=".42"/><circle cx="18.5" cy="18.5" r=".42"/><circle cx="18.5" cy="19.5" r=".42"/><circle cx="19.5" cy="17.5" r=".42"/><circle cx="19.5" cy="18.5" r=".42"/><circle cx="19.5" cy="19.5" r=".42"/><circle cx="20.5" cy="17.5" r=".42"/><circle cx="20.5" cy="18.5" r=".42"/><circle cx="20.5" cy="19.5" r=".42"/><circle cx="19.5" cy="20.5" r=".42"/><circle cx="20.5" cy="20.5" r=".42"/><circle cx="21.5" cy="18.5" r=".42"/><circle cx="21.5" cy="19.5" r=".42"/><circle cx="22.5" cy="19.5" r=".42"/><circle cx="21.5" cy="20.5" r=".42"/><circle cx="22.5" cy="20.5" r=".42"/><circle cx="23.5" cy="19.5" r=".42"/><circle cx="24.5" cy="19.5" r=".42"/><circle cx="23.5" cy="20.5" r=".42"/><circle cx="24.5" cy="20.5" r=".42"/><circle cx="26.5" cy="17.5" r=".42"/><circle cx="25.5" cy="20.5" r=".42"/><circle cx="26.5" cy="20.5" r=".42"/><circle cx="27.5" cy="17.5" r=".42"/><circle cx="30.5" cy="19.5" r=".42"/><circle cx="30.5" cy="20.5" r=".42"/><circle cx="31.5" cy="19.5" r=".42"/><circle cx="32.5" cy="18.5" r=".42"/><circle cx="32.5" cy="19.5" r=".42"/><circle cx="31.5" cy="20.5" r=".42"/><circle cx="32.5" cy="20.5" r=".42"/><circle cx="33.5" cy="17.5" r=".42"/><circle cx="33.5" cy="18.5" r=".42"/><circle cx="33.5" cy="19.5" r=".42"/><circle cx="34.5" cy="17.5" r=".42"/><circle cx="34.5" cy="18.5" r=".42"/><circle cx="34.5" cy="19.5" r=".42"/><circle cx="33.5" cy="20.5" r=".42"/><circle cx="34.5" cy="20.5" r=".42"/><circle cx="35.5" cy="17.5" r=".42"/><circle cx="35.5" cy="18.5" r=".42"/><circle cx="35.5" cy="19.5" r=".42"/><circle cx="36.5" cy="17.5" r=".42"/><circle cx="36.5" cy="18.5" r=".42"/><circle cx="36.5" cy="19.5" r=".42"/><circle cx="20.5" cy="21.5" r=".42"/><circle cx="21.5" cy="21.5" r=".42"/><circle cx="22.5" cy="21.5" r=".42"/><circle cx="23.5" cy="21.5" r=".42"/><circle cx="23.5" cy="22.5" r=".42"/><circle cx="24.5" cy="21.5" r=".42"/><circle cx="24.5" cy="22.5" r=".42"/><circle cx="24.5" cy="23.5" r=".42"/><circle cx="25.5" cy="21.5" r=".42"/><circle cx="25.5" cy="22.5" r=".42"/><circle cx="25.5" cy="23.5" r=".42"/><circle cx="26.5" cy="21.5" r=".42"/><circle cx="26.5" cy="22.5" r=".42"/><circle cx="26.5" cy="23.5" r=".42"/><circle cx="26.5" cy="24.5" r=".42"/><circle cx="27.5" cy="21.5" r=".42"/><circle cx="27.5" cy="22.5" r=".42"/><circle cx="27.5" cy="23.5" r=".42"/><circle cx="28.5" cy="21.5" r=".42"/><circle cx="28.5" cy="22.5" r=".42"/><circle cx="28.5" cy="23.5" r=".42"/><circle cx="27.5" cy="24.5" r=".42"/><circle cx="28.5" cy="24.5" r=".42"/><circle cx="29.5" cy="22.5" r=".42"/><circle cx="29.5" cy="23.5" r=".42"/><circle cx="30.5" cy="23.5" r=".42"/><circle cx="29.5" cy="24.5" r=".42"/><circle cx="30.5" cy="24.5" r=".42"/><circle cx="31.5" cy="21.5" r=".42"/><circle cx="32.5" cy="21.5" r=".42"/><circle cx="31.5" cy="24.5" r=".42"/><circle cx="33.5" cy="21.5" r=".42"/><circle cx="22.5" cy="25.5" r=".42"/><circle cx="22.5" cy="26.5" r=".42"/><circle cx="23.5" cy="25.5" r=".42"/><circle cx="23.5" cy="26.5" r=".42"/><circle cx="23.5" cy="27.5" r=".42"/><circle cx="24.5" cy="26.5" r=".42"/><circle cx="24.5" cy="27.5" r=".42"/><circle cx="24.5" cy="28.5" r=".42"/><circle cx="25.5" cy="26.5" r=".42"/><circle cx="25.5" cy="27.5" r=".42"/><circle cx="26.5" cy="27.5" r=".42"/><circle cx="25.5" cy="28.5" r=".42"/><circle cx="26.5" cy="28.5" r=".42"/><circle cx="28.5" cy="25.5" r=".42"/><circle cx="27.5" cy="28.5" r=".42"/><circle cx="28.5" cy="28.5" r=".42"/><circle cx="29.5" cy="25.5" r=".42"/><circle cx="29.5" cy="26.5" r=".42"/><circle cx="30.5" cy="25.5" r=".42"/><circle cx="30.5" cy="26.5" r=".42"/><circle cx="31.5" cy="25.5" r=".42"/><circle cx="31.5" cy="26.5" r=".42"/><circle cx="20.5" cy="31.5" r=".42"/><circle cx="20.5" cy="32.5" r=".42"/><circle cx="21.5" cy="31.5" r=".42"/><circle cx="22.5" cy="30.5" r=".42"/><circle cx="22.5" cy="31.5" r=".42"/><circle cx="21.5" cy="32.5" r=".42"/><circle cx="22.5" cy="32.5" r=".42"/><circle cx="23.5" cy="30.5" r=".42"/><circle cx="23.5" cy="31.5" r=".42"/><circle cx="24.5" cy="31.5" r=".42"/><circle cx="26.5" cy="29.5" r=".42"/><circle cx="27.5" cy="29.5" r=".42"/><circle cx="28.5" cy="29.5" r=".42"/><circle cx="28.5" cy="30.5" r=".42"/><circle cx="29.5" cy="29.5" r=".42"/><circle cx="29.5" cy="30.5" r=".42"/><circle cx="29.5" cy="31.5" r=".42"/><circle cx="30.5" cy="29.5" r=".42"/><circle cx="30.5" cy="30.5" r=".42"/><circle cx="30.5" cy="31.5" r=".42"/><circle cx="31.5" cy="30.5" r=".42"/><circle cx="31.5" cy="31.5" r=".42"/><circle cx="32.5" cy="31.5" r=".42"/><circle cx="31.5" cy="32.5" r=".42"/><circle cx="32.5" cy="32.5" r=".42"/><circle cx="33.5" cy="31.5" r=".42"/><circle cx="33.5" cy="32.5" r=".42"/><circle cx="20.5" cy="33.5" r=".42"/><circle cx="20.5" cy="34.5" r=".42"/><circle cx="20.5" cy="35.5" r=".42"/><circle cx="21.5" cy="33.5" r=".42"/><circle cx="21.5" cy="34.5" r=".42"/><circle cx="21.5" cy="35.5" r=".42"/><circle cx="22.5" cy="33.5" r=".42"/><circle cx="22.5" cy="34.5" r=".42"/><circle cx="22.5" cy="35.5" r=".42"/><circle cx="21.5" cy="36.5" r=".42"/><circle cx="22.5" cy="36.5" r=".42"/><circle cx="23.5" cy="35.5" r=".42"/><circle cx="24.5" cy="35.5" r=".42"/><circle cx="23.5" cy="36.5" r=".42"/><circle cx="24.5" cy="36.5" r=".42"/><circle cx="26.5" cy="33.5" r=".42"/><circle cx="25.5" cy="36.5" r=".42"/><circle cx="27.5" cy="33.5" r=".42"/><circle cx="29.5" cy="35.5" r=".42"/><circle cx="30.5" cy="35.5" r=".42"/><circle cx="30.5" cy="36.5" r=".42"/><circle cx="31.5" cy="33.5" r=".42"/><circle cx="31.5" cy="34.5" r=".42"/><circle cx="31.5" cy="35.5" r=".42"/><circle cx="32.5" cy="33.5" r=".42"/><circle cx="32.5" cy="34.5" r=".42"/><circle cx="32.5" cy="35.5" r=".42"/><circle cx="31.5" cy="36.5" r=".42"/><circle cx="32.5" cy="36.5" r=".42"/><circle cx="33.5" cy="33.5" r=".42"/><circle cx="33.5" cy="34.5" r=".42"/><circle cx="33.5" cy="35.5" r=".42"/><circle cx="23.5" cy="37.5" r=".42"/><circle cx="24.5" cy="37.5" r=".42"/><circle cx="25.5" cy="37.5" r=".42"/><circle cx="25.5" cy="38.5" r=".42"/><circle cx="26.5" cy="37.5" r=".42"/><circle cx="26.5" cy="38.5" r=".42"/><circle cx="27.5" cy="37.5" r=".42"/><circle cx="27.5" cy="38.5" r=".42"/><circle cx="27.5" cy="39.5" r=".42"/><circle cx="28.5" cy="38.5" r=".42"/><circle cx="28.5" cy="39.5" r=".42"/><circle cx="29.5" cy="39.5" r=".42"/><circle cx="22.5" cy="44.5" r=".42"/><circle cx="23.5" cy="44.5" r=".42"/><circle cx="24.5" cy="44.5" r=".42"/><circle cx="25.5" cy="41.5" r=".42"/><circle cx="26.5" cy="42.5" r=".42"/><circle cx="27.5" cy="42.5" r=".42"/><circle cx="27.5" cy="43.5" r=".42"/><circle cx="28.5" cy="42.5" r=".42"/><circle cx="28.5" cy="43.5" r=".42"/><circle cx="28.5" cy="44.5" r=".42"/><circle cx="29.5" cy="43.5" r=".42"/><circle cx="29.5" cy="44.5" r=".42"/><circle cx="30.5" cy="44.5" r=".42"/><circle cx="31.5" cy="44.5" r=".42"/><circle cx="21.5" cy="45.5" r=".42"/><circle cx="21.5" cy="46.5" r=".42"/><circle cx="21.5" cy="47.5" r=".42"/><circle cx="22.5" cy="45.5" r=".42"/><circle cx="22.5" cy="46.5" r=".42"/><circle cx="22.5" cy="47.5" r=".42"/><circle cx="21.5" cy="48.5" r=".42"/><circle cx="22.5" cy="48.5" r=".42"/><circle cx="23.5" cy="45.5" r=".42"/><circle cx="26.5" cy="46.5" r=".42"/><circle cx="26.5" cy="47.5" r=".42"/><circle cx="26.5" cy="48.5" r=".42"/><circle cx="27.5" cy="46.5" r=".42"/><circle cx="27.5" cy="47.5" r=".42"/><circle cx="27.5" cy="48.5" r=".42"/><circle cx="30.5" cy="45.5" r=".42"/><circle cx="31.5" cy="45.5" r=".42"/><circle cx="31.5" cy="46.5" r=".42"/><circle cx="31.5" cy="47.5" r=".42"/><circle cx="32.5" cy="45.5" r=".42"/><circle cx="32.5" cy="46.5" r=".42"/><circle cx="32.5" cy="47.5" r=".42"/><circle cx="31.5" cy="48.5" r=".42"/><circle cx="22.5" cy="49.5" r=".42"/><circle cx="23.5" cy="49.5" r=".42"/><circle cx="23.5" cy="50.5" r=".42"/><circle cx="24.5" cy="50.5" r=".42"/><circle cx="24.5" cy="51.5" r=".42"/><circle cx="26.5" cy="49.5" r=".42"/><circle cx="27.5" cy="49.5" r=".42"/><circle cx="28.5" cy="51.5" r=".42"/><circle cx="27.5" cy="52.5" r=".42"/><circle cx="28.5" cy="52.5" r=".42"/><circle cx="29.5" cy="50.5" r=".42"/><circle cx="29.5" cy="51.5" r=".42"/><circle cx="30.5" cy="49.5" r=".42"/><circle cx="30.5" cy="50.5" r=".42"/><circle cx="31.5" cy="49.5" r=".42"/><circle cx="26.5" cy="53.5" r=".42"/></g></svg>
+          <div><b id="eng">Claude Code</b></div>
+          <div>Umbrel &middot; /music &middot; Navidrome</div>
+          <div id="sess">Session: -</div>
+        </div>
+        <div class="rt">
+          <h2>Hermes Music v1.1.0</h2>
+          <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
+          <div class="sec"><span class="k">&#9662; Worker</span><br><span id="w-worker" class="d">-</span></div>
+          <div class="sec"><span class="k">&#9662; Settings</span><br><span class="d" id="w-cfg">-</span></div>
+          <div class="sec"><span class="k">&#9656; Commands</span><br><span class="d">/help &middot; /queue &middot; /config &middot; /clear &middot; or just type a song</span></div>
+        </div>
+      </div>
+      <div id="log"></div>
+      <form class="prompt" id="f"><span>&#10095;</span><input id="q" placeholder="type a song name and artist, then press enter" maxlength="200" autofocus autocomplete="off" spellcheck="false"></form>
+      <p class="hint" id="hint"></p>
+    </div>
+
+    <div class="term cfg" id="v-cfg" style="display:none">
+      <h3>Config</h3>
+      <p>Saved on the Umbrel and applied right away.</p>
+
+      <div class="grp">&#9662; Model</div>
+      <div class="row"><label for="c-engine">Provider<small>who picks the right song</small></label>
+        <select id="c-engine"><option value="claude">Claude Code (your subscription)</option><option value="local">Local model (OpenAI-compatible)</option></select></div>
+      <div id="g-claude">
+        <div class="row"><label for="c-cmodel">Claude model<small>uses your subscription</small></label>
+          <select id="c-cmodel"><option value="sonnet">Sonnet</option><option value="opus">Opus</option><option value="haiku">Haiku</option></select></div>
+        <div class="row"><label for="c-token">Claude token<small id="tokhint">run: claude setup-token</small></label><input type="password" id="c-token" placeholder="blank = keep, - = remove" autocomplete="off"></div>
+      </div>
+      <div id="g-local">
+        <div class="row"><label for="c-url">Base URL<small>Ollama, llama.cpp, LM Studio...</small></label><input type="text" id="c-url" placeholder="http://umbrel.local:11434/v1" spellcheck="false"></div>
+        <div class="row"><label for="c-lmodel">Model name<small>as your server names it</small></label><input type="text" id="c-lmodel" placeholder="qwen3.8:27b" spellcheck="false"></div>
+        <div class="row"><label for="c-ctx">Context length<small>tokens, 0 = server default</small></label>
+          <input type="number" id="c-ctx" min="0" max="1048576" step="1024" list="ctx-list"></div>
+        <datalist id="ctx-list"><option value="0"><option value="4096"><option value="8192"><option value="16384"><option value="32768"><option value="65536"><option value="131072"></datalist>
+        <div class="row"><label for="c-key">API key<small id="keyhint">optional</small></label><input type="password" id="c-key" placeholder="blank = keep, - = remove" autocomplete="off"></div>
+      </div>
+
+      <div class="grp">&#9662; Downloads</div>
+      <div class="row"><label for="c-fmt">Audio format<small>what gets saved to the library</small></label>
+        <select id="c-fmt"><option>mp3</option><option>opus</option><option>m4a</option><option>flac</option></select></div>
+      <div class="row"><label for="c-max">Max song length (min)<small>longer videos are skipped</small></label><input type="number" id="c-max" min="1" max="30"></div>
+      <div class="row"><label for="c-art">Embed cover art<small>album cover from iTunes, else video thumbnail</small></label><input type="checkbox" id="c-art"></div>
+      <div class="row"><label for="c-folders">Artist folders<small>music/Artist/Album/Song, off = all in one folder</small></label><input type="checkbox" id="c-folders"></div>
+
+      <div class="grp">&#9662; Queue</div>
+      <div class="row"><label for="c-paused">Pause requests<small>worker skips the queue</small></label><input type="checkbox" id="c-paused"></div>
+      <div class="row"><label for="c-rate">Requests per minute<small>per device, stops spam</small></label><input type="number" id="c-rate" min="1" max="30"></div>
+
+
+      <div class="grp">&#9662; Security</div>
+      <div class="row" id="r-cur"><label for="c-cur">Current PIN<small>needed to save changes</small></label><input type="password" id="c-cur" inputmode="numeric" autocomplete="off"></div>
+      <div class="row"><label for="c-pin">Set PIN<small>4-12 digits, blank = keep, - = remove</small></label><input type="password" id="c-pin" inputmode="numeric" autocomplete="off"></div>
+
+      <button class="btn" id="c-save">Save</button><span id="cfgmsg"></span>
+    </div>
+
+  </div>
 </section>
 <script>
-const l = document.getElementById("l"), msg = document.getElementById("msg"), q = document.getElementById("q"), qc = document.getElementById("qc");
+const $ = (id) => document.getElementById(id);
+const DEMO = location.protocol === "file:";
 const label = { pending: "queued", working: "downloading", done: "added", failed: "failed" };
-async function load() {
-  const r = await (await fetch("api/requests")).json();
-  qc.textContent = r.filter((i) => i.status === "pending" || i.status === "working").length;
-  l.innerHTML = "";
-  if (!r.length) { const e = document.createElement("li"); e.className = "empty"; e.textContent = "No requests yet."; l.append(e); return; }
-  for (const i of r) {
-    const li = document.createElement("li");
-    const s = document.createElement("span");
-    s.className = "s " + i.status;
-    s.textContent = label[i.status] || i.status;
-    const a = document.createElement("div");
-    a.textContent = i.title ? (i.artist ? i.artist + " - " : "") + i.title : i.query;
-    if (i.note) { const n = document.createElement("small"); n.textContent = i.note; a.append(n); }
-    li.append(s, a);
-    l.append(li);
-  }
-}
-document.getElementById("f").onsubmit = async (e) => {
-  e.preventDefault();
-  const r = await fetch("api/requests", { method: "POST", body: JSON.stringify({ query: q.value }) });
+let local = [], lastReqs = [], status = null, cfg = null;
+
+async function api(path, opt) {
+  if (DEMO) return demo(path, opt);
+  const r = await fetch(path, opt);
   const j = await r.json();
-  msg.textContent = r.ok ? "Requested. It will show up in the library soon." : j.error;
-  if (r.ok) q.value = "";
-  load();
+  if (!r.ok) throw new Error(j.error || "error");
+  return j;
+}
+function demo(path) {
+  if (path === "api/status") return { worker: { state: "busy", current: "the weeknd - starboy" }, pending: 1, working: 1, done: 3, failed: 0 };
+  if (path === "api/config") return { engine: "local", claudeModel: "sonnet", localUrl: "http://umbrel.local:11434/v1", localModel: "qwen3.8:27b", contextLength: 8192,
+    hasKey: false, hasToken: true, audioFormat: "mp3", maxMinutes: 10, embedArt: true, artistFolders: true, paused: false, ratePerMinute: 5, hasPin: false };
+  return [
+    { id: "a1", query: "blinding lights", status: "pending", created: new Date().toISOString() },
+    { id: "a2", query: "the weeknd - starboy", status: "working", created: new Date(Date.now() - 60000).toISOString() },
+    { id: "a3", query: "daft punk one more time", status: "done", title: "One More Time", artist: "Daft Punk", created: new Date(Date.now() - 300000).toISOString() },
+    { id: "a4", query: "mr brightside", status: "done", title: "Mr. Brightside", artist: "The Killers", created: new Date(Date.now() - 900000).toISOString() },
+  ];
+}
+const hhmm = (iso) => new Date(iso).toTimeString().slice(0, 5);
+function line(cls, parts) {
+  const d = document.createElement("div"); d.className = "ln " + cls;
+  for (const [c, t] of parts) { const s = document.createElement("span"); if (c) s.className = c; s.textContent = t; d.append(s); }
+  return d;
+}
+function render() {
+  const log = $("log"); log.textContent = "";
+  for (const i of lastReqs.slice().reverse().slice(-14)) {
+    const name = i.title ? (i.artist ? i.artist + " - " : "") + i.title : i.query;
+    const row = line(i.status, [["t", hhmm(i.created)], ["s", "[" + (label[i.status] || i.status) + "]"], ["", name]]);
+    if (i.note) { const n = document.createElement("small"); n.textContent = " (" + i.note + ")"; row.lastChild.append(n); }
+    log.append(row);
+  }
+  for (const l of local) log.append(line(l.cls, [["", l.text]]));
+  if (status) {
+    $("qc").textContent = status.pending + status.working;
+    $("w-queue").textContent = status.pending + " waiting · " + status.working + " downloading · " + status.done + " added · " + status.failed + " failed";
+    const w = $("w-worker"); w.textContent = "";
+    const st = status.worker.state, good = st === "ready" || st === "busy";
+    const text = { ready: "ready (waiting for requests)", busy: "working on: " + (status.worker.current || "..."), paused: "paused (see Config)",
+      setup: "installing tools, first start can take a few minutes", "no-token": "needs a Claude token (see Config)" }[st] || st;
+    const dot = document.createElement("span"); dot.className = good ? "on-dot" : "off-dot"; dot.textContent = good ? "● " : "○ ";
+    w.append(dot, text);
+  }
+  if (cfg) {
+    $("w-cfg").textContent = cfg.audioFormat + " · max " + cfg.maxMinutes + " min · " + cfg.ratePerMinute + " requests/min";
+    $("eng").textContent = cfg.engine === "local" ? (cfg.localModel || "local model") : "Claude Code · " + cfg.claudeModel;
+  }
+  $("sess").textContent = "Session: " + (lastReqs[0] ? lastReqs[0].id : "-");
+  const body = document.querySelector(".body"); body.scrollTop = body.scrollHeight;
+}
+async function load() {
+  try { [lastReqs, status, cfg] = await Promise.all([api("api/requests"), api("api/status"), api("api/config")]); render(); } catch {}
+}
+function say(cls, text) { local.push({ cls, text }); if (local.length > 30) local.shift(); render(); }
+
+const HELP = ["/help    show this list", "/queue   show queue counts", "/config  open the config tab", "/clear   clear this screen", "anything else is treated as a song request"];
+$("f").onsubmit = async (e) => {
+  e.preventDefault();
+  const v = $("q").value.trim(); if (!v) return;
+  $("q").value = "";
+  local.push({ cls: "echo", text: v });
+  if (v[0] === "/") {
+    const c = v.split(" ")[0].toLowerCase();
+    if (c === "/help") HELP.forEach((h) => local.push({ cls: "sys", text: h }));
+    else if (c === "/queue") local.push({ cls: "sys", text: status ? status.pending + " waiting, " + status.working + " downloading, " + status.done + " added" : "no data yet" });
+    else if (c === "/config") { tab("cfg"); local.pop(); }
+    else if (c === "/clear") { local = []; lastReqs = []; setTimeout(load, 4000); }
+    else local.push({ cls: "err", text: "unknown command: " + c + " (try /help)" });
+    render(); return;
+  }
+  try {
+    const r = await api("api/requests", { method: "POST", body: JSON.stringify({ query: v }) });
+    local.push({ cls: "ok", text: "queued #" + r.id + " - it will show up in the library soon" });
+  } catch (err) { local.push({ cls: "err", text: err.message }); }
+  render(); load();
 };
-load(); setInterval(load, 5000);
+
+function tab(name) {
+  $("v-req").style.display = name === "req" ? "" : "none";
+  $("v-cfg").style.display = name === "cfg" ? "" : "none";
+  $("title").textContent = name === "req" ? "Requests" : "Config";
+  document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("on", a.dataset.tab === name));
+  if (name === "cfg" && cfg) fillCfg();
+}
+document.querySelectorAll("nav a").forEach((a) => (a.onclick = () => tab(a.dataset.tab)));
+function showEngine() {
+  const local = $("c-engine").value === "local";
+  $("g-claude").style.display = local ? "none" : "";
+  $("g-local").style.display = local ? "" : "none";
+}
+$("c-engine").onchange = showEngine;
+function fillCfg() {
+  $("c-engine").value = cfg.engine; $("c-cmodel").value = cfg.claudeModel;
+  $("c-url").value = cfg.localUrl; $("c-lmodel").value = cfg.localModel; $("c-ctx").value = cfg.contextLength; $("c-key").value = "";
+  $("keyhint").textContent = cfg.hasKey ? "a key is saved" : "optional";
+  $("c-fmt").value = cfg.audioFormat; $("c-max").value = cfg.maxMinutes; $("c-art").checked = cfg.embedArt;
+  $("c-paused").checked = cfg.paused; $("c-rate").value = cfg.ratePerMinute; $("c-folders").checked = cfg.artistFolders; $("c-token").value = "";
+  $("tokhint").textContent = cfg.hasToken ? "a token is saved" : "run: claude setup-token";
+  $("r-cur").style.display = cfg.hasPin ? "" : "none"; $("c-cur").value = ""; $("c-pin").value = "";
+  showEngine();
+}
+$("c-save").onclick = async () => {
+  const m = $("cfgmsg"); m.style.color = "#4ade80";
+  try {
+    cfg = await api("api/config", { method: "POST", body: JSON.stringify({
+      engine: $("c-engine").value, claudeModel: $("c-cmodel").value,
+      localUrl: $("c-url").value, localModel: $("c-lmodel").value, contextLength: +$("c-ctx").value, localKey: $("c-key").value,
+      audioFormat: $("c-fmt").value, maxMinutes: +$("c-max").value, embedArt: $("c-art").checked,
+      paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, artistFolders: $("c-folders").checked, claudeToken: $("c-token").value,
+      currentPin: $("c-cur").value, newPin: $("c-pin").value }) });
+    fillCfg(); m.textContent = "saved"; render();
+  } catch (err) { m.style.color = "#f87171"; m.textContent = err.message; }
+  setTimeout(() => (m.textContent = ""), 3000);
+};
+document.addEventListener("click", (e) => { if (!getSelection().toString() && $("v-req").style.display !== "none" && !e.target.closest("select,button,a")) $("q").focus(); });
+load(); setInterval(load, 4000);
 </script></body></html>

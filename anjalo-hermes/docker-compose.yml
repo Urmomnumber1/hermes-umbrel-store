@@ -3,21 +3,24 @@ version: "3.7"
 services:
   app_proxy:
     environment:
-      APP_HOST: anjalo-hermes_requests_1
+      APP_HOST: anjalo-hermes_web_1
       APP_PORT: 3000
-      # The request page has no login by design (guests use it).
+      # The request page has no login by design (guests use it). Config can be locked with a PIN.
       PROXY_AUTH_ADD: "false"
 
-  # Song request page + queue. A worker on the owner's PC (Claude Code) picks requests up.
-  requests:
-    image: node:22-alpine
-    command: node /app/server.js
+  # Request page + queue + worker. The worker identifies songs (Claude Code or a local model),
+  # downloads them with yt-dlp and saves them straight into the Umbrel music folder.
+  web:
+    image: node:22-bookworm-slim
+    command: sh /app/start.sh
     restart: on-failure
-    user: "1000:1000"
-    working_dir: /app
+    stop_grace_period: 30s
+    user: "0:0" # start.sh installs ffmpeg, then drops to uid 1000 for the app itself
     volumes:
       - ${APP_DATA_DIR}/requests-app:/app:ro
-      - ${APP_DATA_DIR}/requests-data:/data
+      - ${APP_DATA_DIR}/data:/data
+      # Navidrome library folder (Feishin plays from Navidrome)
+      - ${UMBREL_ROOT}/data/storage/downloads/music:/music
     ports:
       # Guest-facing page at http://<umbrel-ip>:3340 (LAN only)
       - "3340:3000"

@@ -2,17 +2,18 @@ manifestVersion: 1
 id: anjalo-hermes
 category: media
 name: Hermes Music
-version: "1.0.4"
+version: "1.1.0"
 tagline: Request a song and it lands in your music library
 description: >-
-  A simple song request page. Anyone on your network types a song name; a helper running
-  Claude Code finds it on YouTube Music, downloads it, and drops it into your music library
-  (Navidrome / Feishin).
+  A song request page for your household. Anyone on your network types a song name, and Hermes Music
+  finds it on YouTube Music, downloads it and saves it into your Umbrel music folder
+  (Umbrel storage: Downloads/music) so Navidrome and Feishin can play it.
 
 
-  This app is only the request page and queue. The helper is a small script that runs on your
-  own computer (see the store's README).
-releaseNotes: Request-only app. Removed the bundled Hermes container.
+  Songs are identified by Claude Code (with your Claude subscription, using a token from "claude setup-token")
+  or by a local model on any OpenAI-compatible server (Ollama, llama.cpp, LM Studio). Set this up in the Config tab.
+  Everything runs on your Umbrel.
+releaseNotes: Everything now runs on the Umbrel. Terminal-style page, Config tab, local model support.
 developer: Anjalo
 website: https://github.com/Urmomnumber1/hermes-umbrel-store
 dependencies: []
