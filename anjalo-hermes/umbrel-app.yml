@@ -1,9 +1,9 @@
 manifestVersion: 1
 id: anjalo-hermes
 category: ai
-name: Hermes Agent
+name: Hermes Music
 version: "2026.9.24"
-tagline: Self-improving AI agent from Nous Research
+tagline: Request a song and Hermes finds it and adds it to your music library
 description: >-
   Hermes Agent is an open-source AI agent by Nous Research with persistent memory,
   a growing skill library, scheduled jobs, and messaging gateways (Telegram, Discord, Slack and more).
