@@ -53,6 +53,7 @@ input::placeholder{color:var(--mut)}
 .row{display:flex;align-items:center;gap:12px;padding:9px 0;border-top:1px solid var(--bd)}
 .row label{width:15em;flex:none;color:var(--hi)}
 .row small{display:block}
+.sub2{margin:6px 0 4px;color:var(--mut);font-size:.78rem;max-width:60em}
 .grp{margin:20px 0 2px;color:var(--hi);font-weight:700;letter-spacing:.04em}
 input[type=text],input[type=password]{width:24em;max-width:100%}
 select,input[type=number],input[type=text],input[type=password]{background:transparent;color:var(--fg);border:1px solid var(--bd);border-radius:4px;padding:5px 8px;font:inherit}
@@ -91,12 +92,12 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
           <div id="sess">Session: -</div>
         </div>
         <div class="rt">
-          <h2>Hermes Music v2.0.1</h2>
+          <h2>Hermes Music v2.2.0</h2>
           <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
           <div class="sec"><span class="k">&#9662; Worker</span><br><span id="w-worker" class="d">-</span></div>
           <div class="sec"><span class="k">&#9662; Library</span><br><span class="d" id="w-lib">-</span></div>
           <div class="sec"><span class="k">&#9662; Settings</span><br><span class="d" id="w-cfg">-</span></div>
-          <div class="sec"><span class="k">&#9656; Commands</span><br><span class="d">type a song &middot; /album &middot; /artist &middot; /help</span></div>
+          <div class="sec"><span class="k">&#9656; Commands</span><br><span class="d">type a song &middot; /album &middot; /artist &middot; Spotify link &middot; /help</span></div>
         </div>
       </div>
       <div id="log"></div>
@@ -136,6 +137,20 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
       <div class="row"><label for="c-maxalb">Max albums per artist<small>newest first, for /artist</small></label><input type="number" id="c-maxalb" min="1" max="50"></div>
       <div class="row"><label for="c-singles">Include singles &amp; EPs<small>for /artist</small></label><input type="checkbox" id="c-singles"></div>
 
+      <div class="grp">&#9662; Spotify</div>
+      <p class="sub2">Optional. Lets you paste Spotify links and searches Spotify when iTunes can&#39;t find an album or artist.
+        Create an app at developer.spotify.com/dashboard, then copy its Client ID and Secret here.</p>
+      <div class="row"><label for="c-spid">Client ID</label><input type="text" id="c-spid" spellcheck="false" autocomplete="off"></div>
+      <div class="row"><label for="c-spsec">Client Secret<small id="sphint">not set</small></label><input type="password" id="c-spsec" placeholder="blank = keep, - = remove" autocomplete="off"></div>
+
+      <div class="grp">&#9662; Downtify backup</div>
+      <p class="sub2">Optional. Only used when Hermes Music can&#39;t find or download a song itself. Needs the Downtify app installed on this Umbrel.</p>
+      <div class="row"><label for="c-dten">Use Downtify as backup</label><input type="checkbox" id="c-dten"></div>
+      <div class="row"><label for="c-dturl">Address<small>default works for the Umbrel app</small></label><input type="text" id="c-dturl" spellcheck="false" autocomplete="off"></div>
+      <div class="row"><label for="c-dtuser">Username<small>Downtify login</small></label><input type="text" id="c-dtuser" spellcheck="false" autocomplete="off"></div>
+      <div class="row"><label for="c-dtpass">Password<small id="dthint">blank = default (downtify)</small></label><input type="password" id="c-dtpass" placeholder="blank = keep, - = remove" autocomplete="off"></div>
+      <div class="row"><label>Connection<small>save first, then test</small></label><button class="btn" id="c-dttest" style="margin:0">Test</button><span id="dtmsg" class="sub2" style="margin:0"></span></div>
+
       <div class="grp">&#9662; Queue</div>
       <div class="row"><label for="c-paused">Pause requests<small>worker skips the queue</small></label><input type="checkbox" id="c-paused"></div>
       <div class="row"><label for="c-rate">Requests per minute<small>per device, stops spam</small></label><input type="number" id="c-rate" min="1" max="30"></div>
@@ -168,12 +183,13 @@ function demo(path) {
     library: { files: 1284, scanning: false, scanned: true } };
   if (path === "api/config") return { engine: "claude", claudeModel: "sonnet", localUrl: "", localModel: "", contextLength: 0,
     hasKey: false, hasToken: true, audioFormat: "mp3", maxMinutes: 10, embedArt: true, artistFolders: true, artistMaxAlbums: 10, includeSingles: false,
-    paused: false, ratePerMinute: 5, hasPin: true };
+    paused: false, ratePerMinute: 5, hasPin: true, spotifyClientId: "3f9c1e0b7a6d4c2e8b5a1f0e9d8c7b6a", hasSpotifySecret: true, downtifyEnabled: true, downtifyUrl: "http://downtify_downtify_1:8000", downtifyUser: "admin", hasDowntifyPassword: false };
   const t = (m) => new Date(Date.now() - m * 60000).toISOString();
   return [
     { id: "a1", type: "song", query: "blinding lights", status: "pending", created: t(0) },
     { id: "a2", type: "album", query: "hot fuss", status: "working", title: "Hot Fuss", artist: "The Killers", created: t(2), progress: { total: 12, done: 4, failed: 0, skipped: 1, pending: 8 } },
     { id: "a3", type: "artist", query: "daft punk", status: "done", title: "4 releases", artist: "Daft Punk", note: "38 added, 6 already had", created: t(30), progress: { total: 44, done: 44, failed: 0, skipped: 6, pending: 0 } },
+    { id: "a6", type: "playlist", query: "https://open.spotify.com/playlist/x", status: "working", title: "Road Trip", artist: "anjalo", created: t(1), progress: { total: 30, done: 7, failed: 1, skipped: 2, pending: 22 } },
     { id: "a4", type: "song", query: "mr brightside", status: "done", title: "Mr. Brightside", artist: "The Killers", note: "already in the library", created: t(40) },
     { id: "a5", type: "song", query: "big dick randy", status: "done", title: "Big Dick Randy", artist: "DigBar", note: "single: Big Dick Randy", created: t(45) },
   ];
@@ -187,7 +203,7 @@ function line(cls, parts) {
 function render() {
   const log = $("log"); log.textContent = "";
   for (const i of lastReqs.slice().reverse().slice(-14)) {
-    const name = (i.type === "album" ? "album: " : i.type === "artist" ? "artist: " : "")
+    const name = (i.type === "song" || !i.type ? "" : i.type + ": ")
       + (i.title ? (i.artist ? i.artist + " - " : "") + i.title : i.query);
     let st = label[i.status] || i.status;
     if (i.progress && i.status === "working") st += " " + (i.progress.done + i.progress.failed) + "/" + i.progress.total;
@@ -210,7 +226,7 @@ function render() {
       : lib.scanned ? lib.files.toLocaleString() + " songs indexed · duplicates are skipped" : "not scanned yet";
   }
   if (cfg) {
-    $("w-cfg").textContent = cfg.audioFormat + " · max " + cfg.maxMinutes + " min · " + cfg.ratePerMinute + " requests/min";
+    $("w-cfg").textContent = cfg.audioFormat + " · max " + cfg.maxMinutes + " min · " + cfg.ratePerMinute + " requests/min · catalogues: iTunes" + (cfg.spotifyClientId && cfg.hasSpotifySecret ? " + Spotify" : "") + (cfg.downtifyEnabled ? " · backup: Downtify" : "");
     $("eng").textContent = cfg.engine === "local" ? (cfg.localModel || "local model") : "Claude Code · " + cfg.claudeModel;
   }
   $("sess").textContent = "Session: " + (lastReqs[0] ? lastReqs[0].id : "-");
@@ -225,6 +241,7 @@ const HELP = [
   "song name        request one song (add the artist for best results)",
   "/album NAME      download a whole album, e.g. /album the killers hot fuss",
   "/artist NAME     download an artist's albums, e.g. /artist daft punk",
+  "spotify link     paste a Spotify song, album, playlist or artist link",
   "/queue           show queue counts",
   "/config          open the config tab",
   "/clear           clear this screen",
@@ -274,7 +291,8 @@ function fillCfg() {
   $("c-url").value = cfg.localUrl; $("c-lmodel").value = cfg.localModel; $("c-ctx").value = cfg.contextLength; $("c-key").value = "";
   $("keyhint").textContent = cfg.hasKey ? "a key is saved" : "optional";
   $("c-fmt").value = cfg.audioFormat; $("c-max").value = cfg.maxMinutes; $("c-art").checked = cfg.embedArt;
-  $("c-paused").checked = cfg.paused; $("c-rate").value = cfg.ratePerMinute; $("c-folders").checked = cfg.artistFolders; $("c-maxalb").value = cfg.artistMaxAlbums; $("c-singles").checked = cfg.includeSingles; $("c-token").value = "";
+  $("c-paused").checked = cfg.paused; $("c-rate").value = cfg.ratePerMinute; $("c-folders").checked = cfg.artistFolders; $("c-maxalb").value = cfg.artistMaxAlbums; $("c-spid").value = cfg.spotifyClientId || ""; $("c-dten").checked = cfg.downtifyEnabled; $("c-dturl").value = cfg.downtifyUrl || ""; $("c-dtuser").value = cfg.downtifyUser || ""; $("c-dtpass").value = ""; $("dthint").textContent = cfg.hasDowntifyPassword ? "a password is saved" : "blank = default (downtify)"; $("c-spsec").value = "";
+  $("sphint").textContent = cfg.hasSpotifySecret ? "a secret is saved" : "not set"; $("c-singles").checked = cfg.includeSingles; $("c-token").value = "";
   $("tokhint").textContent = cfg.hasToken ? "a token is saved" : "run: claude setup-token";
   $("r-cur").style.display = cfg.hasPin ? "" : "none"; $("c-cur").value = ""; $("c-pin").value = "";
   showEngine();
@@ -286,11 +304,16 @@ $("c-save").onclick = async () => {
       engine: $("c-engine").value, claudeModel: $("c-cmodel").value,
       localUrl: $("c-url").value, localModel: $("c-lmodel").value, contextLength: +$("c-ctx").value, localKey: $("c-key").value,
       audioFormat: $("c-fmt").value, maxMinutes: +$("c-max").value, embedArt: $("c-art").checked,
-      paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, artistFolders: $("c-folders").checked, artistMaxAlbums: +$("c-maxalb").value, includeSingles: $("c-singles").checked, claudeToken: $("c-token").value,
+      paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, artistFolders: $("c-folders").checked, artistMaxAlbums: +$("c-maxalb").value, spotifyClientId: $("c-spid").value, downtifyEnabled: $("c-dten").checked, downtifyUrl: $("c-dturl").value, downtifyUser: $("c-dtuser").value, downtifyPassword: $("c-dtpass").value, spotifySecret: $("c-spsec").value, includeSingles: $("c-singles").checked, claudeToken: $("c-token").value,
       currentPin: $("c-cur").value, newPin: $("c-pin").value }) });
     fillCfg(); m.textContent = "saved"; render();
   } catch (err) { m.style.color = "#f87171"; m.textContent = err.message; }
   setTimeout(() => (m.textContent = ""), 3000);
+};
+$("c-dttest").onclick = async () => {
+  const m = $("dtmsg"); m.style.color = ""; m.textContent = "testing...";
+  try { const r = DEMO ? { ok: true, message: "connected to Downtify" } : await (await fetch("api/downtify/test")).json(); m.style.color = r.ok ? "#4ade80" : "#f87171"; m.textContent = r.message; }
+  catch (e) { m.style.color = "#f87171"; m.textContent = e.message; }
 };
 document.addEventListener("click", (e) => { if (!getSelection().toString() && $("v-req").style.display !== "none" && !e.target.closest("select,button,a")) $("q").focus(); });
 load(); setInterval(load, 4000);

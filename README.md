@@ -23,6 +23,18 @@ Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbr
 - Songs already in the music folder are skipped: the app indexes the folder's tags on start and every 30 minutes.
 - Tags and covers come from iTunes; songs it doesn't know are saved as singles named after the song.
 
+## Spotify (optional)
+Create an app at https://developer.spotify.com/dashboard and paste its Client ID and Secret into Config. Then:
+- paste Spotify song, album, playlist or artist links into the request box;
+- `/album` and `/artist` search Spotify by name when iTunes has no good match.
+Spotify only provides the tracklists and tags; audio still comes from YouTube. Spotify-made playlists
+(Discover Weekly, editorial playlists) can't be read by developer apps.
+
+## Downtify backup (optional)
+If the Downtify app is installed, turn on **Use Downtify as backup** in Config (default address and login work for
+the Umbrel app; press Test). Hermes Music always tries itself first and only hands a song to Downtify when it can't find
+or download it. The file is then moved from Downtify's folder into your music folder and re-tagged like any other song.
+
 ## Notes
 - The page has no login (guests use it); keep port 3340 off the internet.
 - Secrets (Claude token, API key) are stored in the app's data folder on the Umbrel and never sent to the page.

@@ -21,6 +21,8 @@ services:
       - ${APP_DATA_DIR}/data:/data
       # Umbrel Files: Home > Downloads > music (Navidrome library; Feishin plays from Navidrome)
       - ${UMBREL_ROOT}/home/Downloads/music:/music
+      # Downtify's download folder (the path its Umbrel app uses). Only used by the Downtify backup.
+      - ${UMBREL_ROOT}/data/storage/downloads/downtify:/downtify
     ports:
       # Guest-facing page at http://<umbrel-ip>:3340 (LAN only)
       - "3340:3000"
