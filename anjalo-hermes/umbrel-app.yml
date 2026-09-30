@@ -1,0 +1,31 @@
+manifestVersion: 1
+id: anjalo-hermes
+category: ai
+name: Hermes Agent
+version: "latest"
+tagline: Self-improving AI agent from Nous Research
+description: >-
+  Hermes Agent is an open-source AI agent by Nous Research with persistent memory,
+  a growing skill library, scheduled jobs, and messaging gateways (Telegram, Discord, Slack and more).
+
+
+  This app runs the official Hermes container with its web dashboard. Log in with the username
+  "umbrel" and your Umbrel app password (shown under the app's "Default credentials" in the Umbrel UI).
+  After installing, add your model provider API key (Anthropic, OpenAI, OpenRouter, Nous Portal, ...)
+  from the dashboard, or by editing the .env file in the app's data folder.
+
+
+  An OpenAI-compatible API is enabled inside the Umbrel Docker network for other apps.
+releaseNotes: ""
+developer: Nous Research
+website: https://hermes-agent.nousresearch.com
+dependencies: []
+repo: https://github.com/NousResearch/hermes-agent
+support: https://github.com/NousResearch/hermes-agent/issues
+port: 9119
+gallery: []
+path: ""
+defaultUsername: "umbrel"
+deterministicPassword: true
+submitter: Anjalo
+submission: ""

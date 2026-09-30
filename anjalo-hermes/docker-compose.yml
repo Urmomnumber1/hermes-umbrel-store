@@ -1,0 +1,57 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: anjalo-hermes_hermes_1
+      APP_PORT: 9119
+      # Hermes dashboard has its own login (required when bound to a non-loopback address)
+      PROXY_AUTH_ADD: "false"
+
+  hermes:
+    image: nousresearch/hermes-agent:stable
+    command: gateway run
+    restart: on-failure
+    stop_grace_period: 1m
+    shm_size: 1gb # needed by browser tools
+    user: "0:0"
+    volumes:
+      - ${APP_DATA_DIR}/data:/opt/data
+      # Skill that teaches Hermes to work the song request queue
+      - ${APP_DATA_DIR}/skills/song-requests:/opt/data/skills/song-requests:ro
+      # Music library. Point Navidrome/Jellyfin (used by Feishin) at this same folder.
+      - ${UMBREL_ROOT}/data/storage/downloads/music:/music
+    environment:
+      HERMES_UID: 1000
+      HERMES_GID: 1000
+      HERMES_DASHBOARD: "1"
+      HERMES_DASHBOARD_HOST: 0.0.0.0
+      HERMES_DASHBOARD_PORT: 9119
+      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: umbrel
+      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: ${APP_PASSWORD}
+      HERMES_DASHBOARD_BASIC_AUTH_SECRET: ${APP_SEED}
+      # OpenAI-compatible API, reachable only inside the Docker network (not published)
+      API_SERVER_ENABLED: "true"
+      API_SERVER_HOST: 0.0.0.0
+      API_SERVER_KEY: ${APP_SEED}
+      # Used by the song-requests skill
+      SONG_API: http://requests:3000
+      SONG_TOKEN: ${APP_SEED}
+
+  # Public song request page + queue API for Hermes
+  requests:
+    image: node:22-alpine
+    command: node /app/server.js
+    restart: on-failure
+    user: "1000:1000"
+    working_dir: /app
+    volumes:
+      - ${APP_DATA_DIR}/requests-app:/app:ro
+      - ${APP_DATA_DIR}/requests-data:/data
+    environment:
+      AGENT_TOKEN: ${APP_SEED}
+      HERMES_URL: http://hermes:8642
+      HERMES_KEY: ${APP_SEED}
+    ports:
+      # Guest-facing page at http://umbrel.local:3340 (LAN only, no Umbrel login needed)
+      - "3340:3000"
