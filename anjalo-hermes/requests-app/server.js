@@ -29,6 +29,7 @@ let busy = false;
 async function wake() {
   if (busy || !HERMES_URL || !items.some((i) => i.status === "pending")) return;
   busy = true;
+  const seen = new Set(items.filter((i) => i.status === "pending").map((i) => i.id));
   try {
     await fetch(`${HERMES_URL}/v1/chat/completions`, {
       method: "POST",
@@ -39,8 +40,13 @@ async function wake() {
       }),
       signal: AbortSignal.timeout(30 * 60 * 1000),
     });
-  } catch (e) { console.error("wake failed:", e.message); }
-  busy = false;
+    busy = false;
+    // Requests that arrived mid-run get picked up right away (never re-run the same ones: no loop)
+    if (items.some((i) => i.status === "pending" && !seen.has(i.id))) wake();
+  } catch (e) {
+    console.error("wake failed:", e.message);
+    busy = false; // the 5-minute timer retries
+  }
 }
 setInterval(wake, 5 * 60 * 1000);
 
