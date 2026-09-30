@@ -9,6 +9,11 @@ mkdir -p "$TOOLS/bin" /data/home /data/staging /music
 rm -f "$TOOLS/ready" "$TOOLS/setup.log"
 chown 1000:1000 /data /data/home /data/staging "$TOOLS" "$TOOLS/bin"
 
+# yt-dlp needs a JavaScript runtime for YouTube; use the Node that's already in this image.
+mkdir -p /data/home/.config/yt-dlp
+printf '%s\n' '--js-runtimes node' '--remote-components ejs:github' > /data/home/.config/yt-dlp/config
+chown -R 1000:1000 /data/home/.config
+
 (
   set -e
   export DEBIAN_FRONTEND=noninteractive

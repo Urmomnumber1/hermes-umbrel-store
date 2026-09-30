@@ -262,10 +262,16 @@ Request: ${JSON.stringify(query)}
 }
 async function ytSearch(query, n = 8) {
   const s = await run("yt-dlp", [`ytsearch${n}:${query}`, "--skip-download", "--no-warnings",
-    "--print", "%(id)s\t%(title)s\t%(channel)s\t%(duration)s"], { timeout: 120000 });
-  return s.out.split("\n").map((l) => l.split("\t")).filter((p) => p.length === 4 && /^[\w-]{11}$/.test(p[0]))
-    .map(([id, title, channel, dur]) => ({ id, title, channel, seconds: Number(dur) || 0 }))
-    .filter((v) => v.seconds > 0 && v.seconds <= config.maxMinutes * 60);
+    "--print", "%(.{id,title,channel,duration})j"], { timeout: 120000 }); // one JSON object per line
+  const rows = [];
+  for (const l of s.out.split("\n")) {
+    try {
+      const v = JSON.parse(l);
+      if (/^[\w-]{11}$/.test(v.id || "")) rows.push({ id: v.id, title: v.title || "", channel: v.channel || "", seconds: Number(v.duration) || 0 });
+    } catch {}
+  }
+  if (!rows.length && s.err.trim()) throw new Error("YouTube search failed: " + s.err.trim().split("\n").pop().slice(0, 150));
+  return rows.filter((v) => v.seconds > 0 && v.seconds <= config.maxMinutes * 60);
 }
 // Local model: we search YouTube ourselves and the model only picks from the results.
 async function identifyLocal(query) {
