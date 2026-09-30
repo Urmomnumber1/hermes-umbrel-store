@@ -19,8 +19,8 @@ services:
     volumes:
       - ${APP_DATA_DIR}/requests-app:/app:ro
       - ${APP_DATA_DIR}/data:/data
-      # Navidrome library folder (Feishin plays from Navidrome)
-      - ${UMBREL_ROOT}/data/storage/downloads/music:/music
+      # Umbrel Files: Home > Downloads > music (Navidrome library; Feishin plays from Navidrome)
+      - ${UMBREL_ROOT}/home/Downloads/music:/music
     ports:
       # Guest-facing page at http://<umbrel-ip>:3340 (LAN only)
       - "3340:3000"

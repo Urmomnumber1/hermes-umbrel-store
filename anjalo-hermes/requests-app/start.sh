@@ -4,6 +4,8 @@
 set -e
 TOOLS=/data/tools
 mkdir -p "$TOOLS/bin" /data/home /data/staging /music
+# The music folder must be writable by the app user (uid 1000). Only the top folder is changed.
+[ "$(stat -c %u /music)" = "1000" ] || chown 1000:1000 /music
 rm -f "$TOOLS/ready" "$TOOLS/setup.log"
 chown 1000:1000 /data /data/home /data/staging "$TOOLS" "$TOOLS/bin"
 
