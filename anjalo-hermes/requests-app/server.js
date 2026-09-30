@@ -4,9 +4,6 @@ const fs = require("fs");
 const path = require("path");
 
 const PORT = 3000;
-const TOKEN = process.env.AGENT_TOKEN;
-const HERMES_URL = process.env.HERMES_URL; // e.g. http://hermes:8642
-const HERMES_KEY = process.env.HERMES_KEY;
 const DB = "/data/requests.json";
 const PAGE = fs.readFileSync(path.join(__dirname, "index.html"));
 
@@ -24,36 +21,12 @@ const readBody = (req) => new Promise((ok) => {
   req.on("error", () => ok({}));
 });
 
-// Nudge Hermes to work the queue. One run at a time.
-let busy = false;
-async function wake() {
-  if (busy || !HERMES_URL || !items.some((i) => i.status === "pending")) return;
-  busy = true;
-  const seen = new Set(items.filter((i) => i.status === "pending").map((i) => i.id));
-  try {
-    await fetch(`${HERMES_URL}/v1/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${HERMES_KEY}` },
-      body: JSON.stringify({
-        model: "hermes-agent",
-        messages: [{ role: "user", content: "Process all pending song requests using the song-requests skill." }],
-      }),
-      signal: AbortSignal.timeout(30 * 60 * 1000),
-    });
-    busy = false;
-    // Requests that arrived mid-run get picked up right away (never re-run the same ones: no loop)
-    if (items.some((i) => i.status === "pending" && !seen.has(i.id))) wake();
-  } catch (e) {
-    console.error("wake failed:", e.message);
-    busy = false; // the 5-minute timer retries
-  }
-}
-setInterval(wake, 5 * 60 * 1000);
+// Requests are picked up by the worker on the owner's PC (worker/song-worker.ps1),
+// which polls /api/agent/pending. LAN-only, so the agent endpoints are not password protected.
 
 const rate = new Map(); // ip -> timestamps
 http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
-  const agent = req.headers.authorization === `Bearer ${TOKEN}`;
 
   if (req.method === "GET" && url.pathname === "/") return send(res, 200, PAGE, "text/html");
 
@@ -71,13 +44,12 @@ http.createServer(async (req, res) => {
     const q = String(query || "").trim().slice(0, 200);
     if (q.length < 2) return send(res, 400, { error: "Enter a song name" });
     const item = { id: Date.now().toString(36), query: q, status: "pending", created: new Date().toISOString() };
-    items.push(item); save(); wake();
+    items.push(item); save();
     return send(res, 201, item);
   }
 
-  // ---- agent API (Bearer token) ----
+  // ---- worker API ----
   if (url.pathname.startsWith("/api/agent/")) {
-    if (!agent) return send(res, 401, { error: "unauthorized" });
     if (req.method === "GET" && url.pathname === "/api/agent/pending")
       return send(res, 200, items.filter((i) => i.status === "pending"));
     const m = url.pathname.match(/^\/api\/agent\/requests\/([\w-]+)$/);
