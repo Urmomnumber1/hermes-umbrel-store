@@ -43,8 +43,6 @@ const DEFAULTS = {
   audioFormat: "mp3", maxMinutes: 10, embedArt: true, artistFolders: true,
   // albums and artists
   artistMaxAlbums: 10, includeSingles: false,
-  // Spotify (developer app, client credentials): tracklists and a second catalogue after iTunes
-  spotifyClientId: "", spotifySecret: "",
   // Downtify app, used only when our own YouTube search/download fails
   downtifyEnabled: false, downtifyUrl: "http://downtify_downtify_1:8000", downtifyUser: "admin", downtifyPassword: "",
   // queue
@@ -82,12 +80,6 @@ function updateConfig(b) {
   if (typeof b.artistFolders === "boolean") next.artistFolders = b.artistFolders;
   if (int(b.artistMaxAlbums, 1, 50) != null) next.artistMaxAlbums = int(b.artistMaxAlbums, 1, 50);
   if (typeof b.includeSingles === "boolean") next.includeSingles = b.includeSingles;
-  if (typeof b.spotifyClientId === "string") {
-    const id = b.spotifyClientId.trim();
-    if (id && !/^[A-Za-z0-9]{16,64}$/.test(id)) return "Spotify Client ID looks wrong (letters and numbers only)";
-    next.spotifyClientId = id;
-  }
-  if (typeof b.spotifySecret === "string" && b.spotifySecret) next.spotifySecret = secret(b.spotifySecret);
   if (typeof b.downtifyEnabled === "boolean") next.downtifyEnabled = b.downtifyEnabled;
   if (typeof b.downtifyUrl === "string") {
     const u = b.downtifyUrl.trim().replace(/\/+$/, "") || DEFAULTS.downtifyUrl;
@@ -106,14 +98,14 @@ function updateConfig(b) {
   if (next.engine === "local" && (!next.localUrl || !next.localModel)) return "local model needs a base URL and model name";
   config = next;
   fs.writeFileSync(CFG, JSON.stringify(config, null, 1));
-  spToken.exp = 0; dt.cookie = ""; // credentials may have changed
+  dt.cookie = ""; // Downtify login may have changed
   wake();
   return null;
 }
 // What the page may see: never the PIN or secrets.
 const publicConfig = () => {
-  const { pin, localKey, claudeToken, spotifySecret, downtifyPassword, ...rest } = config;
-  return { ...rest, hasPin: !!pin, hasKey: !!localKey, hasToken: !!claudeToken, hasSpotifySecret: !!spotifySecret, hasDowntifyPassword: !!downtifyPassword };
+  const { pin, localKey, claudeToken, downtifyPassword, spotifyClientId, spotifySecret, ...rest } = config; // spotify*: left over from 2.2.0 configs
+  return { ...rest, hasPin: !!pin, hasKey: !!localKey, hasToken: !!claudeToken, hasDowntifyPassword: !!downtifyPassword };
 };
 
 // ---------- helpers ----------
@@ -260,64 +252,104 @@ async function lookupMeta(artist, title) {
   return null;
 }
 
-// ---------- Spotify (client credentials; only catalogue data, audio still comes from YouTube) ----------
-const spToken = { token: "", exp: 0 };
-const hasSpotify = () => !!(config.spotifyClientId && config.spotifySecret);
-const SPOTIFY_LINK = /(?:open\.spotify\.com\/(?:intl-[a-z-]+\/)?|spotify:)(track|album|playlist|artist)[/:]([A-Za-z0-9]{22})/i;
-
-async function spotify(pathOrUrl, tries = 3) {
-  if (!hasSpotify()) throw new Error("Spotify isn't set up (add a Client ID and Secret in Config)");
-  if (Date.now() > spToken.exp - 60000) {
-    const res = await fetch("https://accounts.spotify.com/api/token", {
-      method: "POST", body: "grant_type=client_credentials", signal: AbortSignal.timeout(15000),
-      headers: {
-        authorization: "Basic " + Buffer.from(`${config.spotifyClientId}:${config.spotifySecret}`).toString("base64"),
-        "content-type": "application/x-www-form-urlencoded",
-      },
-    });
-    if (!res.ok) throw new Error(`Spotify login failed (HTTP ${res.status}) - check the Client ID and Secret`);
-    const j = await res.json();
-    Object.assign(spToken, { token: j.access_token, exp: Date.now() + j.expires_in * 1000 });
-  }
-  const url = pathOrUrl.startsWith("https://") ? pathOrUrl : `https://api.spotify.com/v1/${pathOrUrl}`;
-  const res = await fetch(url, { headers: { authorization: `Bearer ${spToken.token}` }, signal: AbortSignal.timeout(20000) });
-  if (res.status === 429 && tries > 0) { // rate limited: wait as told
-    await sleep(Math.min(Number(res.headers.get("retry-after")) || 5, 60) * 1000);
-    return spotify(pathOrUrl, tries - 1);
-  }
-  if (!res.ok) throw new Error(`Spotify returned HTTP ${res.status}${res.status === 404 ? " (not found, or a Spotify-made playlist apps can't read)" : ""}`);
-  return res.json();
+// ---------- Deezer (free, no key): second catalogue after iTunes ----------
+// drops "(Remastered 2009)", "- 2011 Remaster" etc. from Deezer names
+const unremaster = (s) => String(s || "").replace(/\s*[([]\s*(\d{4}\s+)?remaster(ed)?(\s+\d{4})?(\s+version)?\s*[)\]]/gi, "")
+  .replace(/\s+-\s+(\d{4}\s+)?remaster(ed)?(\s+\d{4})?(\s+version)?\s*$/i, "").trim();
+async function deezer(p) {
+  const res = await fetch(`https://api.deezer.com/${p}`, { signal: AbortSignal.timeout(20000) });
+  if (!res.ok) throw new Error(`Deezer returned HTTP ${res.status}`);
+  const j = await res.json();
+  if (j.error) throw new Error(`Deezer: ${j.error.message || "error"}`);
+  return j;
 }
-async function spotifyAll(page) { // follow "next" links
-  const out = [];
-  while (page) {
-    out.push(...page.items);
-    page = page.next && out.length < 2000 ? await spotify(page.next) : null;
-  }
-  return out;
-}
-const spReleaseType = (a) => (a.album_type === "single" ? (a.total_tracks > 3 ? "ep" : "single") : "album");
-function spTrackMeta(t, album = t.album) {
+const dzReleaseType = (a) => (a.record_type === "single" ? "single" : a.record_type === "ep" ? "ep" : "album");
+function dzTrackMeta(t, album) {
   return {
-    title: t.name, artist: t.artists.map((a) => a.name).join(", "),
-    album: album.name, releaseType: spReleaseType(album),
-    albumArtist: album.artists?.[0]?.name || t.artists[0].name,
+    title: unremaster(t.title), artist: t.artist?.name || album.artist?.name || "",
+    album: unremaster(album.title), releaseType: dzReleaseType(album),
+    albumArtist: album.artist?.name || t.artist?.name || "",
     date: (album.release_date || "").slice(0, 4),
-    track: t.track_number ? `${t.track_number}${album.total_tracks ? "/" + album.total_tracks : ""}` : "",
-    disc: t.disc_number ? String(t.disc_number) : "",
-    genre: "", cover: album.images?.[0]?.url || "", spotifyUrl: t.external_urls?.spotify || "",
-    seconds: Math.round((t.duration_ms || 0) / 1000),
+    track: t.track_position ? `${t.track_position}${album.nb_tracks ? "/" + album.nb_tracks : ""}` : "",
+    disc: t.disk_number ? String(t.disk_number) : "",
+    genre: album.genres?.data?.[0]?.name || "", cover: album.cover_xl || album.cover_big || "",
+    seconds: Number(t.duration) || 0,
   };
 }
-// Second catalogue for single songs (e.g. artists iTunes doesn't carry).
-async function spLookupMeta(artist, title) {
-  const r = await spotify(`search?type=track&limit=10&market=US&q=${encodeURIComponent(`track:${title} artist:${artist}`)}`);
-  const a = norm(artist), t = norm(title), wantVersion = VERSION.test(title);
-  const good = (r.tracks?.items || []).filter((x) => norm(x.name) === t && (wantVersion || !VERSION.test(x.name))
-    && x.artists.some((y) => norm(y.name) === a || a.startsWith(norm(y.name))));
-  const pick = good.find((x) => x.album.album_type === "album") || good[0]; // Spotify already sorts by popularity
-  return pick ? spTrackMeta(pick) : null;
+async function dzLookupMeta(artist, title) {
+  const r = await deezer(`search/track?limit=15&q=${encodeURIComponent(`${artist} ${title}`)}`);
+  const a = norm(artist), t = norm(unremaster(title)), wantVersion = VERSION.test(title);
+  const pick = (r.data || []).find((x) => norm(unremaster(x.title)) === t && (wantVersion || !VERSION.test(unremaster(x.title)))
+    && (norm(x.artist?.name) === a || a.startsWith(norm(x.artist?.name)) || norm(x.artist?.name).startsWith(a + " "))
+    && !COMP.test(x.album?.title || "")); // Deezer sorts by popularity
+  if (!pick) return null;
+  const [track, album] = await Promise.all([deezer(`track/${pick.id}`), deezer(`album/${pick.album.id}`)]);
+  return dzTrackMeta(track, album);
 }
+async function deezerAlbum(item, id) {
+  const [album, list] = await Promise.all([deezer(`album/${id}`), deezer(`album/${id}/tracks?limit=300`)]);
+  const tracks = list.data || [];
+  if (!tracks.length) return { status: "failed", note: "no tracks listed for this album" };
+  insertChildren(item, tracks.map((t) => ({ type: "song", query: `${t.artist?.name} - ${t.title}`, meta: dzTrackMeta(t, album) })));
+  return { status: "working", title: unremaster(album.title), artist: album.artist?.name, note: "tracklist from Deezer" };
+}
+async function deezerArtist(item, id, name) {
+  const r = await deezer(`artist/${id}/albums?limit=200`);
+  const wanted = (r.data || []).filter((a) => !COMP.test(a.title) && !/abridged|karaoke|instrumental/i.test(a.title)
+    && (config.includeSingles ? a.record_type !== "compile" : a.record_type === "album"));
+  // no track counts in this list: a "Deluxe"/expanded edition stands in for "more tracks"
+  const pick = newestAlbums(wanted, (a) => a.title, (a) => (/deluxe|expanded|complete|edition/i.test(a.title) ? 1 : 0), (a) => a.release_date);
+  if (!pick.length) return { status: "failed", note: "no albums found (try enabling singles & EPs in Config)" };
+  insertChildren(item, pick.map((a) => ({ type: "album", query: a.title, deezerId: a.id })));
+  return { status: "working", artist: name, title: `${pick.length} release${pick.length === 1 ? "" : "s"}` };
+}
+
+// ---------- Spotify links (no account: the public embed pages list the tracks) ----------
+const SPOTIFY_LINK = /(?:open\.spotify\.com\/(?:intl-[a-z-]+\/)?(?:embed\/)?|spotify:)(track|album|playlist|artist)[/:]([A-Za-z0-9]{22})/i;
+async function spotifyEmbed(kind, id) {
+  const res = await fetch(`https://open.spotify.com/embed/${kind}/${id}`, {
+    headers: { "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36" },
+    signal: AbortSignal.timeout(20000),
+  });
+  if (!res.ok) throw new Error(`Spotify returned HTTP ${res.status}${res.status === 404 ? " (link not found or private)" : ""}`);
+  const m = (await res.text()).match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/);
+  const entity = m && JSON.parse(m[1])?.props?.pageProps?.state?.data?.entity;
+  if (!entity) throw new Error("couldn't read that Spotify page (Spotify may have changed it)");
+  return entity;
+}
+const spCover = (e) => (e.visualIdentity?.image || []).slice().sort((a, b) => (b.maxWidth || 0) - (a.maxWidth || 0))[0]?.url || "";
+const spUrl = (uri) => { const m = String(uri || "").match(/track:([A-Za-z0-9]{22})/); return m ? `https://open.spotify.com/track/${m[1]}` : ""; };
+// Fills in album tags for a song we only know by name (iTunes, then Deezer); keeps the known length and link.
+async function enrich(base) {
+  const first = base.artist.split(", ")[0];
+  const found = await lookupMeta(first, base.title).catch(() => null) || await dzLookupMeta(first, base.title).catch(() => null);
+  if (found) return { ...found, seconds: base.seconds || found.seconds, spotifyUrl: base.spotifyUrl };
+  // in neither catalogue: a single named after the song, so it isn't filed under "Unknown Album"
+  return { releaseType: "single", ...base, albumArtist: base.albumArtist || first, album: base.album || base.title };
+}
+async function spotifyAlbum(item, id) {
+  const e = await spotifyEmbed("album", id);
+  const tracks = e.trackList || [];
+  if (!tracks.length) return { status: "failed", note: "no tracks listed for this album" };
+  const artist = String(e.subtitle || "").split(", ")[0], cover = spCover(e), date = (e.releaseDate?.isoString || "").slice(0, 4);
+  insertChildren(item, tracks.map((t, i) => ({
+    type: "song", query: `${t.subtitle} - ${t.title}`,
+    meta: { title: t.title, artist: t.subtitle || artist, album: e.name, albumArtist: artist, releaseType: tracks.length <= 3 ? "single" : "album",
+      date, track: `${i + 1}/${tracks.length}`, cover, seconds: Math.round((t.duration || 0) / 1000), spotifyUrl: spUrl(t.uri) },
+  })));
+  return { status: "working", title: e.name, artist, note: "tracklist from Spotify" };
+}
+async function expandPlaylist(item) {
+  const e = await spotifyEmbed("playlist", item.spotifyId);
+  const tracks = (e.trackList || []).filter((t) => t.title && (t.entityType || "track") === "track");
+  if (!tracks.length) return { status: "failed", note: "playlist is empty or private" };
+  insertChildren(item, tracks.map((t) => ({
+    type: "song", query: `${t.subtitle} - ${t.title}`,
+    meta: { title: t.title, artist: t.subtitle || "", seconds: Math.round((t.duration || 0) / 1000), spotifyUrl: spUrl(t.uri), lookup: true },
+  })));
+  return { status: "working", title: e.name, artist: e.subtitle || "" };
+}
+
 // Picks the album whose name best matches the request.
 function albumScore(query, name, isAlbum) {
   const flat = (s) => s.replace(/ /g, "");
@@ -535,11 +567,9 @@ async function saveViaDowntify(meta, query) {
     url = pick.url || (pick.youtube_id ? `https://www.youtube.com/watch?v=${pick.youtube_id}` : "");
     if (!url) throw new Error("Downtify's search result had no link");
     body = pick;
-    if (!meta) { // plain request: take the names from Downtify, then the tags from iTunes/Spotify
+    if (!meta) { // plain request: take the names from Downtify, then the tags from iTunes/Deezer
       const artist = Array.isArray(pick.artists) ? pick.artists.map((a) => a.name || a).join(", ") : pick.artist || "";
-      meta = await lookupMeta(artist, name(pick)).catch(() => null)
-        || (hasSpotify() ? await spLookupMeta(artist, name(pick)).catch(() => null) : null)
-        || { title: name(pick), artist, albumArtist: artist, album: name(pick), releaseType: "single" };
+      meta = await enrich({ title: name(pick), artist });
     }
   }
   if (inLibrary(meta.artist, meta.title) || inLibrary(meta.albumArtist, meta.title)) return { ...meta, skipped: true };
@@ -584,7 +614,12 @@ function songDone(meta, skipped) {
   return { status: "done", artist: meta.artist, title: meta.title, note: skipped || info };
 }
 async function processSong(item) {
-  if (item.spotifyId && !item.meta) item.meta = spTrackMeta(await spotify(`tracks/${item.spotifyId}?market=US`)); // Spotify song link
+  if (item.spotifyId && !item.meta) { // Spotify song link
+    const e = await spotifyEmbed("track", item.spotifyId);
+    item.meta = await enrich({ title: e.name, artist: (e.artists || []).map((a) => a.name).join(", "), seconds: Math.round((e.duration || 0) / 1000),
+      spotifyUrl: `https://open.spotify.com/track/${item.spotifyId}`, cover: spCover(e), date: (e.releaseDate?.isoString || "").slice(0, 4) });
+  }
+  if (item.meta?.lookup) item.meta = await enrich(item.meta); // playlist song: find its album
   let meta = item.meta;
   if (meta) { // from an album/artist/playlist request or link: exact song known
     if (inLibrary(meta.artist, meta.title) || inLibrary(meta.albumArtist, meta.title)) return { status: "done", artist: meta.artist, title: meta.title, note: "already in the library" };
@@ -603,10 +638,7 @@ async function processSong(item) {
     return withBackup(async () => { throw e; }, null, item.query);
   }
   if (r.error) return withBackup(async () => null, null, item.query, String(r.error).slice(0, 200));
-  meta = await lookupMeta(r.artist, r.title).catch(() => null)
-    || (hasSpotify() ? await spLookupMeta(r.artist, r.title).catch(() => null) : null)
-    // in neither catalogue: treat it as a single named after the song, so it isn't filed under "Unknown Album"
-    || { title: r.title, artist: r.artist, albumArtist: r.artist, album: r.title, releaseType: "single" };
+  meta = await enrich({ title: r.title, artist: r.artist }); // album tags from iTunes, then Deezer
   if (inLibrary(meta.artist, meta.title) || inLibrary(meta.albumArtist, meta.title))
     return { status: "done", artist: meta.artist, title: meta.title, note: "already in the library" };
   return withBackup(async () => songDone(meta, await saveSong(r.video_id, meta)), meta, item.query);
@@ -616,7 +648,7 @@ function insertChildren(parent, kids) {
   items.splice(at, 0, ...kids.map((k) => ({ id: newId(), parent: parent.id, root: parent.root || parent.id, status: "pending", created: new Date().toISOString(), ...k })));
 }
 
-// --- albums: iTunes first; if it has no good match, Spotify by name ---
+// --- albums: iTunes first; if it has no good match, Deezer by name ---
 async function itunesAlbum(item, collectionId) {
   const res = await itunes("lookup", { id: collectionId, entity: "song", limit: 200 });
   const album = res.find((r) => r.wrapperType === "collection");
@@ -626,34 +658,28 @@ async function itunesAlbum(item, collectionId) {
   insertChildren(item, tracks.map((r) => ({ type: "song", query: `${r.artistName} - ${r.trackName}`, meta: trackMeta(r) })));
   return { status: "working", title: cleanAlbum(album?.collectionName || tracks[0].collectionName), artist: album?.artistName || tracks[0].artistName, note: "tracklist from iTunes" };
 }
-async function spotifyAlbum(item, id) {
-  const album = await spotify(`albums/${id}?market=US`);
-  const tracks = await spotifyAll(album.tracks);
-  if (!tracks.length) return { status: "failed", note: "no tracks listed for this album" };
-  insertChildren(item, tracks.map((t) => ({ type: "song", query: `${t.artists[0].name} - ${t.name}`, meta: spTrackMeta(t, album) })));
-  return { status: "working", title: album.name, artist: album.artists[0].name, note: "tracklist from Spotify" };
-}
 async function expandAlbum(item) {
   if (item.spotifyId) return spotifyAlbum(item, item.spotifyId);
+  if (item.deezerId) return deezerAlbum(item, item.deezerId);
   if (item.collectionId) return itunesAlbum(item, item.collectionId);
   const found = (await itunes("search", { term: item.query, entity: "album", limit: 15 }))
     .filter((c) => !/karaoke|tribute|various artists/i.test(`${c.collectionName} ${c.artistName}`));
   const iScore = (c) => albumScore(item.query, c.collectionName, releaseType(c.collectionName) === "album");
   found.sort((x, y) => iScore(x) - iScore(y)); // stable sort keeps iTunes order for ties
-  if (found[0] && iScore(found[0]) < 4) return itunesAlbum(item, found[0].collectionId); // album name matches the request
+  const best = found[0] ? iScore(found[0]) : 9;
+  if (best === 0) return itunesAlbum(item, found[0].collectionId); // exact album name on iTunes
 
-  if (hasSpotify()) {
-    const r = await spotify(`search?type=album&limit=10&market=US&q=${encodeURIComponent(item.query)}`);
-    const sp = (r.albums?.items || []).filter((a) => !/karaoke|tribute/i.test(`${a.name} ${a.artists[0]?.name}`));
-    const sScore = (a) => albumScore(item.query, a.name, a.album_type === "album");
-    sp.sort((x, y) => sScore(x) - sScore(y)); // ties keep Spotify's popularity order
-    if (sp[0]) return spotifyAlbum(item, sp[0].id);
-  }
-  if (found[0]) return itunesAlbum(item, found[0].collectionId); // weak iTunes match is better than nothing
-  return { status: "failed", note: `album not found on iTunes${hasSpotify() ? " or Spotify" : " (set up Spotify in Config to search there too)"}` };
+  // otherwise ask Deezer too, and use it if it matches better (e.g. iTunes only has a same-named single)
+  const dz = ((await deezer(`search/album?limit=15&q=${encodeURIComponent(item.query)}`).catch(() => ({}))).data || [])
+    .filter((a) => !/karaoke|tribute|ukulele|lullaby/i.test(`${a.title} ${a.artist?.name}`));
+  const dScore = (a) => albumScore(item.query, unremaster(a.title), a.record_type === "album");
+  dz.sort((x, y) => dScore(x) - dScore(y)); // ties keep Deezer's popularity order
+  if (dz[0] && (dScore(dz[0]) < best || best >= 4)) return deezerAlbum(item, dz[0].id);
+  if (found[0]) return itunesAlbum(item, found[0].collectionId);
+  return { status: "failed", note: "album not found on iTunes or Deezer - try 'artist album name'" };
 }
 
-// --- artists: iTunes when it knows the exact name, otherwise Spotify ---
+// --- artists: iTunes when it knows the exact name, otherwise Deezer ---
 function newestAlbums(list, name, tracks, date) { // one edition per album (most tracks), newest first
   const byName = new Map();
   for (const c of list) {
@@ -662,28 +688,18 @@ function newestAlbums(list, name, tracks, date) { // one edition per album (most
   }
   return [...byName.values()].sort((a, b) => String(date(b)).localeCompare(String(date(a)))).slice(0, config.artistMaxAlbums);
 }
-async function spotifyArtist(item, id) {
-  const artist = await spotify(`artists/${id}`);
-  const groups = config.includeSingles ? "album,single" : "album";
-  const all = await spotifyAll(await spotify(`artists/${id}/albums?include_groups=${groups}&market=US&limit=50`));
-  const pick = newestAlbums(all.filter((a) => !COMP.test(a.name)), (a) => a.name, (a) => a.total_tracks, (a) => a.release_date);
-  if (!pick.length) return { status: "failed", note: "no albums found (try enabling singles & EPs in Config)" };
-  insertChildren(item, pick.map((a) => ({ type: "album", query: a.name, spotifyId: a.id })));
-  return { status: "working", artist: artist.name, title: `${pick.length} release${pick.length === 1 ? "" : "s"}` };
-}
 async function expandArtist(item) {
-  if (item.spotifyId) return spotifyArtist(item, item.spotifyId);
+  if (item.spotifyId) item.query = (await spotifyEmbed("artist", item.spotifyId)).name; // Spotify artist link: use the name
   const q = norm(item.query);
   const artists = await itunes("search", { term: item.query, entity: "musicArtist", limit: 10 });
   let artist = artists.find((a) => norm(a.artistName) === q);
-  if (!artist && hasSpotify()) {
-    const r = await spotify(`search?type=artist&limit=5&market=US&q=${encodeURIComponent(item.query)}`);
-    const sp = r.artists?.items || [];
-    const hit = sp.find((a) => norm(a.name) === q) || sp[0];
-    if (hit) return spotifyArtist(item, hit.id);
+  if (!artist) {
+    const dz = (await deezer(`search/artist?limit=5&q=${encodeURIComponent(item.query)}`).catch(() => ({}))).data || [];
+    const hit = dz.find((a) => norm(a.name) === q) || dz[0];
+    if (hit) return deezerArtist(item, hit.id, hit.name);
   }
   artist = artist || artists[0];
-  if (!artist) return { status: "failed", note: `artist not found on iTunes${hasSpotify() ? " or Spotify" : ""}` };
+  if (!artist) return { status: "failed", note: "artist not found on iTunes or Deezer" };
   const res = await itunes("lookup", { id: artist.artistId, entity: "album", limit: 200 });
   const albums = res.filter((c) => c.wrapperType === "collection" && c.artistId === artist.artistId
     && !COMP.test(c.collectionName) && (config.includeSingles || releaseType(c.collectionName) === "album"))
@@ -692,15 +708,6 @@ async function expandArtist(item) {
   if (!pick.length) return { status: "failed", note: "no albums found (try enabling singles & EPs in Config)" };
   insertChildren(item, pick.map((c) => ({ type: "album", query: c.collectionName, collectionId: c.collectionId })));
   return { status: "working", artist: artist.artistName, title: `${pick.length} release${pick.length === 1 ? "" : "s"}` };
-}
-
-// --- Spotify playlists (links only) ---
-async function expandPlaylist(item) {
-  const p = await spotify(`playlists/${item.spotifyId}?market=US`);
-  const tracks = (await spotifyAll(p.tracks)).map((x) => x.track).filter((t) => t && t.type === "track" && !t.is_local && t.album);
-  if (!tracks.length) return { status: "failed", note: "playlist is empty or unreadable" };
-  insertChildren(item, tracks.map((t) => ({ type: "song", query: `${t.artists[0].name} - ${t.name}`, meta: spTrackMeta(t) })));
-  return { status: "working", title: p.name, artist: p.owner?.display_name || "" };
 }
 
 // counts of all songs below an album/artist request
@@ -830,7 +837,6 @@ http.createServer(async (req, res) => {
     const item = { id: newId(), type, query: q, status: "pending", created: new Date().toISOString() };
     const link = q.match(SPOTIFY_LINK); // a pasted Spotify link decides the type by itself
     if (link) {
-      if (!hasSpotify()) return send(res, 400, { error: "Spotify links need a Spotify Client ID and Secret in Config" });
       item.type = link[1].toLowerCase() === "track" ? "song" : link[1].toLowerCase();
       item.spotifyId = link[2];
     }
