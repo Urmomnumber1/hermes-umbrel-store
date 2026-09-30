@@ -17,6 +17,12 @@ Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbr
 5. Make sure Navidrome's music folder is Home > Downloads > music. If existing files there aren't writable, run
    `sudo chown -R 1000:1000 /home/umbrel/umbrel/home/Downloads/music` once on the Umbrel.
 
+## Using it
+- Type a song name (add the artist for best results).
+- `/album NAME` downloads a whole album, `/artist NAME` an artist's albums (limits in Config).
+- Songs already in the music folder are skipped: the app indexes the folder's tags on start and every 30 minutes.
+- Tags and covers come from iTunes; songs it doesn't know are saved as singles named after the song.
+
 ## Notes
 - The page has no login (guests use it); keep port 3340 off the internet.
 - Secrets (Claude token, API key) are stored in the app's data folder on the Umbrel and never sent to the page.
