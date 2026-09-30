@@ -2,7 +2,7 @@ manifestVersion: 1
 id: anjalo-hermes
 category: ai
 name: Hermes Agent
-version: "latest"
+version: "2026.9.24"
 tagline: Self-improving AI agent from Nous Research
 description: >-
   Hermes Agent is an open-source AI agent by Nous Research with persistent memory,
