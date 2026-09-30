@@ -1,10 +1,11 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Song Requests</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Hermes Music</title>
+<link rel="icon" href="https://raw.githubusercontent.com/Urmomnumber1/hermes-umbrel-store/main/anjalo-hermes/icon.png">
 <style>
-:root{color-scheme:light dark;--bg:#fafafa;--fg:#1a1a1a;--card:#fff;--mut:#777;--acc:#6d4aff;--bd:#e3e3e3}
-@media(prefers-color-scheme:dark){:root{--bg:#141416;--fg:#eee;--card:#1e1e22;--mut:#999;--bd:#333}}
-body{margin:0;font:16px system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+:root{color-scheme:dark;--bg:#0b2a6f;--fg:#f2f6ff;--card:rgba(255,255,255,.1);--mut:#b7c8f0;--acc:#3b82f6;--bd:rgba(255,255,255,.22)}
+body{margin:0;min-height:100vh;font:16px system-ui,sans-serif;background:linear-gradient(160deg,#1a4fc4,#0b2a6f 60%,#071b4a) fixed;color:var(--fg)}
+input::placeholder{color:var(--mut)}
 main{max-width:560px;margin:0 auto;padding:24px 16px}
 h1{font-size:1.5rem}form{display:flex;gap:8px}
 input{flex:1;padding:12px;border:1px solid var(--bd);border-radius:10px;background:var(--card);color:var(--fg);font-size:1rem;min-width:0}
@@ -12,10 +13,10 @@ button{padding:12px 18px;border:0;border-radius:10px;background:var(--acc);color
 ul{list-style:none;padding:0}
 li{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px;margin-top:8px;display:flex;justify-content:space-between;gap:8px}
 small{color:var(--mut)}
-.s{font-size:.8rem;white-space:nowrap}.done{color:#1a9c4a}.failed{color:#d33}.working{color:var(--acc)}
+.s{font-size:.8rem;white-space:nowrap}.done{color:#6ee7a0}.failed{color:#ff9a9a}.working{color:#9ec5ff}
 #msg{color:var(--mut);min-height:1.2em}
 </style></head><body><main>
-<h1>Request a song</h1>
+<h1>Hermes Music - request a song</h1>
 <form id="f"><input id="q" placeholder="Song name and artist" maxlength="200" required autofocus><button>Request</button></form>
 <p id="msg"></p><ul id="l"></ul></main>
 <script>
