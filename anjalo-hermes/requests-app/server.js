@@ -6,6 +6,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
+const { AsyncLocalStorage } = require("async_hooks");
 
 const PORT = 3000;
 const DB = "/data/requests.json";
@@ -13,6 +14,9 @@ const CFG = "/data/config.json";
 const LIBCACHE = "/data/library-cache.json";
 const MUSIC = "/music";
 const STAGING = "/data/staging";
+// Each worker (Claude / local model) runs in its own context with its own staging folder, so two can download at once.
+const ctx = new AsyncLocalStorage();
+const ST = () => ctx.getStore()?.stage || STAGING;
 const READY = "/data/tools/ready";
 const PAGE = fs.readFileSync(path.join(__dirname, "index.html"));
 
@@ -44,7 +48,7 @@ const DEFAULTS = {
   // albums and artists
   artistMaxAlbums: 10, includeSingles: false,
   // Downtify app, used only when our own YouTube search/download fails
-  downtifyEnabled: false, downtifyUrl: "http://downtify_downtify_1:8000", downtifyUser: "admin", downtifyPassword: "",
+  downtifyEnabled: false, downtifyUrl: "http://downtify_downtify_1:8000", downtifyUser: "admin", downtifyPassword: "", downtifyToken: "",
   // queue
   paused: false, ratePerMinute: 5,
   // security
@@ -59,7 +63,7 @@ const secret = (v) => (v === "-" ? "" : String(v).trim().slice(0, 500)); // "-" 
 function updateConfig(b) {
   if (config.pin && String(b.currentPin || "") !== config.pin) return "wrong PIN";
   const next = { ...config };
-  if (["claude", "local"].includes(b.engine)) next.engine = b.engine;
+  if (["claude", "local", "both"].includes(b.engine)) next.engine = b.engine;
   if (["sonnet", "opus", "haiku"].includes(b.claudeModel)) next.claudeModel = b.claudeModel;
   if (typeof b.claudeToken === "string" && b.claudeToken) next.claudeToken = secret(b.claudeToken);
   if (typeof b.localUrl === "string") {
@@ -88,6 +92,7 @@ function updateConfig(b) {
   }
   if (typeof b.downtifyUser === "string") next.downtifyUser = b.downtifyUser.trim().slice(0, 100);
   if (typeof b.downtifyPassword === "string" && b.downtifyPassword) next.downtifyPassword = secret(b.downtifyPassword);
+  if (b.downtifyToken === "-") next.downtifyToken = ""; // "unpair"
   if (typeof b.paused === "boolean") next.paused = b.paused;
   if (int(b.ratePerMinute, 1, 30) != null) next.ratePerMinute = int(b.ratePerMinute, 1, 30);
   if (typeof b.newPin === "string" && b.newPin) {
@@ -95,17 +100,17 @@ function updateConfig(b) {
     else if (/^\d{4,12}$/.test(b.newPin)) next.pin = b.newPin;
     else return "PIN must be 4-12 digits";
   }
-  if (next.engine === "local" && (!next.localUrl || !next.localModel)) return "local model needs a base URL and model name";
+  if (next.engine !== "claude" && (!next.localUrl || !next.localModel)) return "the local model needs a base URL and model name";
   config = next;
   fs.writeFileSync(CFG, JSON.stringify(config, null, 1));
-  dt.cookie = ""; // Downtify login may have changed
+  Object.assign(dt, { cookie: "", blockedUntil: 0, noAuth: false, failed: "" }); // Downtify login may have changed
   wake();
   return null;
 }
 // What the page may see: never the PIN or secrets.
 const publicConfig = () => {
-  const { pin, localKey, claudeToken, downtifyPassword, spotifyClientId, spotifySecret, ...rest } = config; // spotify*: left over from 2.2.0 configs
-  return { ...rest, hasPin: !!pin, hasKey: !!localKey, hasToken: !!claudeToken, hasDowntifyPassword: !!downtifyPassword };
+  const { pin, localKey, claudeToken, downtifyPassword, downtifyToken, spotifyClientId, spotifySecret, ...rest } = config; // spotify*: left over from 2.2.0 configs
+  return { ...rest, hasPin: !!pin, hasKey: !!localKey, hasToken: !!claudeToken, hasDowntifyPassword: !!downtifyPassword, downtifyPaired: !!downtifyToken };
 };
 
 // ---------- helpers ----------
@@ -173,32 +178,52 @@ async function* walk(dir) {
     else if (AUDIO.test(e.name)) yield p;
   }
 }
+// fills in artist/title for files without tags, from "Artist - Title.ext" or ".../Artist/[Album/]01 Title.ext"
+function guessFromPath(file, c) {
+  if (c.t) return c;
+  const base = path.basename(file).replace(AUDIO, "");
+  const parts = path.relative(MUSIC, file).split(path.sep);
+  const m = base.match(/^(.+?) - (.+)$/);
+  if (m && !/^\d+$/.test(m[1])) { c.a = c.a || m[1]; c.t = m[2]; }
+  else { c.t = base.replace(/^\d+[\s.\-_]+/, ""); c.a = c.a || (parts.length > 1 ? parts[0] : ""); }
+  return c;
+}
+const addKeys = (set, c) => { for (const a of [c.a, c.aa]) if (a && c.t) set.add(songKey(a, c.t)); };
+// Known instantly at startup: the saved index from the last scan (the rescan then only reads new/changed files).
+for (const c of Object.values(libCache)) addKeys(library.keys, c);
+library.files = Object.keys(libCache).length;
+library.scanned = library.files > 0;
+
 async function scanLibrary() {
   if (library.scanning) return;
   library.scanning = true;
   const fresh = {}, keys = new Set();
-  let n = 0;
+  let n = 0, sinceSave = 0;
   try {
-    for await (const file of walk(MUSIC)) {
-      let st; try { st = await fs.promises.stat(file); } catch { continue; }
-      let c = libCache[file];
-      if (!c || c.m !== st.mtimeMs) {
-        const t = await probeTags(file);
-        c = { m: st.mtimeMs, a: t.artist || "", aa: t.album_artist || t.albumartist || "", t: t.title || "" };
+    const files = [];
+    for await (const file of walk(MUSIC)) files.push(file); // listing folders is quick; reading tags is the slow part
+    let next = 0;
+    const one = async () => {
+      while (next < files.length) {
+        const file = files[next++];
+        let st; try { st = await fs.promises.stat(file); } catch { continue; }
+        let c = libCache[file];
+        if (!c || c.m !== st.mtimeMs) { // only new or changed files are read
+          const t = await probeTags(file);
+          c = guessFromPath(file, { m: st.mtimeMs, a: t.artist || "", aa: t.album_artist || t.albumartist || "", t: t.title || "" });
+          libCache[file] = c; // remembered right away, so a restart mid-scan doesn't start over
+          if (++sinceSave >= 500) { sinceSave = 0; fs.promises.writeFile(LIBCACHE, JSON.stringify(libCache)).catch(() => {}); }
+        }
+        fresh[file] = c;
+        addKeys(keys, c);
+        addKeys(library.keys, c); // usable for the duplicate check while the scan is still running
+        library.files = Math.max(library.files, ++n);
       }
-      if (!c.t) { // no tags: guess from "Artist - Title.ext" or ".../Artist/[Album/]01 Title.ext"
-        const base = path.basename(file).replace(AUDIO, "");
-        const parts = path.relative(MUSIC, file).split(path.sep);
-        const m = base.match(/^(.+?) - (.+)$/);
-        if (m && !/^\d+$/.test(m[1])) { c.a = c.a || m[1]; c.t = m[2]; }
-        else { c.t = base.replace(/^\d+[\s.\-_]+/, ""); c.a = c.a || (parts.length > 1 ? parts[0] : ""); }
-      }
-      fresh[file] = c;
-      for (const a of [c.a, c.aa]) if (a) keys.add(songKey(a, c.t));
-      library.files = ++n;
-    }
-    libCache = fresh;
+    };
+    await Promise.all(Array.from({ length: 8 }, one)); // 8 files at a time
+    libCache = fresh; // drops files that were deleted
     library.keys = keys;
+    library.files = n;
     library.scanned = true;
     fs.writeFileSync(LIBCACHE, JSON.stringify(libCache));
     console.log(`library: ${n} files indexed`);
@@ -208,8 +233,7 @@ async function scanLibrary() {
     library.scanning = false;
     library.lastScan = Date.now();
   }
-}
-const inLibrary = (artist, title) => library.keys.has(songKey(artist, title));
+}const inLibrary = (artist, title) => library.keys.has(songKey(artist, title));
 
 // ---------- /duplicate: find copies of the same song, keep the best one ----------
 // Same artist + title AND lengths within 3 seconds. Removed copies are moved to /music/.duplicates (hidden,
@@ -556,11 +580,11 @@ async function finishSong(raw, ext, meta, thumb) {
   if (fs.existsSync(dest)) return "already in the library";
   let cover = null;
   if (config.embedArt) {
-    const c = path.join(STAGING, "cover.jpg");
+    const c = path.join(ST(), "cover.jpg");
     if (meta.cover && await fetchFile(meta.cover, c).catch(() => false)) cover = c;
     else if (thumb && fs.existsSync(thumb)) cover = thumb;
   }
-  const out = path.join(STAGING, `tagged.${ext}`);
+  const out = path.join(ST(), `tagged.${ext}`);
   const tags = {
     title, artist, album_artist: albumArtist, album, date: meta.date, track: meta.track, disc: meta.disc, genre: meta.genre,
     releasetype: meta.releaseType, "MusicBrainz Album Type": meta.releaseType,
@@ -571,7 +595,7 @@ async function finishSong(raw, ext, meta, thumb) {
 
   fs.mkdirSync(dir, { recursive: true });
   fs.copyFileSync(file, dest, fs.constants.COPYFILE_EXCL); // /music is a different disk mount, so copy (never overwrite)
-  fs.rmSync(STAGING, { recursive: true, force: true });
+  fs.rmSync(ST(), { recursive: true, force: true });
   library.keys.add(songKey(artist, title));
   library.keys.add(songKey(albumArtist, title));
   console.log("added", dest);
@@ -581,35 +605,72 @@ async function finishSong(raw, ext, meta, thumb) {
 async function saveSong(videoId, meta) {
   const fmt = config.audioFormat;
   if (fs.existsSync(destFor(meta, fmt).dest)) return "already in the library";
-  fs.rmSync(STAGING, { recursive: true, force: true }); fs.mkdirSync(STAGING, { recursive: true });
+  fs.rmSync(ST(), { recursive: true, force: true }); fs.mkdirSync(ST(), { recursive: true });
   const d = await run("yt-dlp", ["--no-playlist", "--no-warnings", "-x", "--audio-format", fmt, "--audio-quality", "0",
     ...(config.embedArt && !meta.cover ? ["--write-thumbnail", "--convert-thumbnails", "jpg"] : []),
-    "-o", path.join(STAGING, "song.%(ext)s"), `https://www.youtube.com/watch?v=${videoId}`]);
-  const raw = path.join(STAGING, `song.${fmt}`);
+    "-o", path.join(ST(), "song.%(ext)s"), `https://www.youtube.com/watch?v=${videoId}`]);
+  const raw = path.join(ST(), `song.${fmt}`);
   if (!fs.existsSync(raw)) throw new Error("download failed: " + (d.err.trim().split("\n").pop() || "unknown"));
-  return finishSong(raw, fmt, meta, path.join(STAGING, "song.jpg"));
+  return finishSong(raw, fmt, meta, path.join(ST(), "song.jpg"));
 }
 
 // ---------- Downtify (backup only: used when our own YouTube search/download fails) ----------
 const DOWNTIFY_DIR = "/downtify"; // Downtify's download folder, mounted from its Umbrel app
-const dt = { cookie: "" };
+// Preferred: a paired-device token (Downtify > Settings > Apps > pairing code), which never expires and needs no
+// login. Fallback: username/password. Downtify blocks logins for 5 minutes after 10 failures from one address,
+// so after a failed login we wait instead of retrying on every song (retrying is what kept it locked).
+const dt = { cookie: "", blockedUntil: 0, noAuth: false, failed: "" };
 const dtBase = () => config.downtifyUrl.replace(/\/+$/, "");
 async function dtLogin() {
+  if (Date.now() < dt.blockedUntil) {
+    throw new Error(`${dt.failed} - not retrying for ${Math.ceil((dt.blockedUntil - Date.now()) / 60000)} min`);
+  }
   const res = await fetch(`${dtBase()}/api/auth/login`, {
     method: "POST", headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(20000),
     body: JSON.stringify({ username: config.downtifyUser || "admin", password: config.downtifyPassword || "downtify" }),
   });
-  if (!res.ok) throw new Error(`Downtify login failed (HTTP ${res.status}) - check its username and password in Config`);
+  if (res.status === 409) { dt.noAuth = true; return; } // Downtify has sign-in turned off
+  if (res.status === 429) {
+    const wait = Math.max(Number(res.headers.get("retry-after")) || 300, 60);
+    dt.failed = "Downtify is blocking logins after too many failed attempts";
+    dt.blockedUntil = Date.now() + wait * 1000;
+    throw new Error(`${dt.failed} - try again in ${Math.ceil(wait / 60)} min, or pair Hermes Music in Config instead`);
+  }
+  if (res.status === 401) {
+    dt.failed = "Downtify says the username or password is wrong";
+    dt.blockedUntil = Date.now() + 10 * 60 * 1000; // don't burn through Downtify's 10 attempts
+    throw new Error(`${dt.failed} - fix them in Config (or pair instead)`);
+  }
+  if (!res.ok) throw new Error(`Downtify login failed (HTTP ${res.status})`);
   const c = (res.headers.getSetCookie?.() || []).map((x) => x.split(";")[0]).find((x) => x.startsWith("downtify_session="));
-  dt.cookie = c || "";
+  if (!c) throw new Error("Downtify accepted the login but sent no session cookie");
+  dt.cookie = c; dt.failed = ""; dt.blockedUntil = 0;
 }
 async function dtFetch(p, opt = {}, retry = true) {
+  const auth = config.downtifyToken ? { authorization: `Bearer ${config.downtifyToken}` }
+    : dt.cookie ? { cookie: dt.cookie } : {};
   const res = await fetch(`${dtBase()}${p}`, {
     ...opt, signal: AbortSignal.timeout(opt.timeout || 30000),
-    headers: { ...(opt.headers || {}), ...(dt.cookie ? { cookie: dt.cookie } : {}) },
+    headers: { ...(opt.headers || {}), ...auth },
   });
-  if (res.status === 401 && retry) { await dtLogin(); return dtFetch(p, opt, false); }
+  if (res.status === 401) {
+    if (config.downtifyToken) throw new Error("Downtify rejected the pairing token (was the device removed?) - pair again in Config");
+    if (retry && !dt.noAuth) { dt.cookie = ""; await dtLogin(); return dtFetch(p, opt, false); }
+  }
   return res;
+}
+// Swaps a pairing code from Downtify's Settings > Apps for a permanent device token.
+async function dtPair(code) {
+  const res = await fetch(`${dtBase()}/api/auth/pair`, {
+    method: "POST", headers: { "content-type": "application/json" }, signal: AbortSignal.timeout(20000),
+    body: JSON.stringify({ code: code.trim().toUpperCase(), device_name: "Hermes Music", platform: "server" }),
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok || !j.token) {
+    const why = res.status === 429 ? "too many tries, wait 5 minutes" : j.detail || j.error || `HTTP ${res.status}`;
+    throw new Error(`pairing failed: ${why} (codes only work once and expire after 5 minutes)`);
+  }
+  return j.token;
 }
 async function newestAudioSince(dir, since) { // fallback for finding the file Downtify just wrote
   let best = null;
@@ -657,8 +718,8 @@ async function saveViaDowntify(meta, query) {
   const file = direct || await newestAudioSince(DOWNTIFY_DIR, start);
   if (!file) throw new Error("Downtify says it downloaded the song, but the file isn't in its folder");
   const ext = path.extname(file).slice(1).toLowerCase() || "mp3";
-  fs.rmSync(STAGING, { recursive: true, force: true }); fs.mkdirSync(STAGING, { recursive: true });
-  const raw = path.join(STAGING, `song.${ext}`);
+  fs.rmSync(ST(), { recursive: true, force: true }); fs.mkdirSync(ST(), { recursive: true });
+  const raw = path.join(ST(), `song.${ext}`);
   fs.copyFileSync(file, raw);
   const note = await finishSong(raw, ext, meta, null);
   fs.promises.unlink(file).catch(() => {}); // don't leave a second copy in Downtify's folder (if we're allowed to delete)
@@ -677,7 +738,6 @@ async function withBackup(ours, meta, query, why) {
   }
 }
 // ---------- request handlers ----------
-const worker = { busy: false, current: null, lastError: null };
 
 function songDone(meta, skipped) {
   const info = meta.album ? `${meta.releaseType === "album" ? "" : meta.releaseType + ": "}${meta.album}${meta.date ? " (" + meta.date + ")" : ""}` : "";
@@ -701,7 +761,7 @@ async function processSong(item) {
   // plain request: Claude Code / local model picks the video
   let r;
   try {
-    r = config.engine === "local" ? await identifyLocal(item.query) : await identifyClaude(item.query);
+    r = ctx.getStore()?.engine === "local" ? await identifyLocal(item.query) : await identifyClaude(item.query);
     if (!r.error && !/^[\w-]{11}$/.test(r.video_id || "")) throw new Error(`bad video id '${r.video_id}'`);
     if (!r.error && (!clean(r.artist) || !clean(r.title))) throw new Error("missing artist/title");
   } catch (e) {
@@ -809,35 +869,77 @@ function rollup(id) {
   if (p.parent) rollup(p.parent);
 }
 
-async function processItem(item) {
-  Object.assign(item, { status: "working", note: undefined }); save();
-  worker.current = item.meta ? `${item.meta.artist} - ${item.meta.title}` : item.query;
+// Up to two workers run side by side: "claude" (Claude Code) and "local" (local model). Which ones run
+// depends on Config > Provider (claude, local or both). Album/artist/playlist tracks don't need AI, so
+// either worker takes them. A worker that isn't set up (no token / no model) just waits.
+const WORKERS = [
+  { id: "claude", label: "Claude", busy: false, current: null, lastError: null },
+  { id: "local", label: "Local model", busy: false, current: null, lastError: null },
+];
+const workerEnabled = (w) => config.engine === w.id || config.engine === "both";
+function workerState(w) {
+  if (!workerEnabled(w)) return "off";
+  if (!ready()) return "setup";
+  if (w.id === "claude" && !config.claudeToken) return "no-token";
+  if (w.id === "local" && (!config.localUrl || !config.localModel)) return "no-model";
+  if (config.paused) return "paused";
+  return w.busy ? "busy" : "ready";
+}
+// Queue numbers shown on the page (#1, #2, ...): open requests in the order the workers will get to them.
+function queueOrder() {
+  const open = items.filter((i) => !i.parent && (i.status === "pending" || i.status === "working"));
+  return [...open.filter((i) => i.priority), ...open.filter((i) => !i.priority)];
+}
+// marks a request and everything still waiting under it (album tracks, artist albums) as "next"
+function pushForward(item) {
+  let n = 0;
+  const mark = (it) => { if (it.status === "pending") { it.priority = true; n++; } for (const k of items) if (k.parent === it.id) mark(k); };
+  item.priority = true;
+  mark(item);
+  save(); wake();
+  return n;
+}
+const itemName = (i) => (i.title ? `${i.artist ? i.artist + " - " : ""}${i.title}` : i.query);
+// next job: anything pushed forward with /now or /bump first, then the queue in order
+const nextItem = () => items.find((i) => i.status === "pending" && i.priority) || items.find((i) => i.status === "pending");
+
+async function processItem(item, w) {
+  Object.assign(item, { status: "working", note: undefined, by: w.id }); save(); // claimed before any await, so the other worker skips it
+  w.current = item.meta ? `${item.meta.artist} - ${item.meta.title}` : item.query;
   try {
     const type = item.type || "song";
     const result = type === "album" ? await expandAlbum(item) : type === "artist" ? await expandArtist(item)
       : type === "playlist" ? await expandPlaylist(item) : await processSong(item);
     Object.assign(item, result);
   } catch (e) {
-    worker.lastError = e.message;
+    w.lastError = e.message;
     Object.assign(item, { status: "failed", note: e.message.split("\n")[0].slice(0, 200) });
-    console.error("failed", item.query, e.message);
+    console.error(`[${w.id}] failed`, item.query, e.message);
   } finally {
-    worker.current = null;
+    w.current = null;
     if (item.status !== "working" && item.parent) rollup(item.parent);
     save();
   }
 }
 
-let wakeUp = () => {};
-const wake = () => wakeUp();
-(async function loop() {
-  for (;;) {
-    const next = !config.paused && ready() && items.find((i) => i.status === "pending");
-    if (next) { worker.busy = true; await processItem(next); worker.busy = false; continue; }
-    await Promise.race([sleep(15000), new Promise((r) => (wakeUp = r))]);
-  }
-})();
-
+const waiters = new Set();
+const wake = () => { for (const r of waiters) r(); waiters.clear(); };
+for (const w of WORKERS) {
+  const stage = path.join(STAGING, w.id);
+  (async function loop() {
+    for (;;) {
+      const st = workerState(w);
+      const next = (st === "ready") && nextItem();
+      if (next) {
+        w.busy = true;
+        await ctx.run({ engine: w.id, stage }, () => processItem(next, w));
+        w.busy = false;
+        continue;
+      }
+      await Promise.race([sleep(15000), new Promise((r) => waiters.add(r))]);
+    }
+  })();
+}
 // ---------- http ----------
 const send = (res, code, body, type = "application/json") => {
   res.writeHead(code, { "content-type": type });
@@ -858,21 +960,39 @@ http.createServer(async (req, res) => {
   if (get && p === "/") return send(res, 200, PAGE, "text/html");
 
   if (get && p === "/api/status") {
-    let state = "ready";
-    if (!ready()) state = "setup";
-    else if (config.engine === "claude" && !config.claudeToken) state = "no-token";
-    else if (config.paused) state = "paused";
-    else if (worker.busy) state = "busy";
     const tops = items.filter((i) => !i.parent);
     const c = (s) => tops.filter((i) => i.status === s).length;
     return send(res, 200, {
-      worker: { state, current: worker.current, lastError: worker.lastError },
+      workers: WORKERS.filter(workerEnabled).map((w) => ({ id: w.id, label: w.label, state: workerState(w), current: w.current, lastError: w.lastError })),
       pending: c("pending"), working: c("working"), done: c("done"), failed: c("failed"),
       library: { files: library.files, scanning: library.scanning, scanned: library.scanned },
     });
   }
 
   if (get && p === "/api/config") return send(res, 200, publicConfig());
+  if (post && p === "/api/bump") { // push a queued request (and its remaining tracks) to the front
+    const q = norm(String((await readBody(req)).text || ""));
+    if (q.length < 2) return send(res, 400, { error: "type part of the name, e.g. /bump hot fuss" });
+    const name = (i) => norm(`${i.artist || ""} ${i.title || ""} ${i.query || ""}`);
+    const hit = items.filter((i) => !i.parent && (i.status === "pending" || i.status === "working") && name(i).includes(q)).pop();
+    if (!hit) return send(res, 404, { error: "nothing queued matches that" });
+    const n = pushForward(hit);
+    return send(res, 200, { name: itemName(hit), count: n });
+  }
+  if (post && p === "/api/now") { // /now 3: push queue number 3 to the front
+    const pos = Number((await readBody(req)).pos);
+    const order = queueOrder();
+    if (!Number.isInteger(pos) || pos < 1) return send(res, 400, { error: "type the queue number, e.g. /now 3" });
+    if (pos > order.length) return send(res, 404, { error: order.length ? `there are only ${order.length} in the queue` : "the queue is empty" });
+    const hit = order[pos - 1];
+    const n = pushForward(hit);
+    return send(res, 200, { name: itemName(hit), count: n, pos });
+  }
+  if (post && p === "/api/library/rescan") {
+    if (library.scanning) return send(res, 200, { started: false, message: "already scanning" });
+    scanLibrary();
+    return send(res, 200, { started: true });
+  }
   if (post && p === "/api/duplicates/scan") {
     try {
       const plan = await scanDuplicates();
@@ -891,13 +1011,26 @@ http.createServer(async (req, res) => {
     if (config.pin && String(b.currentPin || "") !== config.pin) return send(res, 403, { error: "wrong PIN - use /duplicate confirm YOURPIN" });
     try { return send(res, 200, removeDuplicates()); } catch (e) { return send(res, 400, { error: e.message }); }
   }
+  if (post && p === "/api/downtify/pair") {
+    const b = await readBody(req);
+    if (config.pin && String(b.currentPin || "") !== config.pin) return send(res, 403, { error: "wrong PIN (enter it in Current PIN first)" });
+    if (!/^[A-Za-z0-9]{4}-?[A-Za-z0-9]{4}$/.test(String(b.code || "").trim())) return send(res, 400, { error: "the pairing code looks like ABCD-1234" });
+    try {
+      config.downtifyToken = await dtPair(String(b.code));
+      config.downtifyEnabled = true;
+      fs.writeFileSync(CFG, JSON.stringify(config, null, 1));
+      Object.assign(dt, { cookie: "", blockedUntil: 0, failed: "" });
+      return send(res, 200, publicConfig());
+    } catch (e) { return send(res, 400, { error: e.message }); }
+  }
   if (get && p === "/api/downtify/test") { // checks the address, the login and the shared folder
     try {
       const h = await fetch(`${dtBase()}/api/health`, { signal: AbortSignal.timeout(10000) }).catch(() => null);
       if (!h || !h.ok) return send(res, 200, { ok: false, message: `can't reach Downtify at ${dtBase()} - is it installed and running?` });
-      const r = await dtFetch("/api/queue");
-      if (!r.ok) return send(res, 200, { ok: false, message: `Downtify answered, but login failed (HTTP ${r.status})` });
-      return send(res, 200, { ok: true, message: `connected to Downtify${fs.existsSync(DOWNTIFY_DIR) ? "" : " (but its download folder isn't mounted)"}` });
+      const r = await dtFetch("/api/songs/search?query=test"); // the same kind of call the backup makes
+      if (!r.ok) return send(res, 200, { ok: false, message: `Downtify answered, but refused access (HTTP ${r.status})` });
+      const how = config.downtifyToken ? "paired" : dt.noAuth ? "no sign-in needed" : "logged in";
+      return send(res, 200, { ok: true, message: `connected to Downtify (${how})${fs.existsSync(DOWNTIFY_DIR) ? "" : " - but its download folder isn't mounted"}` });
     } catch (e) { return send(res, 200, { ok: false, message: e.message }); }
   }
   if (post && p === "/api/config") {
@@ -906,8 +1039,9 @@ http.createServer(async (req, res) => {
   }
 
   if (get && p === "/api/requests") {
-    const list = items.filter((i) => !i.parent).slice(-50).reverse().map(({ id, type, query, status, title, artist, note, created }) => {
-      const r = { id, type: type || "song", query, status, title, artist, note, created };
+    const pos = new Map(queueOrder().map((i, n) => [i.id, n + 1]));
+    const list = items.filter((i) => !i.parent).slice(-50).reverse().map(({ id, type, query, status, title, artist, note, created, priority, by }) => {
+      const r = { id, type: type || "song", query, status, title, artist, note, created, priority: !!priority, by, pos: pos.get(id) };
       if (r.type !== "song") r.progress = songStats(id);
       if (r.type === "artist") { // how many albums / EPs / singles are finished
         r.releases = {};

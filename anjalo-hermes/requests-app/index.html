@@ -140,12 +140,12 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             <div id="sess">Session: -</div>
           </div>
           <div class="rt">
-            <h2>Hermes Music v2.4.0</h2>
+            <h2>Hermes Music v2.5.0</h2>
             <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
-            <div class="sec"><span class="k">&#9662; Worker</span><br><span id="w-worker" class="d">-</span></div>
+            <div class="sec"><span class="k">&#9662; Workers</span><br><span id="w-worker" class="d">-</span></div>
             <div class="sec"><span class="k">&#9662; Library</span><br><span class="d" id="w-lib">-</span></div>
             <div class="sec"><span class="k">&#9662; Settings</span><br><span class="d" id="w-cfg">-</span></div>
-            <div class="sec"><span class="k">&#9656; Commands</span><br><span class="d">type a song &middot; /album &middot; /artist &middot; Spotify link &middot; /duplicate &middot; /help</span></div>
+            <div class="sec"><span class="k">&#9656; Commands</span><br><span class="d">type a song &middot; /album &middot; /artist &middot; Spotify link &middot; /now &middot; /bump &middot; /duplicate &middot; /help</span></div>
           </div>
         </div>
         <div id="log"></div>
@@ -165,7 +165,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             </ol>
             <div class="shot">
               <div class="ln echo"><span>mr brightside the killers</span></div>
-              <div class="ln ok"><span>queued #mq3k - it will show up in the library soon</span></div>
+              <div class="ln ok"><span>queued - it will show up in the library soon</span></div>
               <div class="ln done"><span class="s">[added]</span><span>The Killers - Mr. Brightside <small>(Hot Fuss (2004))</small></span></div>
             </div>
             <p class="shot-cap">example</p>
@@ -239,6 +239,25 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
         </details>
 
         <details>
+          <summary>Skip the queue: /now, /bump</summary>
+          <div class="in">
+            <ol>
+              <li>Everything waiting has a queue number, like <code>[queued #3]</code>.</li>
+              <li><code>/now</code> and that number moves it to the front, e.g. <code>/now 3</code>. For an album, artist or playlist, all its remaining tracks go first.</li>
+              <li>Or use <code>/bump</code> and part of the name, e.g. <code>/bump hot fuss</code>.</li>
+              <li>Pushed requests show a &#9889;. The next worker that finishes its current song takes it, usually within a minute.</li>
+            </ol>
+            <div class="shot">
+              <div class="ln pending"><span class="s">[queued #3]</span><span>blinding lights</span></div>
+              <div class="ln echo"><span>/now 3</span></div>
+              <div class="ln ok"><span>&#9889; #3 blinding lights is next - the next free worker takes it</span></div>
+              <div class="ln working"><span class="s">[downloading #1 &#9889;]</span><span>The Weeknd - Blinding Lights</span></div>
+            </div>
+            <p class="shot-cap">example</p>
+          </div>
+        </details>
+
+        <details>
           <summary>Status words</summary>
           <div class="in">
             <ol>
@@ -257,7 +276,8 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
               <li><code>/help</code> list the commands in the terminal</li>
               <li><code>/queue</code> show queue counts</li>
               <li><code>/config</code> open the settings</li>
-              <li><code>/clear</code> clear the screen</li>
+              <li><code>/clear</code> clear finished requests from the screen (on this device)</li>
+              <li><code>/rescan</code> re-read the music folder now (it also does this by itself every 30 minutes)</li>
             </ol>
           </div>
         </details>
@@ -270,7 +290,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
 
       <div class="grp">&#9662; Model</div>
       <div class="row"><label for="c-engine">Provider<small>who picks the right song</small></label>
-        <select id="c-engine"><option value="claude">Claude Code (your subscription)</option><option value="local">Local model (OpenAI-compatible)</option></select></div>
+        <select id="c-engine"><option value="claude">Claude Code (your subscription)</option><option value="local">Local model (OpenAI-compatible)</option><option value="both">Both at the same time (2 songs at once)</option></select></div>
       <div id="g-claude">
         <div class="row"><label for="c-cmodel">Claude model<small>uses your subscription</small></label>
           <select id="c-cmodel"><option value="sonnet">Sonnet</option><option value="opus">Opus</option><option value="haiku">Haiku</option></select></div>
@@ -297,10 +317,12 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
       <div class="row"><label for="c-singles">Include singles &amp; EPs<small>for /artist</small></label><input type="checkbox" id="c-singles"></div>
 
       <div class="grp">&#9662; Downtify backup</div>
-      <p class="sub2">Optional. Only used when Hermes Music can&#39;t find or download a song itself. Needs the Downtify app installed on this Umbrel.</p>
+      <p class="sub2">Optional. Only used when Hermes Music can&#39;t find or download a song itself. Needs the Downtify app on this Umbrel.
+        Easiest: in Downtify open <b>Settings &rarr; Apps</b>, create a pairing code, paste it below and press Pair.</p>
       <div class="row"><label for="c-dten">Use Downtify as backup</label><input type="checkbox" id="c-dten"></div>
+      <div class="row"><label for="c-dtcode">Pair with Downtify<small id="pairhint">best: no password needed</small></label><input type="text" id="c-dtcode" placeholder="ABCD-1234" spellcheck="false" autocomplete="off" autocapitalize="characters" style="width:16em"><button class="btn" id="c-dtpair" style="margin:0">Pair</button></div>
       <div class="row"><label for="c-dturl">Address<small>default works for the Umbrel app</small></label><input type="text" id="c-dturl" spellcheck="false" autocomplete="off"></div>
-      <div class="row"><label for="c-dtuser">Username<small>Downtify login</small></label><input type="text" id="c-dtuser" spellcheck="false" autocomplete="off"></div>
+      <div class="row"><label for="c-dtuser">Username<small>only if not paired</small></label><input type="text" id="c-dtuser" spellcheck="false" autocomplete="off"></div>
       <div class="row"><label for="c-dtpass">Password<small id="dthint">blank = default (downtify)</small></label><input type="password" id="c-dtpass" placeholder="blank = keep, - = remove" autocomplete="off"></div>
       <div class="row"><label>Connection<small>save first, then test</small></label><button class="btn" id="c-dttest" style="margin:0">Test</button><span id="dtmsg" class="sub2" style="margin:0"></span></div>
 
@@ -323,6 +345,7 @@ const DEMO = location.protocol === "file:";
 const TOUCH = matchMedia("(pointer: coarse)").matches;
 const label = { pending: "queued", working: "downloading", done: "added", failed: "failed" };
 let local = [], lastReqs = [], status = null, cfg = null, current = "req", firstRender = true;
+let clearedAt = 0; try { clearedAt = +localStorage.getItem("hm-cleared") || 0; } catch {}
 
 async function api(path, opt) {
   if (DEMO) return demo(path, opt);
@@ -332,18 +355,23 @@ async function api(path, opt) {
   return j;
 }
 function demo(path) {
-  if (path === "api/status") return { worker: { state: "busy", current: "Bing Crosby - I'd Climb the Highest Mountain" }, pending: 0, working: 1, done: 5, failed: 1,
+  if (path === "api/status") return { workers: [{ id: "claude", label: "Claude", state: "busy", current: "blinding lights" }, { id: "local", label: "Local model", state: "busy", current: "Bing Crosby - I'd Climb the Highest Mountain" }], pending: 1, working: 2, done: 5, failed: 1,
     library: { files: 16785, scanning: false, scanned: true } };
-  if (path === "api/config") return { engine: "claude", claudeModel: "sonnet", localUrl: "", localModel: "", contextLength: 0,
+  if (path === "api/config") return { engine: "both", claudeModel: "sonnet", localUrl: "http://umbrel.local:11434/v1", localModel: "qwen3.8:27b", contextLength: 8192, downtifyPaired: true,
     hasKey: false, hasToken: true, audioFormat: "mp3", maxMinutes: 10, embedArt: true, artistFolders: true, artistMaxAlbums: 50, includeSingles: true,
     paused: false, ratePerMinute: 5, hasPin: true, downtifyEnabled: true, downtifyUrl: "http://downtify_downtify_1:8000", downtifyUser: "admin", hasDowntifyPassword: false };
+  if (path === "api/now") return { pos: 3, name: "mr brightside the killers", count: 1 };
+  if (path === "api/bump") return { name: "Bing Crosby - 50 releases", count: 16 };
+  if (path === "api/library/rescan") return { started: true };
   if (path === "api/duplicates/remove") return { moved: 3, failed: [] };
   if (path === "api/duplicates/scan") return { groups: 2, files: 3, list: [
     { keep: { path: "The Killers/Hot Fuss/02 Mr. Brightside.mp3", kbps: "320 kbps" }, remove: [{ path: "The Killers - Mr. Brightside.mp3", kbps: "160 kbps" }] },
     { keep: { path: "Bobby Darin/That's All/01 Mack the Knife.mp3", kbps: "256 kbps" }, remove: [{ path: "downtify/Bobby Darin - Mack the Knife.mp3", kbps: "128 kbps" }, { path: "Bobby Darin/Mack the Knife.mp3", kbps: "128 kbps" }] }] };
   const t = (m) => new Date(Date.now() - m * 60000).toISOString();
   return [
-    { id: "b1", type: "artist", query: "bing crosby", status: "working", title: "50 releases", artist: "Bing Crosby", created: t(1), progress: { total: 437, done: 409, failed: 12, skipped: 60, pending: 16 },
+    { id: "b9", type: "song", query: "mr brightside the killers", status: "pending", created: t(0), pos: 3 },
+    { id: "b0", type: "song", query: "blinding lights", status: "working", priority: true, created: t(0), pos: 1 },
+    { id: "b1", type: "artist", query: "bing crosby", status: "working", pos: 2, title: "50 releases", artist: "Bing Crosby", created: t(1), progress: { total: 437, done: 409, failed: 12, skipped: 60, pending: 16 },
       releases: { album: { done: 31, failed: 0, total: 34 }, ep: { done: 5, failed: 0, total: 6 }, single: { done: 9, failed: 1, total: 10 } } },
     { id: "b2", type: "artist", query: "bobby darin", status: "done", title: "10 releases", artist: "Bobby Darin", note: "41 added, 168 already had, 3 failed", created: t(60), progress: { total: 212, done: 209, failed: 3, skipped: 168, pending: 0 },
       releases: { album: { done: 10, failed: 0, total: 10 } } },
@@ -364,11 +392,15 @@ function render() {
   // only follow the log when it's the visible tab and you're already at the bottom (so Config and reading don't jump)
   const follow = current === "req" && (firstRender || body.scrollHeight - body.scrollTop - body.clientHeight < 60);
   const log = $("log"); log.textContent = "";
-  for (const i of lastReqs.slice().reverse().slice(-14)) {
+  // /clear hides finished requests from before it (anything still queued or downloading stays)
+  const shown = lastReqs.filter((i) => !(Date.parse(i.created) <= clearedAt && (i.status === "done" || i.status === "failed")));
+  for (const i of shown.slice().reverse().slice(-14)) {
     const name = (i.type === "song" || !i.type ? "" : i.type + ": ")
       + (i.title ? (i.artist ? i.artist + " - " : "") + i.title : i.query);
     let st = label[i.status] || i.status;
     if (i.progress && i.status === "working") st += " " + (i.progress.done + i.progress.failed) + "/" + i.progress.total;
+    if (i.pos) st += " #" + i.pos; // queue number, used by /now
+    if (i.priority && (i.status === "pending" || i.status === "working")) st += " \u26a1";
     const row = line(i.status, [["t", hhmm(i.created)], ["s", "[" + st + "]"], ["", name]]);
     if (i.note) { const n = document.createElement("small"); n.textContent = " (" + i.note + ")"; row.lastChild.append(n); }
     if (i.releases && Object.keys(i.releases).length) { // artist: albums / EPs / singles finished
@@ -389,18 +421,25 @@ function render() {
     $("qc").textContent = status.pending + status.working;
     $("w-queue").textContent = status.pending + " waiting · " + status.working + " downloading · " + status.done + " added · " + status.failed + " failed";
     const w = $("w-worker"); w.textContent = "";
-    const st = status.worker.state, good = st === "ready" || st === "busy";
-    const text = { ready: "ready (waiting for requests)", busy: "working on: " + (status.worker.current || "..."), paused: "paused (see Config)",
-      setup: "installing tools, first start can take a few minutes", "no-token": "needs a Claude token (see Config)" }[st] || st;
-    const dot = document.createElement("span"); dot.className = good ? "on-dot" : "off-dot"; dot.textContent = good ? "● " : "○ ";
-    w.append(dot, text);
+    const workers = status.workers || (status.worker ? [{ label: "Worker", ...status.worker }] : []);
+    workers.forEach((x, n) => {
+      const good = x.state === "ready" || x.state === "busy";
+      const text = { ready: "ready", busy: "working on: " + (x.current || "..."), paused: "paused (see Config)",
+        setup: "installing tools, first start can take a few minutes", "no-token": "needs a Claude token (see Config)",
+        "no-model": "needs a model address (see Config)" }[x.state] || x.state;
+      const dot = document.createElement("span"); dot.className = good ? "on-dot" : "off-dot"; dot.textContent = good ? "● " : "○ ";
+      if (n) w.append(document.createElement("br"));
+      const b = document.createElement("b"); b.textContent = x.label + ": "; b.style.color = "var(--hi)"; b.style.fontWeight = "600";
+      w.append(dot, b, text);
+    });
     const lib = status.library || {};
     $("w-lib").textContent = lib.scanning ? "scanning your music folder... " + lib.files + " songs so far"
       : lib.scanned ? lib.files.toLocaleString() + " songs indexed · duplicates are skipped" : "not scanned yet";
   }
   if (cfg) {
     $("w-cfg").textContent = cfg.audioFormat + " · max " + cfg.maxMinutes + " min · " + cfg.ratePerMinute + " requests/min · catalogues: iTunes + Deezer" + (cfg.downtifyEnabled ? " · backup: Downtify" : "");
-    $("eng").textContent = cfg.engine === "local" ? (cfg.localModel || "local model") : "Claude Code · " + cfg.claudeModel;
+    const claude = "Claude Code · " + cfg.claudeModel, lm = cfg.localModel || "local model";
+    $("eng").textContent = cfg.engine === "local" ? lm : cfg.engine === "both" ? claude + " + " + lm : claude;
   }
   $("sess").textContent = "Session: " + (lastReqs[0] ? lastReqs[0].id : "-");
   if (follow) {
@@ -419,7 +458,10 @@ const HELP = [
   "/album NAME      download a whole album, e.g. /album the killers hot fuss",
   "/artist NAME     download an artist's albums, e.g. /artist daft punk",
   "spotify link     paste a Spotify song, album, playlist or artist link",
+  "/now NUMBER      move that queue number to the front, e.g. /now 3",
+  "/bump NAME       push something already queued to the front",
   "/duplicate       find copies of the same song (then /duplicate confirm)",
+  "/rescan          re-read the music folder now",
   "/queue           show queue counts",
   "/config          open the config tab",
   "/clear           clear this screen",
@@ -457,7 +499,7 @@ $("f").onsubmit = async (e) => {
   push("echo", v);
   firstRender = true; // jump to the bottom after your own command
   let type = "song", query = v;
-  const cmd = v.match(/^\/(album|artist)\b\s*(.*)$/i);
+  const cmd = query.match(/^\/(album|artist)\b\s*(.*)$/i);
   if (cmd) { type = cmd[1].toLowerCase(); query = cmd[2].trim(); }
   else if (v[0] === "/") {
     const [c, ...args] = v.split(/\s+/);
@@ -465,14 +507,30 @@ $("f").onsubmit = async (e) => {
     if (name === "/help") HELP.forEach((h) => push("sys", h));
     else if (name === "/queue") push("sys", status ? status.pending + " waiting, " + status.working + " downloading, " + status.done + " added" : "no data yet");
     else if (name === "/config") { local.pop(); tab("cfg"); }
-    else if (name === "/clear") { local = []; lastReqs = []; setTimeout(load, 4000); }
+    else if (name === "/clear") { local = []; clearedAt = Date.now(); try { localStorage.setItem("hm-cleared", String(clearedAt)); } catch {} render(); return; }
+    else if (name === "/now") {
+      const n = parseInt(args[0], 10);
+      if (!n) push("err", "type the queue number from the list, e.g. /now 3");
+      else try { const r = await api("api/now", { method: "POST", body: JSON.stringify({ pos: n }) });
+        push("ok", "\u26a1 #" + r.pos + " " + r.name + " is next" + (r.count > 1 ? " (" + r.count + " songs)" : "") + " - the next free worker takes it"); }
+      catch (e) { push("err", e.message); }
+    }
+    else if (name === "/bump") {
+      try { const r = await api("api/bump", { method: "POST", body: JSON.stringify({ text: args.join(" ") }) });
+        push("ok", "\u26a1 " + r.name + " moved to the front" + (r.count > 1 ? " (" + r.count + " songs)" : "") + " - the next free worker takes it"); }
+      catch (e) { push("err", e.message); }
+    }
+    else if (name === "/rescan") {
+      try { const r = await api("api/library/rescan", { method: "POST" }); push("ok", r.started ? "rescanning the music folder (only new or changed files are read)" : r.message); }
+      catch (e) { push("err", e.message); }
+    }
     else if (name === "/duplicate" || name === "/duplicates") { render(); await duplicate(args.map((a) => a.toLowerCase() === "confirm" ? "confirm" : a)); firstRender = true; }
     else push("err", "unknown command: " + c + " (try /help)");
     render(); return;
   }
   try {
     const r = await api("api/requests", { method: "POST", body: JSON.stringify({ query, type }) });
-    push("ok", "queued #" + r.id + (type === "song" ? " - it will show up in the library soon"
+    push("ok", "queued" + (type === "song" ? " - it will show up in the library soon"
       : type === "album" ? " - looking up the tracklist" : " - looking up their albums (this can be a lot of songs)"));
   } catch (err) { push("err", err.message); }
   render(); load();
@@ -492,9 +550,9 @@ function tab(name) {
 }
 document.querySelectorAll("nav a").forEach((a) => (a.onclick = () => tab(a.dataset.tab)));
 function showEngine() {
-  const local = $("c-engine").value === "local";
-  $("g-claude").style.display = local ? "none" : "";
-  $("g-local").style.display = local ? "" : "none";
+  const e = $("c-engine").value;
+  $("g-claude").style.display = e === "local" ? "none" : "";
+  $("g-local").style.display = e === "claude" ? "none" : "";
 }
 $("c-engine").onchange = showEngine;
 function fillCfg() {
@@ -505,6 +563,7 @@ function fillCfg() {
   $("c-paused").checked = cfg.paused; $("c-rate").value = cfg.ratePerMinute; $("c-folders").checked = cfg.artistFolders; $("c-maxalb").value = cfg.artistMaxAlbums;
   $("c-dten").checked = cfg.downtifyEnabled; $("c-dturl").value = cfg.downtifyUrl || ""; $("c-dtuser").value = cfg.downtifyUser || ""; $("c-dtpass").value = "";
   $("dthint").textContent = cfg.hasDowntifyPassword ? "a password is saved" : "blank = default (downtify)";
+  $("pairhint").textContent = cfg.downtifyPaired ? "\u2714 paired (type - and Save to unpair)" : "best: no password needed"; $("c-dtcode").value = "";
   $("c-singles").checked = cfg.includeSingles; $("c-token").value = "";
   $("tokhint").textContent = cfg.hasToken ? "a token is saved" : "run: claude setup-token";
   $("r-cur").style.display = cfg.hasPin ? "" : "none"; $("c-cur").value = ""; $("c-pin").value = "";
@@ -518,12 +577,19 @@ $("c-save").onclick = async () => {
       localUrl: $("c-url").value, localModel: $("c-lmodel").value, contextLength: +$("c-ctx").value, localKey: $("c-key").value,
       audioFormat: $("c-fmt").value, maxMinutes: +$("c-max").value, embedArt: $("c-art").checked, artistFolders: $("c-folders").checked,
       artistMaxAlbums: +$("c-maxalb").value, includeSingles: $("c-singles").checked,
-      downtifyEnabled: $("c-dten").checked, downtifyUrl: $("c-dturl").value, downtifyUser: $("c-dtuser").value, downtifyPassword: $("c-dtpass").value,
+      downtifyEnabled: $("c-dten").checked, downtifyUrl: $("c-dturl").value, downtifyUser: $("c-dtuser").value, downtifyPassword: $("c-dtpass").value, downtifyToken: $("c-dtcode").value.trim() === "-" ? "-" : undefined,
       paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, claudeToken: $("c-token").value,
       currentPin: $("c-cur").value, newPin: $("c-pin").value }) });
     fillCfg(); m.textContent = "saved"; render();
   } catch (err) { m.style.color = "#f87171"; m.textContent = err.message; }
   setTimeout(() => (m.textContent = ""), 3000);
+};
+$("c-dtpair").onclick = async () => {
+  const m = $("dtmsg"); m.style.color = ""; m.textContent = "pairing...";
+  try {
+    cfg = DEMO ? { ...cfg, downtifyPaired: true } : await api("api/downtify/pair", { method: "POST", body: JSON.stringify({ code: $("c-dtcode").value, currentPin: $("c-cur").value }) });
+    fillCfg(); m.style.color = "#4ade80"; m.textContent = "paired with Downtify";
+  } catch (e) { m.style.color = "#f87171"; m.textContent = e.message; }
 };
 $("c-dttest").onclick = async () => {
   const m = $("dtmsg"); m.style.color = ""; m.textContent = "testing...";

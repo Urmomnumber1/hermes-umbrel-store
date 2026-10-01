@@ -20,6 +20,9 @@ Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbr
 ## Using it
 - Type a song name (add the artist for best results).
 - `/album NAME` downloads a whole album, `/artist NAME` an artist's albums (limits in Config).
+- Queued requests show a number (`#3`); `/now 3` moves that one to the front (`/bump NAME` does the same by name).
+- Config > Provider > **Both** runs Claude Code and a local model at the same time (two songs at once).
+- `/rescan` re-reads the music folder (it also does this every 30 minutes; only new or changed files are read).
 - `/duplicate` lists copies of the same song (same artist, title and length) and keeps the best-quality one;
   `/duplicate confirm` (plus your PIN, if set) moves the extras to the hidden `.duplicates` folder in your music folder.
 - Songs already in the music folder are skipped: the app indexes the folder's tags on start and every 30 minutes.
@@ -31,8 +34,8 @@ Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbr
   Audio always comes from YouTube. If Spotify changes those pages, links may stop working until the app is updated.
 
 ## Downtify backup (optional)
-If the Downtify app is installed, turn on **Use Downtify as backup** in Config (default address and login work for
-the Umbrel app; press Test). Hermes Music always tries itself first and only hands a song to Downtify when it can't find
+If the Downtify app is installed, turn on **Use Downtify as backup** in Config. Best: in Downtify open Settings > Apps,
+create a pairing code, paste it into Config and press Pair (no password needed). Then press Test. Hermes Music always tries itself first and only hands a song to Downtify when it can't find
 or download it. The file is then moved from Downtify's folder into your music folder and re-tagged like any other song.
 
 ## Notes
