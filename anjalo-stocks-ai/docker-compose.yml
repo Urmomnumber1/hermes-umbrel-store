@@ -9,8 +9,8 @@ services:
 
   web:
     # Built by GitHub Actions in https://github.com/Urmomnumber1/umbrel-apps (source code)
-    image: ghcr.io/urmomnumber1/stocks-ai:0.1.0
-    user: "1000:1000"
+    image: ghcr.io/urmomnumber1/stocks-ai:0.1.1
+    user: "0:0" # entrypoint fixes /data ownership, then runs the app as uid 1000
     restart: on-failure
     volumes:
       - ${APP_DATA_DIR}/data:/data

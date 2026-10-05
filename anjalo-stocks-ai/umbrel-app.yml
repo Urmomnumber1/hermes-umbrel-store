@@ -2,13 +2,13 @@ manifestVersion: 1
 id: anjalo-stocks-ai
 category: finance
 name: Stocks AI
-version: "0.1.0"
+version: "0.1.1"
 tagline: An AI portfolio assistant with hard risk limits
 description: >-
   Claude reviews your Alpaca brokerage account, prices and news, then proposes trades.
   Every proposal passes hard-coded risk limits, and by default each trade waits for your approval.
   Starts on a paper (simulated) account.
-releaseNotes: ""
+releaseNotes: "Fixes the app not starting (unable to reach) because its data folder was not writable."
 developer: Anjalo
 website: https://github.com/Urmomnumber1/umbrel-apps
 dependencies: []
