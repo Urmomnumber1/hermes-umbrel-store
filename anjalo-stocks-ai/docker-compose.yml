@@ -1,0 +1,19 @@
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      # <app-id>_<service>_1
+      APP_HOST: anjalo-stocks-ai_web_1
+      APP_PORT: 8000
+
+  web:
+    # Built by GitHub Actions in https://github.com/Urmomnumber1/umbrel-apps (source code)
+    image: ghcr.io/urmomnumber1/stocks-ai:0.1.0
+    user: "1000:1000"
+    restart: on-failure
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
+    environment:
+      # Live (real-money) trading stays locked unless this is "1".
+      ALLOW_LIVE_TRADING: "0"

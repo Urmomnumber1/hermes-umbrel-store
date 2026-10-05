@@ -42,3 +42,17 @@ or download it. The file is then moved from Downtify's folder into your music fo
 - The page has no login (guests use it); keep port 3340 off the internet.
 - Secrets (Claude token, API key) are stored in the app's data folder on the Umbrel and never sent to the page.
 - Only download music you're entitled to; ripping from YouTube may violate its terms and copyright law where you live.
+
+---
+
+# Stocks AI
+
+An AI portfolio assistant. Claude reviews your Alpaca brokerage account, prices and news, then proposes trades.
+Hard-coded risk limits check every proposal, and by default each trade waits for your approval. It starts on a paper (simulated) account.
+
+## Setup
+1. Install **Stocks AI** from this store and open it from the Umbrel dashboard (it's behind your Umbrel login).
+2. In **Settings**, paste your Anthropic API key and your Alpaca **paper trading** key ID and secret (free at alpaca.markets).
+3. Turn on **Trading on**, save, and click **Run AI now** during market hours. Suggested trades appear under **Awaiting your approval**.
+
+Source code, risk rules and docs: https://github.com/Urmomnumber1/umbrel-apps/tree/main/stocks-ai
