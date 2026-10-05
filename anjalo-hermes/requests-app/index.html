@@ -140,12 +140,12 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             <div id="sess">Session: -</div>
           </div>
           <div class="rt">
-            <h2>Hermes Music v2.5.0</h2>
+            <h2>Hermes Music v2.6.0</h2>
             <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
             <div class="sec"><span class="k">&#9662; Workers</span><br><span id="w-worker" class="d">-</span></div>
             <div class="sec"><span class="k">&#9662; Library</span><br><span class="d" id="w-lib">-</span></div>
             <div class="sec"><span class="k">&#9662; Settings</span><br><span class="d" id="w-cfg">-</span></div>
-            <div class="sec"><span class="k">&#9656; Commands</span><br><span class="d">type a song &middot; /album &middot; /artist &middot; Spotify link &middot; /now &middot; /bump &middot; /duplicate &middot; /help</span></div>
+            <div class="sec"><span class="k">&#9656; Commands</span><br><span class="d">type a song &middot; /album &middot; /artist &middot; Spotify link &middot; /now &middot; /bump &middot; /video &middot; /duplicate &middot; /help</span></div>
           </div>
         </div>
         <div id="log"></div>
@@ -258,6 +258,24 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
         </details>
 
         <details>
+          <summary>Music videos: /video</summary>
+          <div class="in">
+            <ol>
+              <li>Type <code>/video</code> and a song that&#39;s already in your library, e.g. <code>/video mr brightside the killers</code>.</li>
+              <li>Hermes Music finds its official music video on YouTube (not lyric videos, audio uploads or live versions). Nothing is downloaded.</li>
+              <li>In the custom Feishin a <b>video button</b> appears in the player bar while that song plays. It pauses the song and plays the video.</li>
+              <li>Wrong video, or none found? Pick it yourself: <code>/video mr brightside | https://youtu.be/...</code></li>
+              <li><code>/video list</code> shows all of them, <code>/video remove SONG</code> deletes one.</li>
+            </ol>
+            <div class="shot">
+              <div class="ln echo"><span>/video mr brightside the killers</span></div>
+              <div class="ln ok"><span>&#127916; The Killers - Mr. Brightside now has a music video: The Killers - Mr. Brightside (Official Music Video)</span></div>
+            </div>
+            <p class="shot-cap">example</p>
+          </div>
+        </details>
+
+        <details>
           <summary>Status words</summary>
           <div class="in">
             <ol>
@@ -351,15 +369,17 @@ async function api(path, opt) {
   if (DEMO) return demo(path, opt);
   const r = await fetch(path, opt);
   const j = await r.json();
-  if (!r.ok) throw new Error(j.error || "error");
+  if (!r.ok) { const e = new Error(j.error || "error"); e.choices = j.choices; throw e; }
   return j;
 }
-function demo(path) {
+function demo(path, opt) {
   if (path === "api/status") return { workers: [{ id: "claude", label: "Claude", state: "busy", current: "blinding lights" }, { id: "local", label: "Local model", state: "busy", current: "Bing Crosby - I'd Climb the Highest Mountain" }], pending: 1, working: 2, done: 5, failed: 1,
     library: { files: 16785, scanning: false, scanned: true } };
   if (path === "api/config") return { engine: "both", claudeModel: "sonnet", localUrl: "http://umbrel.local:11434/v1", localModel: "qwen3.8:27b", contextLength: 8192, downtifyPaired: true,
     hasKey: false, hasToken: true, audioFormat: "mp3", maxMinutes: 10, embedArt: true, artistFolders: true, artistMaxAlbums: 50, includeSingles: true,
     paused: false, ratePerMinute: 5, hasPin: true, downtifyEnabled: true, downtifyUrl: "http://downtify_downtify_1:8000", downtifyUser: "admin", hasDowntifyPassword: false };
+  if (path === "api/videos" && opt && opt.method === "POST") return { artist: "The Killers", song: "Mr. Brightside", videoId: "gGdGFtwCNBE", title: "The Killers - Mr. Brightside (Official Music Video)", channel: "TheKillersMusic" };
+  if (path === "api/videos") return [{ artist: "Adele", song: "Rolling in the Deep", videoId: "rYEDA3JcQqw" }, { artist: "The Killers", song: "Mr. Brightside", videoId: "gGdGFtwCNBE" }];
   if (path === "api/now") return { pos: 3, name: "mr brightside the killers", count: 1 };
   if (path === "api/bump") return { name: "Bing Crosby - 50 releases", count: 16 };
   if (path === "api/library/rescan") return { started: true };
@@ -462,6 +482,7 @@ const HELP = [
   "/bump NAME       push something already queued to the front",
   "/duplicate       find copies of the same song (then /duplicate confirm)",
   "/rescan          re-read the music folder now",
+  "/video SONG      find the song's music video for Feishin (also: /video list, /video remove SONG)",
   "/queue           show queue counts",
   "/config          open the config tab",
   "/clear           clear this screen",
@@ -519,6 +540,32 @@ $("f").onsubmit = async (e) => {
       try { const r = await api("api/bump", { method: "POST", body: JSON.stringify({ text: args.join(" ") }) });
         push("ok", "\u26a1 " + r.name + " moved to the front" + (r.count > 1 ? " (" + r.count + " songs)" : "") + " - the next free worker takes it"); }
       catch (e) { push("err", e.message); }
+    }
+    else if (name === "/video" || name === "/videos") {
+      const rest = v.replace(/^\/videos?\s*/i, "").trim();
+      if (!rest || rest.toLowerCase() === "list") {
+        try {
+          const list = await api("api/videos");
+          if (!list.length) push("sys", "no music videos yet - add one with /video SONG");
+          list.forEach((x) => push("sys", "  \ud83c\udfac " + x.artist + " - " + x.song + "  (youtu.be/" + x.videoId + ")"));
+        } catch (e) { push("err", e.message); }
+      } else if (/^remove\s+/i.test(rest)) {
+        try { const r = await api("api/videos/remove", { method: "POST", body: JSON.stringify({ query: rest.replace(/^remove\s+/i, "") }) });
+          push("ok", "removed the music video for " + r.artist + " - " + r.song); }
+        catch (e) { push("err", e.message); }
+      } else {
+        push("sys", "looking for the official music video on YouTube...");
+        render();
+        try {
+          const r = await api("api/videos", { method: "POST", body: JSON.stringify({ query: rest }) });
+          push("ok", "\ud83c\udfac " + r.artist + " - " + r.song + " now has a music video: " + r.title + (r.channel ? " (" + r.channel + ")" : ""));
+          push("sys", "  in the custom Feishin a video button shows up while it plays - youtu.be/" + r.videoId);
+        } catch (e) {
+          push("err", e.message);
+          (e.choices || []).forEach((c) => push("sys", "  " + c));
+          if (e.choices && /video/.test(e.message)) push("sys", "  pick one with: /video SONG | LINK");
+        }
+      }
     }
     else if (name === "/rescan") {
       try { const r = await api("api/library/rescan", { method: "POST" }); push("ok", r.started ? "rescanning the music folder (only new or changed files are read)" : r.message); }

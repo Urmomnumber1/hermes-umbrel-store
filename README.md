@@ -23,6 +23,9 @@ Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbr
 - Queued requests show a number (`#3`); `/now 3` moves that one to the front (`/bump NAME` does the same by name).
 - Config > Provider > **Both** runs Claude Code and a local model at the same time (two songs at once).
 - `/rescan` re-reads the music folder (it also does this every 30 minutes; only new or changed files are read).
+- `/video SONG` finds the official music video for a song in your library (`/video SONG | LINK` to pick one,
+  `/video list`, `/video remove SONG`). The custom Feishin build shows a video button for those songs and streams the
+  video with YouTube's embedded player; nothing is downloaded. Feishin asks `GET /api/videos/lookup?artist=&title=`.
 - `/duplicate` lists copies of the same song (same artist, title and length) and keeps the best-quality one;
   `/duplicate confirm` (plus your PIN, if set) moves the extras to the hidden `.duplicates` folder in your music folder.
 - Songs already in the music folder are skipped: the app indexes the folder's tags on start and every 30 minutes.

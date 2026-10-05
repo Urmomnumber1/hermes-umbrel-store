@@ -940,9 +940,73 @@ for (const w of WORKERS) {
     }
   })();
 }
+// ---------- music videos (/video): matched here, streamed by the custom Feishin from YouTube ----------
+// Nothing is downloaded. Hermes Music only remembers which YouTube video belongs to which song in the library.
+const VIDEOS = "/data/videos.json";
+let videos = {};
+try { videos = JSON.parse(fs.readFileSync(VIDEOS, "utf8")); } catch {}
+const saveVideos = () => fs.writeFileSync(VIDEOS, JSON.stringify(videos, null, 1));
+const ytId = (s) => (String(s).match(/(?:youtu\.be\/|[?&]v=|\/shorts\/|\/embed\/|\/live\/)([\w-]{11})/) || [])[1] || null;
+
+// Finds a song in the music folder from text like "mr brightside the killers" or "The Killers - Mr. Brightside".
+function findInLibrary(query) {
+  const q = norm(query), dash = String(query).match(/^(.+?)\s+-\s+(.+)$/);
+  const seen = new Map();
+  for (const [file, c] of Object.entries(libCache)) {
+    if (!c.t) continue;
+    const t = norm(c.t), a = norm(c.a || c.aa);
+    if (!t) continue;
+    let score = 0;
+    if (dash && t === norm(dash[2]) && (a === norm(dash[1]) || a.startsWith(norm(dash[1])))) score = 3;
+    else if (dash && t === norm(dash[1]) && (a === norm(dash[2]) || a.startsWith(norm(dash[2])))) score = 3;
+    else if (a && q.includes(t) && q.includes(a)) score = 2 + t.length / 1000; // longer title match wins
+    else if (t === q) score = 1;
+    if (!score) continue;
+    const key = songKey(c.a || c.aa, c.t);
+    if (!seen.has(key) || seen.get(key).score < score) seen.set(key, { score, file, artist: c.a || c.aa, title: c.t });
+  }
+  return [...seen.values()].sort((x, y) => y.score - x.score);
+}
+// YouTube search with no length limit (videos are often longer than the song).
+async function ytSearchAny(query, n = 10) {
+  const s = await run("yt-dlp", [`ytsearch${n}:${query}`, "--skip-download", "--no-warnings",
+    "--print", "%(.{id,title,channel,duration})j"], { timeout: 120000 });
+  const rows = [];
+  for (const l of s.out.split("\n")) {
+    try { const v = JSON.parse(l); if (/^[\w-]{11}$/.test(v.id || "")) rows.push({ id: v.id, title: v.title || "", channel: v.channel || "", seconds: Number(v.duration) || 0 }); } catch {}
+  }
+  if (!rows.length && s.err.trim()) throw new Error("YouTube search failed: " + s.err.trim().split("\n").pop().slice(0, 150));
+  return rows;
+}
+// Picks the official music video: right title, video (not audio/lyrics/live), artist's or VEVO channel, sensible length.
+function scoreVideo(v, artist, title, seconds) {
+  const first = String(artist).split(/\s*(?:,|&|\bfeat\.?|\bft\.?)\s*/i)[0];
+  const t = norm(title), a = norm(first), wantLive = /\blive\b/i.test(title);
+  const vt = norm(v.title), ch = norm(v.channel);
+  let s = vt.includes(t) ? 0 : -100;
+  if (/official\s+(music\s+)?video/i.test(v.title)) s += 40;
+  else if (/music\s+video|\bmv\b/i.test(v.title)) s += 20;
+  if (/vevo$/i.test(v.channel.replace(/\s/g, ""))) s += 25;
+  else if (ch && (ch.includes(a) || a.includes(ch))) s += 20;
+  if (/ - topic$/i.test(v.channel)) s -= 80; // auto-generated, audio only
+  if (/lyric|lyrics|letra/i.test(v.title)) s -= 60;
+  if (/official\s+audio|\baudio\b|visuali[sz]er/i.test(v.title)) s -= 40;
+  if (!wantLive && /\blive\b|concert|tour/i.test(v.title)) s -= 40;
+  if (/cover|karaoke|reaction|tutorial|remix|sped|slowed|nightcore|\b8d\b|instrumental/i.test(v.title)) s -= 70;
+  if (seconds && v.seconds) { const d = Math.abs(v.seconds - seconds); s += d <= 15 ? 15 : d <= 90 ? 5 : d > 240 ? -30 : 0; }
+  return s;
+}
+async function findMusicVideo(artist, title, seconds) {
+  const first = String(artist).split(/\s*(?:,|&|\bfeat\.?|\bft\.?)\s*/i)[0];
+  const scored = (await ytSearchAny(`${first} ${title} official music video`))
+    .map((v) => ({ ...v, score: scoreVideo(v, artist, title, seconds) }))
+    .sort((x, y) => y.score - x.score);
+  return { best: scored[0] && scored[0].score >= 30 ? scored[0] : null, others: scored.slice(0, 3) };
+}
+
 // ---------- http ----------
-const send = (res, code, body, type = "application/json") => {
-  res.writeHead(code, { "content-type": type });
+const send = (res, code, body, type = "application/json", extra = {}) => {
+  res.writeHead(code, { "content-type": type, ...extra });
   res.end(typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body));
 };
 const readBody = (req) => new Promise((ok) => {
@@ -967,6 +1031,54 @@ http.createServer(async (req, res) => {
       pending: c("pending"), working: c("working"), done: c("done"), failed: c("failed"),
       library: { files: library.files, scanning: library.scanning, scanned: library.scanned },
     });
+  }
+
+  // ---- music videos ----
+  if (get && p === "/api/videos/lookup") { // asked by Feishin for the song that's playing; open to any origin (read-only)
+    const cors = { "access-control-allow-origin": "*", "cache-control": "no-store" };
+    const v = videos[songKey(url.searchParams.get("artist") || "", url.searchParams.get("title") || "")];
+    return v ? send(res, 200, { videoId: v.videoId, title: v.title, channel: v.channel }, "application/json", cors)
+      : send(res, 404, { error: "no music video for this song" }, "application/json", cors);
+  }
+  if (get && p === "/api/videos") {
+    return send(res, 200, Object.values(videos).sort((x, y) => String(x.artist).localeCompare(String(y.artist))));
+  }
+  if (post && p === "/api/videos") { // /video SONG  or  /video SONG | youtube link
+    const b = await readBody(req);
+    const [text, link] = String(b.query || "").split("|").map((x) => x.trim());
+    if (!text || text.length < 2) return send(res, 400, { error: "type a song from your library, e.g. /video mr brightside the killers" });
+    const hits = findInLibrary(text);
+    if (!hits.length) return send(res, 404, { error: "that song isn't in your music folder (request it first, or type 'Artist - Title')" });
+    if (hits.length > 1 && hits[0].score === hits[1].score && norm(hits[0].artist) !== norm(hits[1].artist))
+      return send(res, 409, { error: "more than one artist has that song - add the artist", choices: hits.slice(0, 5).map((h) => `${h.artist} - ${h.title}`) });
+    const song = hits[0];
+    let pick;
+    if (link) {
+      const id = ytId(link) || (/^[\w-]{11}$/.test(link) ? link : null);
+      if (!id) return send(res, 400, { error: "that doesn't look like a YouTube link" });
+      pick = { id, title: "(chosen by hand)", channel: "" };
+    } else {
+      if (!ready()) return send(res, 503, { error: "still installing tools - try again in a minute" });
+      const secs = (await probeInfo(song.file)).d;
+      try {
+        const r = await findMusicVideo(song.artist, song.title, secs);
+        if (!r.best) return send(res, 404, {
+          error: `no official music video found for ${song.artist} - ${song.title}`,
+          choices: r.others.map((v) => `${v.title} (${v.channel}) https://youtu.be/${v.id}`),
+        });
+        pick = r.best;
+      } catch (e) { return send(res, 502, { error: e.message }); }
+    }
+    videos[songKey(song.artist, song.title)] = { videoId: pick.id, title: pick.title, channel: pick.channel, artist: song.artist, song: song.title, at: new Date().toISOString() };
+    saveVideos();
+    return send(res, 200, { artist: song.artist, song: song.title, videoId: pick.id, title: pick.title, channel: pick.channel });
+  }
+  if (post && p === "/api/videos/remove") {
+    const hits = findInLibrary(String((await readBody(req)).query || ""));
+    const key = hits.map((h) => songKey(h.artist, h.title)).find((k) => videos[k]);
+    if (!key) return send(res, 404, { error: "no saved music video matches that" });
+    const v = videos[key]; delete videos[key]; saveVideos();
+    return send(res, 200, { artist: v.artist, song: v.song });
   }
 
   if (get && p === "/api/config") return send(res, 200, publicConfig());

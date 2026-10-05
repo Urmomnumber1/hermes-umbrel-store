@@ -2,7 +2,7 @@ manifestVersion: 1
 id: anjalo-hermes
 category: media
 name: Hermes Music
-version: "2.5.0"
+version: "2.6.0"
 tagline: Request a song and it lands in your music library
 description: >-
   A song request page for your household. Anyone on your network types a song, album (/album) or artist (/artist), and Hermes Music
@@ -13,7 +13,7 @@ description: >-
   Songs are identified by Claude Code (with your Claude subscription, using a token from "claude setup-token")
   or by a local model on any OpenAI-compatible server (Ollama, llama.cpp, LM Studio). Set this up in the Config tab.
   Everything runs on your Umbrel.
-releaseNotes: "Claude and a local model can work at the same time (Config > Provider > Both), /now <queue number> and /bump to skip the queue, Downtify pairing instead of password logins, faster library scan, /rescan, and /clear now really clears."
+releaseNotes: "Music videos: /video SONG finds the official YouTube video for a song in your library, and the custom Feishin shows a video button for it (streamed, never downloaded)."
 developer: Anjalo
 website: https://github.com/Urmomnumber1/hermes-umbrel-store
 dependencies: []
