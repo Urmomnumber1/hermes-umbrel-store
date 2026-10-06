@@ -1,8 +1,9 @@
 #!/bin/sh
-# Starts the request page right away, and installs the download tools in the background
-# (ffmpeg via apt each start; yt-dlp and Claude Code cached in /data/tools).
+# Starts the request page right away. The download tools (ffmpeg, ffprobe, yt-dlp, Claude Code) are
+# single files cached in /data/tools, so they're fetched once (in parallel) and later starts are instant.
 set -e
 TOOLS=/data/tools
+TV=2 # bump to force a fresh download of the cached tools
 mkdir -p "$TOOLS/bin" /data/home /data/staging /music
 # The music folder must be writable by the app user (uid 1000). Only the top folder is changed.
 [ "$(stat -c %u /music)" = "1000" ] || chown 1000:1000 /music
@@ -14,22 +15,45 @@ mkdir -p /data/home/.config/yt-dlp
 printf '%s\n' '--js-runtimes node' '--remote-components ejs:github' > /data/home/.config/yt-dlp/config
 chown -R 1000:1000 /data/home/.config
 
+case "$(uname -m)" in
+  aarch64|arm64) FF=linux-arm64; YT=yt-dlp_linux_aarch64 ;;
+  *) FF=linux-x64; YT=yt-dlp_linux ;;
+esac
+
+# download URL FILE [gz]: Node's fetch, so no apt packages are needed
+fetch() {
+  node -e '
+    const [url, out, gz] = process.argv.slice(1);
+    (async () => {
+      const r = await fetch(url);
+      if (!r.ok) throw new Error(url + " -> HTTP " + r.status);
+      let buf = Buffer.from(await r.arrayBuffer());
+      if (gz) buf = require("zlib").gunzipSync(buf);
+      require("fs").writeFileSync(out + ".part", buf, { mode: 0o755 });
+      require("fs").renameSync(out + ".part", out);
+    })().catch((e) => { console.error(e.message); process.exit(1); });
+  ' "$@"
+}
+
 (
   set -e
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq
-  apt-get install -y -qq --no-install-recommends ffmpeg python3 ca-certificates curl
-  if [ -x "$TOOLS/bin/yt-dlp" ]; then
-    "$TOOLS/bin/yt-dlp" -U || true
-  else
-    curl -fsSL https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o "$TOOLS/bin/yt-dlp"
-    chmod +x "$TOOLS/bin/yt-dlp"
+  # tools from older versions (yt-dlp needing Python, ffmpeg from apt) are replaced once
+  if [ "$(cat "$TOOLS/version" 2>/dev/null)" != "$TV" ]; then
+    rm -f "$TOOLS/bin/yt-dlp" "$TOOLS/bin/ffmpeg" "$TOOLS/bin/ffprobe"
   fi
-  if [ ! -x "$TOOLS/npm/bin/claude" ]; then
-    npm install -g --silent --prefix "$TOOLS/npm" @anthropic-ai/claude-code
-  fi
+  FFR=https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1
+  pids=""
+  [ -x "$TOOLS/bin/ffmpeg" ] || { fetch "$FFR/ffmpeg-$FF.gz" "$TOOLS/bin/ffmpeg" gz & pids="$pids $!"; }
+  [ -x "$TOOLS/bin/ffprobe" ] || { fetch "$FFR/ffprobe-$FF.gz" "$TOOLS/bin/ffprobe" gz & pids="$pids $!"; }
+  [ -x "$TOOLS/bin/yt-dlp" ] || { fetch "https://github.com/yt-dlp/yt-dlp/releases/latest/download/$YT" "$TOOLS/bin/yt-dlp" & pids="$pids $!"; }
+  [ -x "$TOOLS/npm/bin/claude" ] || { npm install -g --silent --no-audit --no-fund --prefix "$TOOLS/npm" @anthropic-ai/claude-code & pids="$pids $!"; }
+  for p in $pids; do wait "$p"; done
+  echo "$TV" > "$TOOLS/version"
   chown -R 1000:1000 "$TOOLS"
   touch "$TOOLS/ready"
+  echo "tools ready"
+  # keep yt-dlp current without holding up the queue
+  setpriv --reuid=1000 --regid=1000 --clear-groups env HOME=/data/home "$TOOLS/bin/yt-dlp" -U || true
 ) >"$TOOLS/setup.log" 2>&1 &
 
 exec setpriv --reuid=1000 --regid=1000 --clear-groups \

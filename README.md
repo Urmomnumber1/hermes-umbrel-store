@@ -6,8 +6,8 @@ Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbr
 
 ## Setup
 1. Add this repo as a community app store in Umbrel and install **Hermes Music**.
-2. Open it (or `http://<umbrel-ip>:3340`). The first start installs ffmpeg, yt-dlp and Claude Code
-   in the background; the Worker line shows when it's ready.
+2. Open it (or `http://<umbrel-ip>:3340`). The first start downloads ffmpeg, yt-dlp and Claude Code (cached, so
+   later starts are instant); the Worker line shows when they are ready.
 3. Open **Config** and pick a provider:
    - **Claude Code**: on any computer with Claude Code, run `claude setup-token`, then paste the token
      into Config. Uses your Claude subscription.
