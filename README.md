@@ -26,6 +26,11 @@ Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbr
 - `/video SONG` finds the official music video for a song in your library (`/video SONG | LINK` to pick one,
   `/video list`, `/video remove SONG`). The custom Feishin build shows a video button for those songs and streams the
   video with YouTube's embedded player; nothing is downloaded. Feishin asks `GET /api/videos/lookup?artist=&title=`.
+- Music videos play muted in step with the song in the custom Feishin. Hermes Music lines each video up with the song
+  in the background by matching the sound (the video's audio is fetched for that and deleted right after).
+- Group Play (custom Feishin, people icon): a host creates a group and shares the 5-letter code; members join, hear what
+  the host plays, and can add songs (right-click > Add to group queue). Only the host skips or seeks. Hermes Music relays
+  the state (`/api/group/...`, Server-Sent Events); groups live in memory.
 - `/duplicate` lists copies of the same song (same artist, title and length) and keeps the best-quality one;
   `/duplicate confirm` (plus your PIN, if set) moves the extras to the hidden `.duplicates` folder in your music folder.
 - Songs already in the music folder are skipped: the app indexes the folder's tags on start and every 30 minutes.

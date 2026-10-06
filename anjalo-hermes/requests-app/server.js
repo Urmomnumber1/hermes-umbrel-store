@@ -7,6 +7,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 const { AsyncLocalStorage } = require("async_hooks");
+const crypto = require("crypto");
 
 const PORT = 3000;
 const DB = "/data/requests.json";
@@ -1004,14 +1005,208 @@ async function findMusicVideo(artist, title, seconds) {
   return { best: scored[0] && scored[0].score >= 30 ? scored[0] : null, others: scored.slice(0, 3) };
 }
 
+// Music video timing: finds where the song starts inside the video by matching the sound, so the custom
+// Feishin can play the video muted in step with the song. The video's audio is fetched only for this check
+// and deleted right after; nothing is kept.
+async function readPcm(file, out) {
+  const r = await run("ffmpeg", ["-y", "-v", "error", "-i", file, "-ac", "1", "-ar", "8000", "-f", "s16le", out], { timeout: 180000 });
+  if (r.code !== 0 || !fs.existsSync(out)) throw new Error("couldn't read the audio");
+  const b = fs.readFileSync(out);
+  return new Int16Array(b.buffer, b.byteOffset, Math.floor(b.length / 2));
+}
+// loudness changes every 50 ms (what the beat/vocals look like), normalised
+function onsets(pcm) {
+  const frame = 400, n = Math.floor(pcm.length / frame), e = new Float64Array(n), o = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    let sum = 0;
+    for (let j = i * frame; j < (i + 1) * frame; j++) sum += pcm[j] * pcm[j];
+    e[i] = Math.log(1e-3 + sum / frame);
+  }
+  for (let i = 1; i < n; i++) o[i] = Math.max(0, e[i] - e[i - 1]);
+  let mean = 0; for (const x of o) mean += x; mean /= n || 1;
+  let sd = 0; for (const x of o) sd += (x - mean) ** 2; sd = Math.sqrt(sd / (n || 1)) || 1;
+  for (let i = 0; i < n; i++) o[i] = (o[i] - mean) / sd;
+  return o;
+}
+async function alignVideo(songFile, videoId) {
+  const dir = path.join(STAGING, "video-align");
+  fs.rmSync(dir, { recursive: true, force: true }); fs.mkdirSync(dir, { recursive: true });
+  try {
+    const d = await run("yt-dlp", ["--no-playlist", "--no-warnings", "-f", "bestaudio/best", "-o", path.join(dir, "video.%(ext)s"),
+      `https://www.youtube.com/watch?v=${videoId}`], { timeout: 240000 });
+    const vfile = fs.readdirSync(dir).map((f) => path.join(dir, f)).find((f) => /video\./.test(f));
+    if (!vfile) throw new Error("couldn't fetch the video's audio: " + (d.err.trim().split("\n").pop() || ""));
+    const song = onsets(await readPcm(songFile, path.join(dir, "song.raw")));
+    const video = onsets(await readPcm(vfile, path.join(dir, "video.raw")));
+    const minOverlap = Math.floor(song.length * 0.6);
+    const scores = [];
+    let best = { lag: 0, score: -Infinity };
+    // lag = video frame where the song's first frame lines up (negative: the video skips the song's start)
+    for (let lag = -Math.floor(song.length * 0.4); lag <= video.length - minOverlap; lag++) {
+      let dot = 0, n = 0;
+      const from = Math.max(0, -lag), to = Math.min(song.length, video.length - lag);
+      for (let i = from; i < to; i++) { dot += song[i] * video[i + lag]; n++; }
+      if (n < minOverlap) continue;
+      const score = dot / n;
+      scores.push(score);
+      if (score > best.score) best = { lag, score };
+    }
+    if (!scores.length) throw new Error("the video is much shorter than the song");
+    let mean = 0; for (const x of scores) mean += x; mean /= scores.length;
+    let sd = 0; for (const x of scores) sd += (x - mean) ** 2; sd = Math.sqrt(sd / scores.length) || 1;
+    const z = (best.score - mean) / sd; // how much the best match stands out from all the others
+    return { offset: Math.round(best.lag * 5) / 100, confident: z >= 5 };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true }); // nothing from YouTube is kept
+  }
+}
+
+// Timing is measured in the background, one video at a time, so /video answers right away and
+// Feishin picks the timing up when it's ready. Videos saved without timing are measured on start.
+const alignQueue = [], alignQueued = new Set();
+let aligning = false;
+function queueAlign(key) {
+  if (!videos[key] || alignQueued.has(key)) return;
+  alignQueued.add(key);
+  alignQueue.push(key);
+  runAlign();
+}
+async function runAlign() {
+  if (aligning) return;
+  aligning = true;
+  while (alignQueue.length) {
+    if (!ready()) { await sleep(30000); continue; } // tools still installing
+    const key = alignQueue.shift(), v = videos[key];
+    if (v && v.timing !== "manual") {
+      try {
+        const hit = findInLibrary(`${v.artist} - ${v.song}`)[0];
+        if (!hit) throw new Error("song file not found");
+        const a = await alignVideo(hit.file, v.videoId);
+        if (videos[key] === v) Object.assign(v, { offset: a.offset, timing: a.confident ? "auto" : "guess" });
+      } catch (e) {
+        Object.assign(v, { offset: v.offset || 0, timing: "failed" });
+        console.error("video timing failed:", v.artist, v.song, e.message);
+      }
+      saveVideos();
+    }
+    alignQueued.delete(key);
+  }
+  aligning = false;
+}
+setTimeout(() => {
+  for (const [key, v] of Object.entries(videos)) if (v.offset == null || v.timing === "pending") queueAlign(key);
+}, 15000);
+
+// ---------- Group Play: one host, any number of members, everyone listens to the same song ----------
+// The host's Feishin is the source of truth: it reports the queue, the song and the position here, and members'
+// Feishin follow it. Members can only ask for songs to be added; the host's Feishin adds them to its queue.
+// Groups live in memory and close when the host leaves or after 6 hours without the host.
+const groups = new Map();
+const clean1 = (v, n = 200) => String(v ?? "").slice(0, n);
+function newCode() {
+  const abc = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  for (;;) {
+    const c = Array.from({ length: 5 }, () => abc[Math.floor(Math.random() * abc.length)]).join("");
+    if (!groups.has(c)) return c;
+  }
+}
+const groupSong = (x) => (x && typeof x.id === "string" && x.id.length <= 200 ? {
+  id: x.id, title: clean1(x.title), artist: clean1(x.artist), album: clean1(x.album), duration: Number(x.duration) || 0,
+} : null);
+function groupState(g) {
+  return {
+    code: g.code, name: g.name, host: g.hostName, ended: !!g.ended,
+    members: [...g.members.values()].map((m) => m.name),
+    queue: g.queue, index: g.index, playing: g.playing, position: g.position, updatedAt: g.updatedAt,
+    requests: g.requests, serverNow: Date.now(),
+  };
+}
+function broadcast(g) {
+  const data = `event: state\ndata: ${JSON.stringify(groupState(g))}\n\n`;
+  for (const res of g.streams) { try { res.write(data); } catch {} }
+}
+function endGroup(g) {
+  g.ended = true;
+  broadcast(g);
+  for (const res of g.streams) { try { res.end(); } catch {} }
+  groups.delete(g.code);
+}
+setInterval(() => { // tidy up groups whose host disappeared
+  for (const g of groups.values()) if (Date.now() - g.hostSeen > 6 * 3600 * 1000) endGroup(g);
+}, 60000);
+setInterval(() => { for (const g of groups.values()) for (const res of g.streams) { try { res.write(": ping\n\n"); } catch {} } }, 20000);
+
+async function groupRoute(req, res, p, get, post, url) {
+  const m = p.match(/^\/api\/group\/([A-Z0-9]{5})(?:\/(\w+))?$/);
+  if (post && p === "/api/group/create") {
+    const b = await readBody(req);
+    const code = newCode(), hostKey = crypto.randomUUID();
+    const g = {
+      code, hostKey, name: clean1(b.name, 60) || "Group Play", hostName: clean1(b.user, 40) || "Host",
+      members: new Map(), streams: new Set(), queue: [], index: 0, playing: false, position: 0,
+      updatedAt: Date.now(), requests: [], hostSeen: Date.now(),
+    };
+    groups.set(code, g);
+    return send(res, 200, { code, hostKey, state: groupState(g) });
+  }
+  if (!m) return send(res, 404, { error: "not found" });
+  const g = groups.get(m[1]);
+  if (!g) return send(res, 404, { error: "that group doesn't exist (or has ended)" });
+  const action = m[2] || "";
+
+  if (get && action === "events") { // live updates (Server-Sent Events)
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
+    res.write(`event: state\ndata: ${JSON.stringify(groupState(g))}\n\n`);
+    g.streams.add(res);
+    const member = url.searchParams.get("member");
+    req.on("close", () => {
+      g.streams.delete(res);
+      if (member && g.members.has(member)) { g.members.delete(member); broadcast(g); }
+    });
+    return;
+  }
+  if (!post) return send(res, 404, { error: "not found" });
+  const b = await readBody(req, 2000000); // a host queue can be long
+  const isHost = b.hostKey === g.hostKey;
+
+  if (action === "join") {
+    const id = crypto.randomUUID();
+    g.members.set(id, { name: clean1(b.user, 40) || "Guest" });
+    broadcast(g);
+    return send(res, 200, { member: id, state: groupState(g) });
+  }
+  if (action === "add") { // anyone in the group can ask for songs
+    const songs = (Array.isArray(b.songs) ? b.songs : []).map(groupSong).filter(Boolean).slice(0, 200);
+    if (!songs.length) return send(res, 400, { error: "no songs to add" });
+    const by = clean1(b.user, 40) || "someone";
+    for (const song of songs) g.requests.push({ rid: crypto.randomUUID(), song, by });
+    broadcast(g);
+    return send(res, 200, { added: songs.length });
+  }
+  if (!isHost) return send(res, 403, { error: "only the host can do that" });
+  g.hostSeen = Date.now();
+  if (action === "report") { // the host's player: queue, current song, position, playing
+    if (Array.isArray(b.queue)) g.queue = b.queue.map(groupSong).filter(Boolean).slice(0, 2000);
+    if (Number.isInteger(b.index)) g.index = Math.max(0, b.index);
+    if (typeof b.playing === "boolean") g.playing = b.playing;
+    if (Number.isFinite(b.position)) g.position = Math.max(0, b.position);
+    g.updatedAt = Date.now();
+    if (Array.isArray(b.applied)) g.requests = g.requests.filter((r) => !b.applied.includes(r.rid)); // added by the host
+    broadcast(g);
+    return send(res, 200, { ok: true });
+  }
+  if (action === "end") { endGroup(g); return send(res, 200, { ok: true }); }
+  return send(res, 404, { error: "not found" });
+}
+
 // ---------- http ----------
 const send = (res, code, body, type = "application/json", extra = {}) => {
   res.writeHead(code, { "content-type": type, ...extra });
   res.end(typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body));
 };
-const readBody = (req) => new Promise((ok) => {
+const readBody = (req, max = 10000) => new Promise((ok) => {
   let b = "";
-  req.on("data", (c) => { b += c; if (b.length > 10000) req.destroy(); });
+  req.on("data", (c) => { b += c; if (b.length > max) { req.destroy(); ok({}); } });
   req.on("end", () => { try { ok(JSON.parse(b || "{}")); } catch { ok({}); } });
   req.on("error", () => ok({}));
 });
@@ -1020,6 +1215,14 @@ const rate = new Map(); // ip -> timestamps
 http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   const p = url.pathname, get = req.method === "GET", post = req.method === "POST";
+  if (p.startsWith("/api/group/") || p.startsWith("/api/videos/")) { // used by the custom Feishin
+    res.setHeader("access-control-allow-origin", "*");
+    if (req.method === "OPTIONS") {
+      res.writeHead(204, { "access-control-allow-methods": "GET, POST", "access-control-allow-headers": "content-type", "access-control-max-age": "86400" });
+      return res.end();
+    }
+  }
+  if (p.startsWith("/api/group/")) return groupRoute(req, res, p, get, post, url);
 
   if (get && p === "/") return send(res, 200, PAGE, "text/html");
 
@@ -1036,8 +1239,10 @@ http.createServer(async (req, res) => {
   // ---- music videos ----
   if (get && p === "/api/videos/lookup") { // asked by Feishin for the song that's playing; open to any origin (read-only)
     const cors = { "access-control-allow-origin": "*", "cache-control": "no-store" };
-    const v = videos[songKey(url.searchParams.get("artist") || "", url.searchParams.get("title") || "")];
-    return v ? send(res, 200, { videoId: v.videoId, title: v.title, channel: v.channel }, "application/json", cors)
+    const key = songKey(url.searchParams.get("artist") || "", url.searchParams.get("title") || ""), v = videos[key];
+    const pending = !!v && (v.offset == null || v.timing === "pending");
+    if (pending) queueAlign(key);
+    return v ? send(res, 200, { videoId: v.videoId, title: v.title, channel: v.channel, offset: v.offset || 0, pending }, "application/json", cors)
       : send(res, 404, { error: "no music video for this song" }, "application/json", cors);
   }
   if (get && p === "/api/videos") {
@@ -1069,9 +1274,24 @@ http.createServer(async (req, res) => {
         pick = r.best;
       } catch (e) { return send(res, 502, { error: e.message }); }
     }
-    videos[songKey(song.artist, song.title)] = { videoId: pick.id, title: pick.title, channel: pick.channel, artist: song.artist, song: song.title, at: new Date().toISOString() };
+    const key = songKey(song.artist, song.title);
+    videos[key] = { videoId: pick.id, title: pick.title, channel: pick.channel, artist: song.artist, song: song.title,
+      offset: 0, timing: "pending", at: new Date().toISOString() };
     saveVideos();
+    queueAlign(key); // timing is measured in the background
     return send(res, 200, { artist: song.artist, song: song.title, videoId: pick.id, title: pick.title, channel: pick.channel });
+  }
+  if (post && p === "/api/videos/offset") { // timing tweak saved from Feishin's video window
+    const b = await readBody(req);
+    let key = b.artist != null ? songKey(String(b.artist), String(b.title || "")) : null;
+    if (!key || !videos[key]) key = findInLibrary(String(b.query || "")).map((h) => songKey(h.artist, h.title)).find((k) => videos[k]);
+    if (!key || !videos[key]) return send(res, 404, { error: "no saved music video matches that" });
+    const v = videos[key];
+    const o = Number(b.offset);
+    if (!Number.isFinite(o) || Math.abs(o) > 600) return send(res, 400, { error: "the timing must be a number of seconds" });
+    v.offset = Math.round(o * 100) / 100; v.timing = "manual";
+    saveVideos();
+    return send(res, 200, { artist: v.artist, song: v.song, offset: v.offset, timing: v.timing });
   }
   if (post && p === "/api/videos/remove") {
     const hits = findInLibrary(String((await readBody(req)).query || ""));

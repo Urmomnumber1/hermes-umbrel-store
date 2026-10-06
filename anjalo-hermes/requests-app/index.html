@@ -140,7 +140,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             <div id="sess">Session: -</div>
           </div>
           <div class="rt">
-            <h2>Hermes Music v2.6.0</h2>
+            <h2>Hermes Music v2.7.0</h2>
             <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
             <div class="sec"><span class="k">&#9662; Workers</span><br><span id="w-worker" class="d">-</span></div>
             <div class="sec"><span class="k">&#9662; Library</span><br><span class="d" id="w-lib">-</span></div>
@@ -265,6 +265,8 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
               <li>Hermes Music finds its official music video on YouTube (not lyric videos, audio uploads or live versions). Nothing is downloaded.</li>
               <li>In the custom Feishin a <b>video button</b> appears in the player bar while that song plays. It pauses the song and plays the video.</li>
               <li>Wrong video, or none found? Pick it yourself: <code>/video mr brightside | https://youtu.be/...</code></li>
+              <li>The video plays <b>muted, in step with the song</b> (like YouTube Music). Hermes Music lines it up by itself in the background by matching the sound (the video&#39;s audio is only fetched for that and deleted right after). If you open the video before that&#39;s done, it snaps into sync a moment later.</li>
+              <li>Rarely a little off? Nudge it with the -0.5s / +0.5s buttons under the video and press Save.</li>
               <li><code>/video list</code> shows all of them, <code>/video remove SONG</code> deletes one.</li>
             </ol>
             <div class="shot">
@@ -272,6 +274,19 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
               <div class="ln ok"><span>&#127916; The Killers - Mr. Brightside now has a music video: The Killers - Mr. Brightside (Official Music Video)</span></div>
             </div>
             <p class="shot-cap">example</p>
+          </div>
+        </details>
+
+        <details>
+          <summary>Group Play (in Feishin)</summary>
+          <div class="in">
+            <ol>
+              <li>Group Play lives in the custom Feishin: the <b>people icon</b> in the player bar. Hermes Music keeps everyone in step.</li>
+              <li><b>Host:</b> type your name, press <b>Create</b> and share the 5-letter code. Play, skip and seek as usual - everyone hears the same song at the same spot.</li>
+              <li><b>Members:</b> type your name and the code, press <b>Join</b>. Add songs with right-click &gt; <b>Add to group queue</b>; they go to the end of the host&#39;s queue. Only the host can skip or seek.</li>
+              <li>Everyone needs the Hermes Music address in Feishin (Settings &gt; General &gt; Music videos) and access to the same Navidrome server.</li>
+              <li>The group ends when the host presses <b>End group</b>.</li>
+            </ol>
           </div>
         </details>
 
@@ -559,6 +574,7 @@ $("f").onsubmit = async (e) => {
         try {
           const r = await api("api/videos", { method: "POST", body: JSON.stringify({ query: rest }) });
           push("ok", "\ud83c\udfac " + r.artist + " - " + r.song + " now has a music video: " + r.title + (r.channel ? " (" + r.channel + ")" : ""));
+          push("sys", "  lining the video up with the song in the background - it plays in sync in Feishin");
           push("sys", "  in the custom Feishin a video button shows up while it plays - youtu.be/" + r.videoId);
         } catch (e) {
           push("err", e.message);
