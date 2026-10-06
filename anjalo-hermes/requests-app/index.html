@@ -140,7 +140,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             <div id="sess">Session: -</div>
           </div>
           <div class="rt">
-            <h2>Hermes Music v2.7.1</h2>
+            <h2>Hermes Music v2.8.0</h2>
             <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
             <div class="sec"><span class="k">&#9662; Workers</span><br><span id="w-worker" class="d">-</span></div>
             <div class="sec"><span class="k">&#9662; Library</span><br><span class="d" id="w-lib">-</span></div>
@@ -263,8 +263,9 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             <ol>
               <li>Type <code>/video</code> and a song that&#39;s already in your library, e.g. <code>/video mr brightside the killers</code>.</li>
               <li>Hermes Music finds its official music video on YouTube (not lyric videos, audio uploads or live versions). Nothing is downloaded.</li>
-              <li>In the custom Feishin a <b>video button</b> appears in the player bar while that song plays. It pauses the song and plays the video.</li>
-              <li>Wrong video, or none found? Pick it yourself: <code>/video mr brightside | https://youtu.be/...</code></li>
+              <li>In the custom Feishin a <b>video button</b> appears in the player bar while that song plays. It opens the video next to the song.</li>
+              <li>Before a video is used, Hermes Music checks by sound that it&#39;s the same recording as your song, so fan edits and other songs are skipped.</li>
+              <li>Still the wrong video? Press <b>Wrong video</b> under it in Feishin (or type <code>/video wrong mr brightside</code>) and the next best one is tried. Or pick it yourself: <code>/video mr brightside | https://youtu.be/...</code></li>
               <li>The video plays <b>muted, in step with the song</b> (like YouTube Music). Hermes Music lines it up by itself in the background by matching the sound (the video&#39;s audio is only fetched for that and deleted right after). If you open the video before that&#39;s done, it snaps into sync a moment later.</li>
               <li>Rarely a little off? Nudge it with the -0.5s / +0.5s buttons under the video and press Save.</li>
               <li><code>/video list</code> shows all of them, <code>/video remove SONG</code> deletes one.</li>
@@ -497,7 +498,7 @@ const HELP = [
   "/bump NAME       push something already queued to the front",
   "/duplicate       find copies of the same song (then /duplicate confirm)",
   "/rescan          re-read the music folder now",
-  "/video SONG      find the song's music video for Feishin (also: /video list, /video remove SONG)",
+  "/video SONG      find the song's music video for Feishin (also: /video list, /video wrong SONG, /video remove SONG)",
   "/queue           show queue counts",
   "/config          open the config tab",
   "/clear           clear this screen",
@@ -564,6 +565,11 @@ $("f").onsubmit = async (e) => {
           if (!list.length) push("sys", "no music videos yet - add one with /video SONG");
           list.forEach((x) => push("sys", "  \ud83c\udfac " + x.artist + " - " + x.song + "  (youtu.be/" + x.videoId + ")"));
         } catch (e) { push("err", e.message); }
+      } else if (/^wrong\s+/i.test(rest)) {
+        try { const r = await api("api/videos/wrong", { method: "POST", body: JSON.stringify({ query: rest.replace(/^wrong\s+/i, "") }) });
+          if (r.removed) push("sys", "no other video sounds like " + r.artist + " - " + r.song + ", so it was removed - pick one with /video SONG | LINK");
+          else push("ok", "🎬 " + r.artist + " - " + r.song + ": trying " + (r.title ? r.title + " (" + r.channel + ")" : "a fresh search") + " - checked by sound in the background"); }
+        catch (e) { push("err", e.message); }
       } else if (/^remove\s+/i.test(rest)) {
         try { const r = await api("api/videos/remove", { method: "POST", body: JSON.stringify({ query: rest.replace(/^remove\s+/i, "") }) });
           push("ok", "removed the music video for " + r.artist + " - " + r.song); }

@@ -971,38 +971,50 @@ function findInLibrary(query) {
 // YouTube search with no length limit (videos are often longer than the song).
 async function ytSearchAny(query, n = 10) {
   const s = await run("yt-dlp", [`ytsearch${n}:${query}`, "--skip-download", "--no-warnings",
-    "--print", "%(.{id,title,channel,duration})j"], { timeout: 120000 });
+    "--print", "%(.{id,title,channel,duration,view_count,channel_is_verified})j"], { timeout: 120000 });
   const rows = [];
   for (const l of s.out.split("\n")) {
-    try { const v = JSON.parse(l); if (/^[\w-]{11}$/.test(v.id || "")) rows.push({ id: v.id, title: v.title || "", channel: v.channel || "", seconds: Number(v.duration) || 0 }); } catch {}
+    try { const v = JSON.parse(l); if (/^[\w-]{11}$/.test(v.id || "")) rows.push({ id: v.id, title: v.title || "", channel: v.channel || "", seconds: Number(v.duration) || 0,
+      views: Number(v.view_count) || 0, verified: !!v.channel_is_verified }); } catch {}
   }
   if (!rows.length && s.err.trim()) throw new Error("YouTube search failed: " + s.err.trim().split("\n").pop().slice(0, 150));
   return rows;
 }
-// Picks the official music video: right title, video (not audio/lyrics/live), artist's or VEVO channel, sensible length.
-function scoreVideo(v, artist, title, seconds) {
-  const first = String(artist).split(/\s*(?:,|&|\bfeat\.?|\bft\.?)\s*/i)[0];
-  const t = norm(title), a = norm(first), wantLive = /\blive\b/i.test(title);
-  const vt = norm(v.title), ch = norm(v.channel);
+// Picks the official music video: right title, the artist's own (or VEVO) channel, popular, not a fan edit,
+// audio, lyric or live upload, sensible length. The pick is then confirmed by matching the sound (verifyVideo).
+const artistNames = (artist) => String(artist).split(/\s*(?:,|&|;|\bfeat\.?|\bft\.?|\bx\b|\band\b)\s*/i).map(norm).filter((a) => a.length > 1);
+function scoreVideo(v, artist, title, seconds, maxViews) {
+  const t = norm(title), names = artistNames(artist), wantLive = /\blive\b/i.test(title);
+  const vt = norm(v.title), ch = norm(v.channel).replace(/ ?(official|vevo|music|tv)$/g, "");
+  const own = !!ch && names.some((a) => ch === a || ch.includes(a) || (ch.length > 3 && a.includes(ch)));
   let s = vt.includes(t) ? 0 : -100;
-  if (/official\s+(music\s+)?video/i.test(v.title)) s += 40;
-  else if (/music\s+video|\bmv\b/i.test(v.title)) s += 20;
-  if (/vevo$/i.test(v.channel.replace(/\s/g, ""))) s += 25;
-  else if (ch && (ch.includes(a) || a.includes(ch))) s += 20;
+  if (/official\s+(music\s+)?video/i.test(v.title)) s += 30;
+  else if (/music\s+video|\bmv\b/i.test(v.title)) s += 15;
+  if (/vevo$/i.test(v.channel.replace(/\s/g, ""))) s += 45;
+  else if (own) s += 45;
+  else s -= 15; // someone else's upload: needs to be clearly the best otherwise
+  if (v.verified) s += 10;
   if (/ - topic$/i.test(v.channel)) s -= 80; // auto-generated, audio only
   if (/lyric|lyrics|letra/i.test(v.title)) s -= 60;
   if (/official\s+audio|\baudio\b|visuali[sz]er/i.test(v.title)) s -= 40;
   if (!wantLive && /\blive\b|concert|tour/i.test(v.title)) s -= 40;
   if (/cover|karaoke|reaction|tutorial|remix|sped|slowed|nightcore|\b8d\b|instrumental/i.test(v.title)) s -= 70;
+  if (/school\s+project|fan[\s-]?(made|video|edit|animation)|\bfan\b|unofficial|\b[ap]mv\b|\bmmd\b|animatic|parody|\bmeme\b|\bedit\b|concept|tribute|piano|guitar|drum|dance\s+(practice|cover)|choreo/i.test(v.title)) s -= 80;
+  if (maxViews && v.views) { const r = v.views / maxViews; s += r >= 0.3 ? 25 : r >= 0.05 ? 10 : r < 0.005 ? -25 : 0; }
   if (seconds && v.seconds) { const d = Math.abs(v.seconds - seconds); s += d <= 15 ? 15 : d <= 90 ? 5 : d > 240 ? -30 : 0; }
   return s;
 }
 async function findMusicVideo(artist, title, seconds) {
   const first = String(artist).split(/\s*(?:,|&|\bfeat\.?|\bft\.?)\s*/i)[0];
-  const scored = (await ytSearchAny(`${first} ${title} official music video`))
-    .map((v) => ({ ...v, score: scoreVideo(v, artist, title, seconds) }))
-    .sort((x, y) => y.score - x.score);
-  return { best: scored[0] && scored[0].score >= 30 ? scored[0] : null, others: scored.slice(0, 3) };
+  // two searches: the "official music video" one, and a plain one (official videos aren't always titled that way)
+  const lists = await Promise.allSettled([ytSearchAny(`${first} ${title} official music video`), ytSearchAny(`${first} ${title}`, 8)]);
+  const seen = new Map();
+  for (const l of lists) if (l.status === "fulfilled") for (const v of l.value) if (!seen.has(v.id)) seen.set(v.id, v);
+  if (!seen.size) { const e = lists.find((l) => l.status === "rejected"); if (e) throw e.reason; }
+  const all = [...seen.values()], maxViews = Math.max(0, ...all.map((v) => v.views));
+  const scored = all.map((v) => ({ ...v, score: scoreVideo(v, artist, title, seconds, maxViews) })).sort((x, y) => y.score - x.score);
+  const good = scored.filter((v) => v.score >= 30);
+  return { best: good[0] || null, candidates: good.slice(0, 4), others: scored.slice(0, 3) };
 }
 
 // Music video timing: finds where the song starts inside the video by matching the sound, so the custom
@@ -1055,7 +1067,7 @@ async function alignVideo(songFile, videoId) {
     let mean = 0; for (const x of scores) mean += x; mean /= scores.length;
     let sd = 0; for (const x of scores) sd += (x - mean) ** 2; sd = Math.sqrt(sd / scores.length) || 1;
     const z = (best.score - mean) / sd; // how much the best match stands out from all the others
-    return { offset: Math.round(best.lag * 5) / 100, confident: z >= 5 };
+    return { offset: Math.round(best.lag * 5) / 100, confident: z >= 5, z };
   } finally {
     fs.rmSync(dir, { recursive: true, force: true }); // nothing from YouTube is kept
   }
@@ -1078,13 +1090,9 @@ async function runAlign() {
     if (!ready()) { await sleep(30000); continue; } // tools still installing
     const key = alignQueue.shift(), v = videos[key];
     if (v && v.timing !== "manual") {
-      try {
-        const hit = findInLibrary(`${v.artist} - ${v.song}`)[0];
-        if (!hit) throw new Error("song file not found");
-        const a = await alignVideo(hit.file, v.videoId);
-        if (videos[key] === v) Object.assign(v, { offset: a.offset, timing: a.confident ? "auto" : "guess" });
-      } catch (e) {
-        Object.assign(v, { offset: v.offset || 0, timing: "failed" });
+      try { await verifyVideo(key, v); }
+      catch (e) {
+        if (videos[key] === v) Object.assign(v, { offset: v.offset || 0, timing: "failed" });
         console.error("video timing failed:", v.artist, v.song, e.message);
       }
       saveVideos();
@@ -1093,8 +1101,48 @@ async function runAlign() {
   }
   aligning = false;
 }
+// Hand-picked videos (/video SONG | LINK) are only timed. Automatic picks are checked by sound: if the video's
+// audio isn't the same recording, the next candidate is tried, so fan edits and wrong songs get skipped.
+const isManualPick = (v) => v.pick === "manual" || (v.pick == null && v.title === "(chosen by hand)");
+async function verifyVideo(key, v) {
+  const hit = findInLibrary(`${v.artist} - ${v.song}`)[0];
+  if (!hit) throw new Error("song file not found");
+  const stale = () => videos[key] !== v; // /video or "wrong video" replaced it meanwhile
+  if (isManualPick(v)) {
+    const a = await alignVideo(hit.file, v.videoId);
+    if (!stale()) Object.assign(v, { offset: a.offset, timing: a.confident ? "auto" : "guess" });
+    return;
+  }
+  const rejected = new Set(v.rejected || []);
+  if (!v.candidates) {
+    const r = await findMusicVideo(v.artist, v.song, (await probeInfo(hit.file)).d);
+    if (stale()) return;
+    v.candidates = r.candidates.map(({ id, title, channel }) => ({ id, title, channel }));
+  }
+  const list = v.candidates.filter((c) => !rejected.has(c.id));
+  if (!list.length && !rejected.has(v.videoId)) list.push({ id: v.videoId, title: v.title, channel: v.channel });
+  if (!list.length) { if (!stale()) delete videos[key]; return; } // nothing left that could be it
+  let best = null;
+  for (const c of list.slice(0, 3)) {
+    let a;
+    try { a = await alignVideo(hit.file, c.id); } catch (e) { console.error("video check failed:", c.id, e.message); continue; }
+    if (stale()) return;
+    if (!best || a.z > best.a.z) best = { c, a };
+    if (a.confident) break; // same recording: this is the one
+    rejected.add(c.id); // doesn't sound like the song
+  }
+  if (stale()) return;
+  if (!best) best = { c: list[0], a: { offset: 0, confident: false } };
+  rejected.delete(best.c.id);
+  Object.assign(v, { videoId: best.c.id, title: best.c.title, channel: best.c.channel, offset: best.a.offset,
+    timing: best.a.confident ? "auto" : "guess", rejected: [...rejected], check: 2 });
+}
 setTimeout(() => {
-  for (const [key, v] of Object.entries(videos)) if (v.offset == null || v.timing === "pending") queueAlign(key);
+  for (const [key, v] of Object.entries(videos)) {
+    // picks from before the sound check are looked at again once
+    if (!isManualPick(v) && v.timing !== "manual" && v.check !== 2) { v.timing = "pending"; delete v.candidates; }
+    if (v.offset == null || v.timing === "pending") queueAlign(key);
+  }
 }, 15000);
 
 // ---------- Group Play: one host, any number of members, everyone listens to the same song ----------
@@ -1261,7 +1309,7 @@ http.createServer(async (req, res) => {
     if (link) {
       const id = ytId(link) || (/^[\w-]{11}$/.test(link) ? link : null);
       if (!id) return send(res, 400, { error: "that doesn't look like a YouTube link" });
-      pick = { id, title: "(chosen by hand)", channel: "" };
+      pick = { id, title: "(chosen by hand)", channel: "", manual: true };
     } else {
       if (!ready()) return send(res, 503, { error: "still installing tools - try again in a minute" });
       const secs = (await probeInfo(song.file)).d;
@@ -1271,12 +1319,13 @@ http.createServer(async (req, res) => {
           error: `no official music video found for ${song.artist} - ${song.title}`,
           choices: r.others.map((v) => `${v.title} (${v.channel}) https://youtu.be/${v.id}`),
         });
-        pick = r.best;
+        pick = { ...r.best, candidates: r.candidates.map(({ id, title, channel }) => ({ id, title, channel })) };
       } catch (e) { return send(res, 502, { error: e.message }); }
     }
     const key = songKey(song.artist, song.title);
     videos[key] = { videoId: pick.id, title: pick.title, channel: pick.channel, artist: song.artist, song: song.title,
-      offset: 0, timing: "pending", at: new Date().toISOString() };
+      offset: 0, timing: "pending", at: new Date().toISOString(), check: 2,
+      ...(pick.manual ? { pick: "manual" } : { candidates: pick.candidates }) };
     saveVideos();
     queueAlign(key); // timing is measured in the background
     return send(res, 200, { artist: song.artist, song: song.title, videoId: pick.id, title: pick.title, channel: pick.channel });
@@ -1292,6 +1341,23 @@ http.createServer(async (req, res) => {
     v.offset = Math.round(o * 100) / 100; v.timing = "manual";
     saveVideos();
     return send(res, 200, { artist: v.artist, song: v.song, offset: v.offset, timing: v.timing });
+  }
+  if (post && p === "/api/videos/wrong") { // skip this video and try the next candidate
+    const b = await readBody(req);
+    let key = b.artist != null ? songKey(String(b.artist), String(b.title || "")) : null;
+    if (!key || !videos[key]) key = findInLibrary(String(b.query || "")).map((h) => songKey(h.artist, h.title)).find((k) => videos[k]);
+    if (!key || !videos[key]) return send(res, 404, { error: "no saved music video matches that" });
+    const old = videos[key];
+    const rejected = [...new Set([...(old.rejected || []), old.videoId])];
+    const next = (old.candidates || []).find((c) => !rejected.includes(c.id));
+    if (!next && old.candidates) { delete videos[key]; saveVideos(); return send(res, 200, { artist: old.artist, song: old.song, removed: true }); }
+    // try the next one (or search again for hand picks and old saves); the sound check confirms it in the background
+    const v = videos[key] = { ...old, ...(next ? { videoId: next.id, title: next.title, channel: next.channel } : {}),
+      pick: "auto", offset: 0, timing: "pending", rejected, check: 2, at: new Date().toISOString() };
+    if (!next) delete v.candidates;
+    saveVideos();
+    queueAlign(key);
+    return send(res, 200, { artist: v.artist, song: v.song, videoId: next ? next.id : null, title: next ? next.title : null, channel: next ? next.channel : null });
   }
   if (post && p === "/api/videos/remove") {
     const hits = findInLibrary(String((await readBody(req)).query || ""));

@@ -26,6 +26,10 @@ Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbr
 - `/video SONG` finds the official music video for a song in your library (`/video SONG | LINK` to pick one,
   `/video list`, `/video remove SONG`). The custom Feishin build shows a video button for those songs and streams the
   video with YouTube's embedded player; nothing is downloaded. Feishin asks `GET /api/videos/lookup?artist=&title=`.
+- Videos are picked from the artist's own (or VEVO) channel and the most-watched uploads, skipping fan edits, lyric and
+  audio uploads; each pick is then checked by sound against your file, and the next candidate is tried if it isn't the
+  same recording. Wrong anyway? Press **Wrong video** in Feishin or type `/video wrong SONG`.
+- The custom Feishin updates itself from this fork's releases (downloads in the background, installs when you close it).
 - Music videos play muted in step with the song in the custom Feishin. Hermes Music lines each video up with the song
   in the background by matching the sound (the video's audio is fetched for that and deleted right after).
 - Group Play (custom Feishin, people icon): a host creates a group and shares the 5-letter code; members join, hear what
