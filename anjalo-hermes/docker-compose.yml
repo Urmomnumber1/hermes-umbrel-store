@@ -12,7 +12,32 @@ services:
   # downloads them with yt-dlp and saves them straight into the Umbrel music folder.
   web:
     image: node:22-bookworm-slim
-    command: sh /app/start.sh
+    # Umbrel updates replace this file but not the code folder, so the code for this version is fetched
+    # from GitHub on start (and kept in /data/app). Falls back to the installed copy if that fails.
+    environment:
+      HM_VERSION: "2.8.1"
+    command:
+      - sh
+      - -c
+      - |
+        D=/data/app/$$HM_VERSION
+        if [ ! -f "$$D/.ok" ]; then
+          mkdir -p "$$D" && node -e '
+            const [dir, v] = process.argv.slice(1);
+            const base = "https://raw.githubusercontent.com/Urmomnumber1/hermes-umbrel-store/hermes-music-" + v + "/anjalo-hermes/requests-app/";
+            Promise.all(["server.js", "index.html", "start.sh"].map(async (f) => {
+              let r;
+              for (let i = 0; i < 4; i++) { // GitHub sometimes answers 404/5xx for a moment
+                r = await fetch(base + f).catch(() => null);
+                if (r && r.ok) break;
+                await new Promise((ok) => setTimeout(ok, 2000 * (i + 1)));
+              }
+              if (!r || !r.ok) throw new Error(f + " -> " + (r ? "HTTP " + r.status : "no connection"));
+              require("fs").writeFileSync(dir + "/" + f, Buffer.from(await r.arrayBuffer()));
+            })).then(() => require("fs").writeFileSync(dir + "/.ok", ""), (e) => { console.error("code download failed:", e.message); process.exit(1); });
+          ' "$$D" "$$HM_VERSION" || rm -rf "$$D"
+        fi
+        if [ -f "$$D/.ok" ]; then exec sh "$$D/start.sh"; else exec sh /app/start.sh; fi
     restart: on-failure
     stop_grace_period: 30s
     user: "0:0" # start.sh installs ffmpeg, then drops to uid 1000 for the app itself

@@ -2,7 +2,10 @@
 # Starts the request page right away. The download tools (ffmpeg, ffprobe, yt-dlp, Claude Code) are
 # single files cached in /data/tools, so they're fetched once (in parallel) and later starts are instant.
 set -e
+APP=$(cd "$(dirname "$0")" && pwd) # /data/app/<version> (fetched for this version) or /app (installed copy)
 TOOLS=/data/tools
+# drop code fetched for older versions
+[ -n "$HM_VERSION" ] && [ -d /data/app ] && find /data/app -mindepth 1 -maxdepth 1 ! -name "$HM_VERSION" -exec rm -rf {} +
 TV=2 # bump to force a fresh download of the cached tools
 mkdir -p "$TOOLS/bin" /data/home /data/staging /music
 # The music folder must be writable by the app user (uid 1000). Only the top folder is changed.
@@ -57,4 +60,4 @@ fetch() {
 ) >"$TOOLS/setup.log" 2>&1 &
 
 exec setpriv --reuid=1000 --regid=1000 --clear-groups \
-  env HOME=/data/home PATH="$TOOLS/bin:$TOOLS/npm/bin:$PATH" node /app/server.js
+  env HOME=/data/home PATH="$TOOLS/bin:$TOOLS/npm/bin:$PATH" node "$APP/server.js"
