@@ -1640,6 +1640,11 @@ async function groupRoute(req, res, p, get, post, url) {
     if (typeof sourStat === "function" && me.profile) sourStat(me.profile, "skips", 1);
     const needed = Math.max(1, Math.ceil(uniquePeople(g) / 2));
     const skipped = g.votes.size >= needed;
+    if (skipped && g.queue[g.index] && typeof social === "object") { // the song's "sourness" (how often it gets skipped)
+      const id = g.queue[g.index].id;
+      social.skips[id] = (social.skips[id] || 0) + 1;
+      socialDirty = true;
+    }
     if (skipped) stationAdvance(g);
     broadcast(g);
     return send(res, 200, { skipped, votes: skipped ? 0 : g.votes.size, needed });
@@ -1792,6 +1797,13 @@ function countPlay(p, song) {
   const ds = (d.songs[song.id] ??= { song, n: 0 }); ds.n++;
   for (const k of Object.keys(groupStats.days).sort().slice(0, -14)) delete groupStats.days[k]; // two weeks of days
   for (const k of Object.keys(groupStats.weeks).sort().slice(0, -104)) delete groupStats.weeks[k]; // two years of weeks
+  // each month's most played songs (the "era" strip on profiles), 13 months kept
+  const month = dayKey().slice(0, 7);
+  p.months = p.months || {};
+  const mm = (p.months[month] ??= {});
+  const ms = (mm[song.id] ??= { song, n: 0 }); ms.n++; ms.song = song;
+  p.months[month] = trimCounts(mm, 20);
+  for (const k of Object.keys(p.months).sort().slice(0, -13)) delete p.months[k];
   statsDirty = true;
 }
 function profileStats(p) {
@@ -1823,8 +1835,308 @@ function publicProfile(p, self = false) {
     away: !online ? p.away || "" : "",
   };
   if (!hidden && !priv.hideStats) out.stats = profileStats(p);
-  if (self) Object.assign(out, { account: p.navidrome || null, avatarHistory: (p.avatarHistory || []).map((h) => h.v), resume: p.lastPlayback || null, perks: perksOf(p.id) });
+  if (self) Object.assign(out, { account: p.navidrome || null, visits: p.custom && p.custom.visits ? p.visits || [] : [], avatarHistory: (p.avatarHistory || []).map((h) => h.v), resume: p.lastPlayback || null, perks: perksOf(p.id) });
   return out;
+}
+
+// ---- Sour Player social extras (3.1.0): gifts, time capsules, sticky notes on songs, duels and the Hall of
+// Fame, the daily hot seat, "play this next" asks, an activity feed, the colour of the day, wrapped night ----
+const SOCIAL = "/data/social.json";
+let social = { gifts: [], capsules: [], notes: {}, duels: [], hall: [], asks: [], activity: [], hotseat: {}, wrapped: null, colors: {}, skips: {}, ...readJson(SOCIAL, {}) };
+let socialDirty = false;
+const saveSocial = () => { socialDirty = false; fs.writeFileSync(SOCIAL, JSON.stringify(social)); };
+setInterval(() => { if (socialDirty) saveSocial(); }, 20000);
+const sid = () => crypto.randomUUID().slice(0, 10);
+const nameOf = (id) => (profiles[id] ? profiles[id].name : "someone");
+function addActivity(type, who, text, song = null) {
+  social.activity = [{ id: sid(), type, by: who ? who.id : null, byName: who ? who.name : null, text: clean1(text, 160), song, at: Date.now() }, ...social.activity].slice(0, 120);
+  socialDirty = true;
+}
+const DAILY_COLORS = ["#f2c14e", "#9bd06b", "#ff7a6b", "#7c8cff", "#ff71ce", "#2ed3c6", "#ff9f43", "#b48ef0", "#e84393", "#39c0ed"];
+function colorOfDay(day = dayKey()) { // the most voted colour from the day before, otherwise the rotation
+  const votes = social.colors[day] || {};
+  const tally = {};
+  for (const c of Object.values(votes)) tally[c] = (tally[c] || 0) + 1;
+  const top = Object.entries(tally).sort((a, b) => b[1] - a[1])[0];
+  if (top) return top[0];
+  const n = Math.floor(Date.parse(day + "T00:00:00Z") / 86400000);
+  return DAILY_COLORS[((n % DAILY_COLORS.length) + DAILY_COLORS.length) % DAILY_COLORS.length];
+}
+// a number from a string (the same every time), for picking the hot seat and shuffling its choices
+const seeded = (text) => { let h = 2166136261; for (const ch of text) { h ^= ch.charCodeAt(0); h = Math.imul(h, 16777619); } return h >>> 0; };
+function hotSeat(day = dayKey()) {
+  if (social.hotseat.day === day && profiles[social.hotseat.profile]) return social.hotseat;
+  const people = visibleProfiles().filter((x) => !privacy(x).private && !privacy(x).hideStats && Date.now() - (x.lastSeen || 0) < 14 * 86400000
+    && Object.keys((x.stats && x.stats.songs) || {}).length >= 4);
+  if (!people.length) return null;
+  const who = people.sort((a, b) => a.id.localeCompare(b.id))[seeded(day) % people.length];
+  const answer = topEntries(who.stats.songs, 1)[0][1].song;
+  const pool = new Map();
+  for (const x of visibleProfiles()) for (const [, s] of topEntries((x.stats && x.stats.songs) || {}, 8)) if (s.song.id !== answer.id) pool.set(s.song.id, s.song);
+  const others = [...pool.values()].sort((a, b) => seeded(day + a.id) - seeded(day + b.id)).slice(0, 3);
+  if (others.length < 2) return null;
+  const options = [answer, ...others].sort((a, b) => seeded(day + "o" + a.id) - seeded(day + "o" + b.id));
+  social.hotseat = { day, profile: who.id, answer: answer.id, options, guesses: {} };
+  socialDirty = true;
+  return social.hotseat;
+}
+function settleDuels() { // a duel closes a day after both songs are in; the winner goes to the Hall of Fame
+  const now = Date.now();
+  for (const d of social.duels) {
+    if (d.winner || !d.b || now < d.ends) continue;
+    const tally = { a: 0, b: 0 };
+    for (const side of Object.values(d.votes || {})) tally[side] = (tally[side] || 0) + 1;
+    d.winner = tally.b > tally.a ? "b" : "a";
+    d.tally = tally;
+    const w = d[d.winner];
+    social.hall = [{ song: w.song, by: w.by, byName: w.byName, against: d[d.winner === "a" ? "b" : "a"].song.title, votes: tally[d.winner], at: now }, ...social.hall].slice(0, 200);
+    addActivity("duel", profiles[w.by] || null, `won a song duel with ${w.song.title}`, w.song);
+  }
+  social.duels = social.duels.filter((d) => !d.winner || now - d.ends < 7 * 86400000).slice(-60);
+}
+const publicDuel = (d, viewer) => ({ id: d.id, a: d.a, b: d.b, opponent: d.opponent, opponentName: d.opponent ? nameOf(d.opponent) : null, created: d.created, ends: d.ends || null,
+  votes: d.winner ? d.tally : { a: Object.values(d.votes || {}).filter((v) => v === "a").length, b: Object.values(d.votes || {}).filter((v) => v === "b").length },
+  myVote: viewer ? (d.votes || {})[viewer] || null : null, winner: d.winner || null });
+
+// returns true when it answered the request
+async function socialRoute(req, res, p, get, post, url) {
+  let m;
+  const auth = async (limit = 20000) => {
+    const b = await readBody(req, limit);
+    const me = ownProfile(String(b.profile || ""), b.key);
+    return { b, me };
+  };
+  const denied = () => send(res, 403, { error: "set up your profile first" });
+  if (get && p === "/api/activity") { settleDuels(); return send(res, 200, social.activity.slice(0, 60)), true; }
+  if (post && p === "/api/activity") { // "on repeat" and other things the app noticed
+    const { b, me } = await auth();
+    if (!me) return denied(), true;
+    const song = b.song ? groupSong(b.song) : null;
+    if (b.type === "repeat" && song) {
+      const key = `${me.id}:${song.id}:${dayKey()}`;
+      if (!(social.repeatSeen || (social.repeatSeen = {}))[key]) {
+        social.repeatSeen[key] = 1;
+        for (const k of Object.keys(social.repeatSeen)) if (!k.endsWith(dayKey())) delete social.repeatSeen[k];
+        addActivity("repeat", me, `has played ${song.title} ${int(b.count, 2, 999) || 10} times today`, song);
+      }
+    }
+    return send(res, 200, { ok: true }), true;
+  }
+  if (p === "/api/gifts" && post) { // send a friend a song (with a note); it shows up wrapped in their inbox
+    const { b, me } = await auth();
+    if (!me) return denied(), true;
+    const to = profiles[String(b.to || "")], song = groupSong(b.song);
+    if (!to || to.mergedInto || !song) return send(res, 400, { error: "pick a friend and a song" }), true;
+    social.gifts = [{ id: sid(), from: me.id, fromName: me.name, to: to.id, song, note: clean1(b.note, 200), at: Date.now(), opened: null }, ...social.gifts].slice(0, 500);
+    addActivity("gift", me, `sent ${to.name} a song`);
+    return send(res, 200, { ok: true }), true;
+  }
+  if (post && p === "/api/gifts/mine") {
+    const { me } = await auth();
+    if (!me) return denied(), true;
+    return send(res, 200, { received: social.gifts.filter((g) => g.to === me.id).slice(0, 50), sent: social.gifts.filter((g) => g.from === me.id).slice(0, 50).map((g) => ({ ...g, toName: nameOf(g.to) })) }), true;
+  }
+  if (post && (m = p.match(/^\/api\/gifts\/([\w-]{1,20})\/open$/))) {
+    const { me } = await auth();
+    const g = social.gifts.find((x) => x.id === m[1]);
+    if (!me || !g || g.to !== me.id) return denied(), true;
+    if (!g.opened) { g.opened = Date.now(); socialDirty = true; }
+    return send(res, 200, g), true;
+  }
+  if (post && p === "/api/capsules") { // a song and a note that only opens on a chosen date
+    const { b, me } = await auth();
+    if (!me) return denied(), true;
+    const song = groupSong(b.song), unlockAt = Number(b.unlockAt);
+    const to = b.to === "group" ? "group" : profiles[String(b.to || "")] ? String(b.to) : null;
+    if (!song || !to) return send(res, 400, { error: "pick who it's for and a song" }), true;
+    if (!Number.isFinite(unlockAt) || unlockAt < Date.now() + 3600000 || unlockAt > Date.now() + 3 * 365 * 86400000) return send(res, 400, { error: "pick a date from an hour to three years away" }), true;
+    social.capsules = [...social.capsules, { id: sid(), from: me.id, fromName: me.name, to, song, note: clean1(b.note, 500), at: Date.now(), unlockAt }].slice(-400);
+    socialDirty = true;
+    return send(res, 200, { ok: true }), true;
+  }
+  if (post && p === "/api/capsules/mine") {
+    const { me } = await auth();
+    if (!me) return denied(), true;
+    const now = Date.now();
+    const mine = social.capsules.filter((c) => c.to === me.id || c.to === "group" || c.from === me.id);
+    return send(res, 200, mine.map((c) => (c.unlockAt <= now || c.from === me.id
+      ? { ...c, toName: c.to === "group" ? "the group" : nameOf(c.to), locked: c.unlockAt > now }
+      : { id: c.id, fromName: c.fromName, to: c.to, toName: c.to === "group" ? "the group" : nameOf(c.to), at: c.at, unlockAt: c.unlockAt, locked: true }))
+      .sort((a, b) => a.unlockAt - b.unlockAt)), true;
+  }
+  if ((m = p.match(/^\/api\/song-notes\/([^/]{1,200})$/))) { // sticky notes friends leave on a song
+    const songId = decodeURIComponent(m[1]);
+    if (get) return send(res, 200, social.notes[songId] || []), true;
+    if (!post) return false;
+    const { b, me } = await auth();
+    if (!me) return denied(), true;
+    const list = social.notes[songId] || [];
+    if (b.remove) social.notes[songId] = list.filter((n) => !(n.id === b.remove && n.from === me.id));
+    else {
+      const text = clean1(b.text, 200).trim();
+      if (!text) return send(res, 400, { error: "write something" }), true;
+      social.notes[songId] = [{ id: sid(), from: me.id, fromName: me.name, text, at: Date.now() }, ...list].slice(0, 20);
+    }
+    if (!social.notes[songId].length) delete social.notes[songId];
+    socialDirty = true;
+    return send(res, 200, social.notes[songId] || []), true;
+  }
+  if (get && p === "/api/duels") { settleDuels(); const viewer = url.searchParams.get("profile"); return send(res, 200, social.duels.slice().reverse().map((d) => publicDuel(d, viewer))), true; }
+  if (get && p === "/api/hall") { settleDuels(); return send(res, 200, social.hall), true; }
+  if (post && p === "/api/duels") { // start a song duel (against someone, or whoever answers first)
+    const { b, me } = await auth();
+    if (!me) return denied(), true;
+    const song = groupSong(b.song);
+    if (!song) return send(res, 400, { error: "pick your song" }), true;
+    if (social.duels.filter((d) => !d.winner && d.a.by === me.id).length >= 3) return send(res, 429, { error: "you already have 3 duels going" }), true;
+    const opponent = b.opponent && profiles[String(b.opponent)] ? String(b.opponent) : null;
+    const d = { id: sid(), a: { song, by: me.id, byName: me.name }, b: null, opponent, created: Date.now(), votes: {} };
+    social.duels.push(d);
+    addActivity("duel", me, opponent ? `challenged ${nameOf(opponent)} to a song duel` : "started a song duel - anyone can answer", song);
+    return send(res, 200, publicDuel(d, me.id)), true;
+  }
+  if (post && (m = p.match(/^\/api\/duels\/([\w-]{1,20})\/(accept|vote)$/))) {
+    const { b, me } = await auth();
+    const d = social.duels.find((x) => x.id === m[1]);
+    if (!me) return denied(), true;
+    if (!d || d.winner) return send(res, 404, { error: "that duel is over" }), true;
+    if (m[2] === "accept") {
+      if (d.b) return send(res, 409, { error: "someone already answered" }), true;
+      if (d.a.by === me.id || (d.opponent && d.opponent !== me.id)) return send(res, 403, { error: "this duel isn't yours to answer" }), true;
+      const song = groupSong(b.song);
+      if (!song) return send(res, 400, { error: "pick your song" }), true;
+      d.b = { song, by: me.id, byName: me.name };
+      d.ends = Date.now() + 86400000;
+      addActivity("duel", me, `took the duel: ${d.a.song.title} vs ${song.title} - vote!`, song);
+      return send(res, 200, publicDuel(d, me.id)), true;
+    }
+    if (!d.b) return send(res, 409, { error: "waiting for the second song" }), true;
+    if (me.id === d.a.by || me.id === d.b.by) return send(res, 403, { error: "you can't vote in your own duel" }), true;
+    d.votes[me.id] = b.side === "b" ? "b" : "a";
+    socialDirty = true;
+    return send(res, 200, publicDuel(d, me.id)), true;
+  }
+  if (get && p === "/api/hotseat") { // today's hot seat: guess their most played song
+    const hs = hotSeat();
+    if (!hs) return send(res, 404, { error: "not enough listening yet for a hot seat" }), true;
+    const viewer = url.searchParams.get("profile") || "";
+    const guessed = hs.guesses[viewer] || null;
+    const show = !!guessed || viewer === hs.profile;
+    return send(res, 200, { day: hs.day, profile: { id: hs.profile, name: nameOf(hs.profile), avatar: profiles[hs.profile].avatar ? profiles[hs.profile].avatar.v : 0 },
+      options: hs.options, guessed, answer: show ? hs.answer : null,
+      results: show ? Object.entries(hs.guesses).map(([id, g]) => ({ name: nameOf(id), right: g === hs.answer })) : null,
+      guesses: Object.keys(hs.guesses).length }), true;
+  }
+  if (post && p === "/api/hotseat/guess") {
+    const { b, me } = await auth();
+    const hs = hotSeat();
+    if (!me) return denied(), true;
+    if (!hs) return send(res, 404, { error: "no hot seat today" }), true;
+    if (me.id === hs.profile) return send(res, 403, { error: "you're in the hot seat today" }), true;
+    if (hs.guesses[me.id]) return send(res, 409, { error: "you already guessed" }), true;
+    if (!hs.options.some((o) => o.id === b.songId)) return send(res, 400, { error: "pick one of the songs" }), true;
+    hs.guesses[me.id] = String(b.songId);
+    if (hs.guesses[me.id] === hs.answer) addActivity("hotseat", me, `knows ${nameOf(hs.profile)}'s most played song`);
+    socialDirty = true;
+    return send(res, 200, { right: hs.guesses[me.id] === hs.answer, answer: hs.answer }), true;
+  }
+  if (post && p === "/api/asks") { // ask a friend to play a song next
+    const { b, me } = await auth();
+    if (!me) return denied(), true;
+    const to = profiles[String(b.to || "")], song = groupSong(b.song);
+    if (!to || !song) return send(res, 400, { error: "pick a friend and a song" }), true;
+    social.asks = [{ id: sid(), from: me.id, fromName: me.name, to: to.id, song, at: Date.now(), status: "waiting" }, ...social.asks].slice(0, 300);
+    socialDirty = true;
+    return send(res, 200, { ok: true }), true;
+  }
+  if (post && p === "/api/asks/mine") {
+    const { me } = await auth();
+    if (!me) return denied(), true;
+    const fresh = (a) => Date.now() - a.at < 2 * 86400000;
+    return send(res, 200, { received: social.asks.filter((a) => a.to === me.id && a.status === "waiting" && fresh(a)),
+      sent: social.asks.filter((a) => a.from === me.id && fresh(a)).map((a) => ({ ...a, toName: nameOf(a.to) })).slice(0, 30) }), true;
+  }
+  if (post && (m = p.match(/^\/api\/asks\/([\w-]{1,20})$/))) {
+    const { b, me } = await auth();
+    const a = social.asks.find((x) => x.id === m[1]);
+    if (!me || !a || a.to !== me.id) return denied(), true;
+    a.status = b.accept ? "played" : "declined";
+    socialDirty = true;
+    return send(res, 200, { ok: true }), true;
+  }
+  if (get && (m = p.match(/^\/api\/duo\/([\w-]{1,40})\/([\w-]{1,40})$/))) { // two friends' numbers together
+    const a = profiles[m[1]], b2 = profiles[m[2]];
+    if (!a || !b2) return send(res, 404, { error: "no such profile" }), true;
+    if (privacy(a).private || privacy(b2).private || privacy(a).hideStats || privacy(b2).hideStats) return send(res, 403, { error: "hidden" }), true;
+    const sa = (a.stats && a.stats.songs) || {}, sb = (b2.stats && b2.stats.songs) || {};
+    const shared = Object.keys(sa).filter((id) => sb[id]).map((id) => ({ ...sa[id].song, plays: Math.min(sa[id].n, sb[id].n) })).sort((x, y) => y.plays - x.plays).slice(0, 10);
+    const together = Math.max((a.together || {})[b2.id] || 0, (b2.together || {})[a.id] || 0); // both count the same time
+    let streak = 0;
+    for (let i = 0; i < 400; i++) { // days in a row both listened (today can still be on its way)
+      const day = dayKey(Date.now() - i * 86400000);
+      const both = ((a.days || {})[day] || 0) > 60 && ((b2.days || {})[day] || 0) > 60;
+      if (both) streak++; else if (i > 0) break;
+    }
+    return send(res, 200, { shared, togetherHours: Math.round(together / 360) / 10, streak }), true;
+  }
+  if (get && (m = p.match(/^\/api\/profiles\/([\w-]{1,40})\/(heatmap|era)$/))) { // listening per day, top songs per month
+    const prof = profiles[m[1]];
+    if (!prof) return send(res, 404, { error: "no such profile" }), true;
+    if (privacy(prof).private || privacy(prof).hideStats) return send(res, 403, { error: "hidden" }), true;
+    if (m[2] === "heatmap") return send(res, 200, Object.fromEntries(Object.entries(prof.days || {}).map(([d, s]) => [d, Math.round(s / 60)]))), true;
+    return send(res, 200, Object.keys(prof.months || {}).sort().reverse().map((month) => ({ month, songs: topEntries(prof.months[month], 5).map(([, s]) => ({ ...s.song, plays: s.n })) }))), true;
+  }
+  if (post && (m = p.match(/^\/api\/profiles\/([\w-]{1,40})\/visit$/))) { // "who looked at my profile" (only if they turned it on)
+    const b = await readBody(req);
+    const from = ownProfile(String(b.from || ""), b.key), prof = profiles[m[1]];
+    if (!from || !prof || from.id === prof.id) return send(res, 200, { ok: true }), true;
+    if (prof.custom && prof.custom.visits) {
+      const recent = (prof.visits || []).find((v) => v.from === from.id && Date.now() - v.at < 3600000);
+      if (!recent) { prof.visits = [{ from: from.id, fromName: from.name, at: Date.now() }, ...(prof.visits || [])].slice(0, 30); profilesDirty = true; }
+    }
+    return send(res, 200, { ok: true }), true;
+  }
+  if (p === "/api/wrapped-night") { // everyone opens their recap together at a set time
+    if (social.wrapped && Date.now() - social.wrapped.at > 3 * 3600000) { social.wrapped = null; socialDirty = true; }
+    if (get) return send(res, 200, social.wrapped || {}), true;
+    const { b, me } = await auth();
+    if (!me) return denied(), true;
+    if (b.cancel) social.wrapped = null;
+    else {
+      const at = Number(b.at);
+      if (!Number.isFinite(at) || at < Date.now() - 60000 || at > Date.now() + 30 * 86400000) return send(res, 400, { error: "pick a time in the next 30 days" }), true;
+      social.wrapped = { at, by: me.id, byName: me.name };
+      addActivity("wrapped", me, `planned a recap night for ${new Date(at).toLocaleString("en-GB", { weekday: "long", hour: "2-digit", minute: "2-digit" })}`);
+    }
+    socialDirty = true;
+    return send(res, 200, social.wrapped || {}), true;
+  }
+  if (p === "/api/daily-color") { // today's accent colour; vote for tomorrow's
+    const today = dayKey(), tomorrow = dayKey(Date.now() + 86400000);
+    if (get) {
+      const viewer = url.searchParams.get("profile") || "";
+      const votes = social.colors[tomorrow] || {};
+      const tally = {};
+      for (const c of Object.values(votes)) tally[c] = (tally[c] || 0) + 1;
+      return send(res, 200, { today: colorOfDay(today), choices: DAILY_COLORS, votes: tally, myVote: votes[viewer] || null }), true;
+    }
+    const { b, me } = await auth();
+    if (!me) return denied(), true;
+    const color = cleanColor(b.color);
+    if (!color) return send(res, 400, { error: "pick a colour" }), true;
+    (social.colors[tomorrow] ??= {})[me.id] = color;
+    for (const d of Object.keys(social.colors)) if (d < today) delete social.colors[d];
+    socialDirty = true;
+    return send(res, 200, { ok: true }), true;
+  }
+  if (get && (m = p.match(/^\/api\/sourness\/([^/]{1,200})$/))) { // how often the group skips a song (0 = loved, 100 = always skipped)
+    const songId = decodeURIComponent(m[1]);
+    let plays = 0;
+    for (const x of Object.values(profiles)) plays += ((x.stats && x.stats.songs) || {})[songId]?.n || 0;
+    const skips = social.skips[songId] || 0;
+    return send(res, 200, { plays, skips, score: plays + skips ? Math.round((skips / (plays + skips)) * 100) : null }), true;
+  }
+  return false;
 }
 
 // ---- Sour Player accounts = Navidrome accounts ----
@@ -1884,8 +2196,9 @@ function mergeProfile(from, into) {
 }
 const visibleProfiles = () => Object.values(profiles).filter((x) => !x.mergedInto);
 
-async function sourRoute(req, res, p, get, post) {
+async function sourRoute(req, res, p, get, post, url) {
   let m;
+  if (await socialRoute(req, res, p, get, post, url)) return;
   if (post && p === "/api/profiles") { // new profile for this Sour Player
     const b = await readBody(req);
     const id = crypto.randomUUID().slice(0, 12), key = crypto.randomUUID();
@@ -1939,6 +2252,19 @@ async function sourRoute(req, res, p, get, post) {
       (me.stats ??= { songs: {}, artists: {}, seconds: 0 }).seconds += dt;
       groupStats.totalSeconds = (groupStats.totalSeconds || 0) + dt;
       statsDirty = true;
+      // listening per day (heatmap, streaks) and time spent in the same group as each friend (duo stats)
+      const day = dayKey(now);
+      me.days = me.days || {};
+      me.days[day] = (me.days[day] || 0) + dt;
+      const dayKeys = Object.keys(me.days);
+      if (dayKeys.length > 400) for (const k of dayKeys.sort().slice(0, dayKeys.length - 400)) delete me.days[k];
+      if (me.group) {
+        for (const other of Object.values(profiles)) {
+          if (other.id === me.id || !other.group || other.group.code !== me.group.code || now - (other.lastSeen || 0) > ONLINE_MS) continue;
+          me.together = me.together || {};
+          me.together[other.id] = (me.together[other.id] || 0) + dt;
+        }
+      }
     }
     if (song && b.playing && (!me.listening || me.listening.id !== song.id)) countPlay(me, song);
     if (!isInvisible(me)) me.lastOfflineSeen = now;
@@ -2225,7 +2551,9 @@ http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   const p = url.pathname, get = req.method === "GET", post = req.method === "POST";
   const SOUR_ROUTES = ["/api/presence", "/api/leaderboard", "/api/song-of-the-day", "/api/group-top", "/api/milestones", "/api/follows"];
-  const isSour = p.startsWith("/api/profiles") || p.startsWith("/api/playlist-themes") || p.startsWith("/api/friend-group") || SOUR_ROUTES.includes(p);
+  const SOUR_PREFIXES = ["/api/profiles", "/api/playlist-themes", "/api/friend-group", "/api/activity", "/api/gifts", "/api/capsules", "/api/song-notes",
+    "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/"];
+  const isSour = SOUR_PREFIXES.some((x) => p.startsWith(x)) || SOUR_ROUTES.includes(p);
   if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/requests") || p.startsWith("/api/library") || isSour
     || ["/api/status", "/api/now", "/api/bump"].includes(p)) { // used by Sour Player (the custom Feishin)
     res.setHeader("access-control-allow-origin", "*");
@@ -2235,7 +2563,7 @@ http.createServer(async (req, res) => {
     }
   }
   if (p.startsWith("/api/group/")) return groupRoute(req, res, p, get, post, url);
-  if (isSour) return sourRoute(req, res, p, get, post);
+  if (isSour) return sourRoute(req, res, p, get, post, url);
 
   if (get && p === "/") return send(res, 200, PAGE, "text/html");
 
@@ -2430,6 +2758,18 @@ http.createServer(async (req, res) => {
     return err ? send(res, 400, { error: err }) : send(res, 200, publicConfig());
   }
 
+  if (get && p === "/api/requests/leaderboard") { // who added the most to the library this month
+    const month = new Date().toISOString().slice(0, 7), tally = new Map();
+    for (const i of items) {
+      if (i.parent || !String(i.created || "").startsWith(month) || i.status === "failed") continue;
+      const who = (i.profile && profiles[i.profile] && profiles[i.profile].name) || String(i.askedBy || "").replace(/\s*\(.*\)$/, "") || "someone";
+      const t = tally.get(who) || { name: who, profile: i.profile || null, requests: 0, songs: 0 };
+      t.requests++;
+      t.songs += i.type === "song" ? 1 : (songStats(i.id) || {}).done || 0;
+      tally.set(who, t);
+    }
+    return send(res, 200, [...tally.values()].sort((a, b) => b.songs - a.songs || b.requests - a.requests));
+  }
   if (get && p === "/api/requests") {
     const pos = new Map(queueOrder().map((i, n) => [i.id, n + 1]));
     const list = items.filter((i) => !i.parent).slice(-50).reverse().map(({ id, type, query, status, title, artist, note, created, priority, askedBy, profile, votes }) => {
