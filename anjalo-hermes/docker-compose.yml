@@ -15,7 +15,7 @@ services:
     # Umbrel updates replace this file but not the code folder, so the code for this version is fetched
     # from GitHub on start (and kept in /data/app). Falls back to the installed copy if that fails.
     environment:
-      HM_VERSION: "2.11.0"
+      HM_VERSION: "3.0.0"
     command:
       - sh
       - -c

@@ -144,7 +144,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             <div id="sess">Session: -</div>
           </div>
           <div class="rt">
-            <h2>Hermes Music v2.11.0</h2>
+            <h2>Hermes Music v3.0.0</h2>
             <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
             <div class="sec"><span class="k">&#9662; Workers</span><br><span id="w-worker" class="d">-</span></div>
             <div class="sec"><span class="k">&#9662; Library</span><br><span class="d" id="w-lib">-</span></div>
@@ -168,6 +168,8 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
               <a id="dl-win" href="https://github.com/Urmomnumber1/feishin/releases/latest/download/Sour-Player-win-x64.exe">Windows<small>Sour-Player-win-x64.exe</small></a>
               <a id="dl-appimage" href="https://github.com/Urmomnumber1/feishin/releases/latest/download/Sour-Player-linux-x86_64.AppImage">Linux (any)<small>AppImage</small></a>
               <a id="dl-deb" href="https://github.com/Urmomnumber1/feishin/releases/latest/download/Sour-Player-linux-amd64.deb">Linux (Ubuntu / Mint / Debian)<small>.deb</small></a>
+              <a id="dl-mac" href="https://github.com/Urmomnumber1/feishin/releases/latest/download/Sour-Player-mac-arm64.dmg">Mac (Apple chip, 2020+)<small>.dmg - test</small></a>
+              <a id="dl-mac-intel" href="https://github.com/Urmomnumber1/feishin/releases/latest/download/Sour-Player-mac-x64.dmg">Mac (Intel)<small>.dmg - test</small></a>
             </div>
             <ol>
               <li><b>Not sure which you have?</b> If your computer has a Start button with the Windows logo, pick <b>Windows</b>. Almost every PC and laptop from a shop runs Windows. Linux is something you would have installed on purpose.</li>
@@ -351,6 +353,9 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
               <li><code>/config</code> open the settings</li>
               <li><code>/clear</code> clear finished requests from the screen (on this device)</li>
               <li><code>/rescan</code> re-read the music folder now (it also does this by itself every 30 minutes)</li>
+              <li><code>/issues</code> check the library for songs with missing tags, no cover or low quality; <code>/fix 3</code> re-tags number 3 and adds its cover, <code>/upgrade 3</code> downloads a better copy</li>
+              <li><code>/follow the killers</code> new releases from that artist download by themselves (<code>/following</code> lists them, <code>/unfollow NAME</code> stops)</li>
+              <li>New songs come with synced lyrics when LRCLIB has them (saved next to the song for Navidrome and Sour Player).</li>
             </ol>
           </div>
         </details>
@@ -420,6 +425,7 @@ const label = { pending: "queued", working: "downloading", done: "added", failed
 let local = [], lastReqs = [], status = null, cfg = null, current = "req", firstRender = true;
 let clearedAt = 0; try { clearedAt = +localStorage.getItem("hm-cleared") || 0; } catch {}
 
+let lastIssues = [];
 async function api(path, opt) {
   if (DEMO) return demo(path, opt);
   const r = await fetch(path, opt);
@@ -537,6 +543,8 @@ const HELP = [
   "/bump NAME       push something already queued to the front",
   "/duplicate       find copies of the same song (then /duplicate confirm)",
   "/rescan          re-read the music folder now",
+  "/issues          find songs with missing tags, no cover or low quality (/fix N, /upgrade N)",
+  "/follow ARTIST   download an artist's new releases by themselves (/following, /unfollow ARTIST)",
   "/video SONG      find the song's music video for Feishin (also: /video list, /video wrong SONG, /video remove SONG)",
   "/queue           show queue counts",
   "/config          open the config tab",
@@ -628,6 +636,51 @@ $("f").onsubmit = async (e) => {
         }
       }
     }
+    else if (name === "/issues") { // missing tags, no cover, low quality
+      try {
+        await api("api/library/issues", { method: "POST" });
+        push("sys", "checking every song (this can take a few minutes on a big library)...");
+        render();
+        let r;
+        for (;;) { await new Promise((ok) => setTimeout(ok, 2000)); r = await api("api/library/issues"); if (!r.running) break; }
+        lastIssues = r.list;
+        if (!r.list.length) push("ok", "no problems found in " + r.total + " songs");
+        else {
+          push("sys", r.list.length + " songs need attention (/fix N re-tags and adds the cover, /upgrade N downloads a better copy):");
+          r.list.slice(0, 50).forEach((x, i) => push("sys", "  " + (i + 1) + ". " + (x.artist ? x.artist + " - " : "") + (x.title || x.file) + "  [" + x.problems.join(", ") + "]"));
+          if (r.list.length > 50) push("sys", "  ...and " + (r.list.length - 50) + " more");
+        }
+      } catch (e) { push("err", e.message); }
+    }
+    else if (name === "/fix" || name === "/upgrade") {
+      const n = parseInt(args[0], 10), it = lastIssues[n - 1];
+      if (!it) push("err", "run /issues first, then use a number from its list, e.g. " + name + " 3");
+      else {
+        push("sys", (name === "/fix" ? "re-tagging " : "downloading a better copy of ") + (it.title || it.file) + "...");
+        render();
+        try { const r = await api("api/library/fix", { method: "POST", body: JSON.stringify({ file: it.file, action: name === "/fix" ? "retag" : "upgrade" }) });
+          push("ok", "fixed: " + r.artist + " - " + r.title); }
+        catch (e) { push("err", e.message); }
+      }
+    }
+    else if (name === "/follow" || name === "/unfollow" || name === "/following") { // new releases download by themselves
+      try {
+        if (name === "/following") {
+          const list = await api("api/follows");
+          if (!list.length) push("sys", "not following anyone - /follow ARTIST");
+          list.forEach((f) => push("sys", "  " + f.artist + "  (since " + f.since.slice(0, 10) + ", by " + f.by + ")"));
+        } else if (!args.length) push("err", "type an artist, e.g. " + name + " the killers");
+        else if (name === "/follow") {
+          const r = await api("api/follows", { method: "POST", body: JSON.stringify({ artist: args.join(" ") }) });
+          push("ok", "following " + r.artist + " - their new releases will download by themselves");
+        } else {
+          const list = await api("api/follows"), q = args.join(" ").toLowerCase();
+          const f = list.find((x) => x.artist.toLowerCase() === q);
+          if (!f) push("err", "you're not following " + args.join(" "));
+          else { await api("api/follows", { method: "POST", body: JSON.stringify({ remove: f.deezerId }) }); push("ok", "stopped following " + f.artist); }
+        }
+      } catch (e) { push("err", e.message); }
+    }
     else if (name === "/rescan") {
       try { const r = await api("api/library/rescan", { method: "POST" }); push("ok", r.started ? "rescanning the music folder (only new or changed files are read)" : r.message); }
       catch (e) { push("err", e.message); }
@@ -650,7 +703,7 @@ $("f").onsubmit = async (e) => {
   let pick = null, text = "";
   if (/Android|iPhone|iPad/i.test(ua)) text = "You're on a phone or tablet: Sour Player is a computer app, so download it on your PC.";
   else if (/Windows/i.test(ua)) { pick = "dl-win"; text = "This computer runs <b>Windows</b> - use the highlighted button."; }
-  else if (/Mac OS X|Macintosh/i.test(ua)) text = "Sour Player isn't available for Mac yet.";
+  else if (/Mac OS X|Macintosh/i.test(ua)) { pick = "dl-mac"; text = "This is a <b>Mac</b> - the Mac version is new: the first time, right-click Sour Player and choose Open (it isn't signed by Apple). Older Intel Macs use the Intel download."; }
   else if (/Ubuntu|Debian|Mint/i.test(ua)) { pick = "dl-deb"; text = "This computer runs <b>Linux</b> - use the highlighted button."; }
   else if (/Linux/i.test(ua)) { pick = "dl-appimage"; text = "This computer runs <b>Linux</b> - use the highlighted button."; }
   guess.innerHTML = text;

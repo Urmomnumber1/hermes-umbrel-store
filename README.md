@@ -46,6 +46,11 @@ Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbr
   they're playing; **Sour Radio**, an always-on group (`RADIO`) whose clock Hermes Music keeps and whose random songs
   come from the listeners' libraries (vote to skip); and shared playlist themes (`/api/playlist-themes/<id>`).
   Pictures are stored in the app's data folder (`data/sour`).
+- **3.0:** stations (`RADIO`, `CHILL`, `HYPED`, `THROW`, `SLEEP`) and people's own rooms (`/api/group/rooms`), Group Play chat,
+  reactions, upvotes, DJ rotation, guessing game and DJ show bookings; profile walls/dedications/nicknames/pings, stats from
+  presence (`/api/leaderboard`, `/api/song-of-the-day`, `/api/group-top`, `/api/milestones`, `/api/friend-group`); request
+  upvotes and screenshot requests (`/api/requests/screenshot`, needs the Claude token); followed artists (`/api/follows`,
+  `/follow`); synced lyrics from LRCLIB saved as `.lrc`; `/issues`, `/fix N`, `/upgrade N` for the library.
 - `/duplicate` lists copies of the same song (same artist, title and length) and keeps the best-quality one;
   `/duplicate confirm` (plus your PIN, if set) moves the extras to the hidden `.duplicates` folder in your music folder.
 - Songs already in the music folder are skipped: the app indexes the folder's tags on start and every 30 minutes.
