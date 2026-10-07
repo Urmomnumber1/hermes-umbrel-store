@@ -1322,6 +1322,7 @@ function newCode() {
 const groupSong = (x) => (x && typeof x.id === "string" && x.id.length <= 200 ? {
   id: x.id, title: clean1(x.title), artist: clean1(x.artist), album: clean1(x.album), duration: Number(x.duration) || 0,
   imageId: typeof x.imageId === "string" ? x.imageId.slice(0, 200) : null, // cover id on the shared Navidrome (no URL/credentials)
+  year: Number.isInteger(x.year) && x.year > 1800 && x.year < 2200 ? x.year : null,
 } : null);
 // a profile picture set only for one group (older apps; newer ones use the profile picture)
 const cleanAvatar = (v) => (typeof v === "string" && /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(v) && v.length <= 150000 ? v : null);
@@ -1351,7 +1352,8 @@ function groupState(g) {
     needSongs: !!g.radio && upcoming(g) < 3, votes: g.votes ? g.votes.size : 0,
     votesNeeded: g.radio ? Math.max(1, Math.ceil(uniquePeople(g) / 2)) : 0,
     hostProfile: g.hostProfile || null, hostAvatar: g.hostAvatar ? g.avatarVersion : 0,
-    members: [...g.members.entries()].map(([id, m]) => ({ id, name: m.name, avatar: m.avatar ? g.avatarVersion : 0, profile: m.profile || null })),
+    members: [...g.members.entries()].map(([id, m]) => ({ id, name: m.name, avatar: m.avatar ? g.avatarVersion : 0, profile: m.profile || null,
+      spectate: !!m.spectate, position: m.position ?? null, positionAt: m.positionAt ?? null })),
     queue: g.queue.map((x, i) => ({ ...x, by: hide && x.requested && i >= g.index ? "?" : g.addedBy.get(x.id) || g.hostName })),
     index: g.index, playing: g.playing, position: g.position, updatedAt: g.updatedAt,
     requests: g.requests, commands: g.commands,
@@ -1359,6 +1361,10 @@ function groupState(g) {
     djRotation: !!g.djRotation, dj: currentDj(g), watchVideo: !!g.watchVideo,
     guess: hide, guessScores: Object.fromEntries(g.guessScores || []), show: g.radio ? currentShow(g) : null,
     schedule: g.schedule || [], birthday: g.birthday || null,
+    encore: g.encore.size, encoreNeeded: Math.max(1, Math.ceil((uniquePeople(g) + (g.radio ? 0 : 1)) / 2)),
+    marks: g.marks.filter((x) => x.songId === (g.queue[g.index] || {}).id).slice(-60),
+    tokens: Object.fromEntries(g.tokens), approval: !!g.approval, pending: g.approval ? g.pending : [],
+    blind: !!g.blind, themeNight: g.themeNight || null, roomTheme: g.roomTheme || "none",
     serverNow: nowMs(),
   };
 }
@@ -1386,7 +1392,13 @@ function baseGroup(fields) {
     hostKey: crypto.randomUUID(), members: new Map(), streams: new Set(), queue: [], index: 0, playing: false,
     position: 0, guestControl: false, updatedAt: nowMs(), requests: [], commands: [], addedBy: new Map(),
     hostSeen: nowMs(), listed: true, hostAvatar: null, avatarVersion: 1, chat: [], upvotes: new Map(),
-    djRotation: false, djTurn: 0, watchVideo: false, ...fields,
+    djRotation: false, djTurn: 0, watchVideo: false,
+    // Sour Player 0.4: encore votes, reactions pinned to a moment, skip-the-line tokens, the request line,
+    // blind rounds, theme nights, room looks and the session summary
+    encore: new Set(), encoreSong: null, marks: [], tokens: new Map(), approval: false, pending: [], blind: false,
+    themeNight: null, roomTheme: "none", sounds: new Map(),
+    session: { start: nowMs(), plays: new Map(), adders: new Map(), skips: 0, reactions: 0, people: new Set(), lastSong: null },
+    ...fields,
   };
 }
 setInterval(() => { // tidy up: groups whose host disappeared, and connections that stopped checking in
@@ -1476,7 +1488,30 @@ setInterval(() => {
   }
 }, 1000);
 
+// theme nights: "2010s only", "songs with a colour in the title"... a rule the room plays by
+function cleanThemeNight(t) {
+  if (!t || typeof t !== "object") return null;
+  const kind = ["decade", "word", "artist", "colour", "free"].includes(t.kind) ? t.kind : null;
+  if (!kind) return null;
+  const value = kind === "decade" ? (Number.isInteger(t.value) && t.value >= 1900 && t.value <= 2090 && t.value % 10 === 0 ? t.value : null) : clean1(t.value, 60).trim() || null;
+  if (kind !== "colour" && kind !== "free" && value === null) return null;
+  return { kind, value, label: clean1(t.label, 80).trim() || null };
+}
+const ROOM_THEMES = ["none", "club", "campfire", "retro", "beach", "space", "rainy"];
 const CONTROLS = new Set(["play", "pause", "next", "previous", "seek", "playIndex", "remove", "playNext"]);
+const SCRAPBOOK = "/data/scrapbook.json";
+let scrapbook = [];
+try { scrapbook = JSON.parse(fs.readFileSync(SCRAPBOOK, "utf8")); } catch {}
+// what a hosted session was like, kept in the scrapbook when it ends
+function sessionSummary(g) {
+  const top = (map) => [...map.entries()].sort((a, b) => (b[1].n ?? b[1]) - (a[1].n ?? a[1]))[0];
+  const topSong = top(g.session.plays), topAdder = top(g.session.adders);
+  const songs = [...g.session.plays.values()].reduce((n, x) => n + x.n, 0);
+  return { id: crypto.randomUUID().slice(0, 10), name: g.name, host: g.hostName, start: g.session.start, end: nowMs(),
+    minutes: Math.round((nowMs() - g.session.start) / 60000), songs, topSong: topSong ? topSong[1].song : null,
+    topAdder: topAdder ? { name: topAdder[0], songs: topAdder[1] } : null, skips: g.session.skips, reactions: g.session.reactions,
+    people: [g.hostName, ...g.session.people].filter((v, i, a) => a.indexOf(v) === i) };
+}
 async function groupRoute(req, res, p, get, post, url) {
   const m = p.match(/^\/api\/group\/([A-Z0-9]{5})(?:\/(\w+))?$/);
   if (get && p === "/api/group/list") { // stations, rooms and the groups people chose to show
@@ -1513,6 +1548,7 @@ async function groupRoute(req, res, p, get, post, url) {
     saveRooms();
     return send(res, 200, { code: r.code, name: r.name });
   }
+  if (get && p === "/api/group/scrapbook") return send(res, 200, scrapbook.slice().reverse());
   if (!m) return send(res, 404, { error: "not found" });
   const g = groups.get(m[1]);
   if (!g) return send(res, 404, { error: "that group doesn't exist (or has ended)" });
@@ -1563,7 +1599,8 @@ async function groupRoute(req, res, p, get, post, url) {
     const profile = clean1(b.profile, 40) || null;
     if (profile) for (const [id, mm] of g.members) if (mm.profile === profile) dropMember(g, id); // you, from an older connection
     const id = crypto.randomUUID();
-    g.members.set(id, { name: clean1(b.user, 40) || "Guest", avatar: cleanAvatar(b.avatar), profile, seen: nowMs(), pings: 0 });
+    g.members.set(id, { name: clean1(b.user, 40) || "Guest", avatar: cleanAvatar(b.avatar), profile, seen: nowMs(), pings: 0, spectate: !!b.spectate });
+    g.session.people.add(g.members.get(id).name);
     if (g.members.get(id).avatar) g.avatarVersion++;
     broadcast(g);
     tell(g, "joined", { name: g.members.get(id).name, profile });
@@ -1571,7 +1608,10 @@ async function groupRoute(req, res, p, get, post, url) {
   }
   if (action === "ping") { // "still here" every 20 seconds; connections that stop are removed after 75 seconds
     if (!me) return send(res, 404, { error: "you're not in this group any more" });
-    if (!isHost) { me.pings = (me.pings || 0) + 1; }
+    if (!isHost) {
+      me.pings = (me.pings || 0) + 1;
+      if (Number.isFinite(b.position)) { me.position = Math.max(0, b.position); me.positionAt = nowMs(); } // "is everyone in sync?"
+    }
     return send(res, 200, { ok: true });
   }
   if (action === "profile") {
@@ -1599,8 +1639,64 @@ async function groupRoute(req, res, p, get, post, url) {
     if (!me) return send(res, 403, { error: "join the group first" });
     const emoji = oneEmoji(b.emoji);
     if (!emoji) return send(res, 400, { error: "pick a reaction" });
-    tell(g, "reaction", { by: me.name, profile: me.profile || null, emoji, at: nowMs() });
+    const cur = g.queue[g.index];
+    const pos = Number.isFinite(b.position) ? Math.max(0, b.position) : null;
+    tell(g, "reaction", { by: me.name, profile: me.profile || null, emoji, at: nowMs(), position: pos });
+    if (cur && pos !== null) { g.marks.push({ songId: cur.id, position: pos, emoji, by: me.name }); g.marks = g.marks.slice(-200); broadcast(g); }
+    g.session.reactions++;
     return send(res, 200, { ok: true });
+  }
+  if (action === "sound") { // the soundboard: a short sound for everyone (one every few seconds each)
+    if (!me) return send(res, 403, { error: "join the group first" });
+    const name = String(b.name || "");
+    if (!["airhorn", "rewind", "cheer", "drumroll", "boo", "laugh", "scratch", "applause"].includes(name)) return send(res, 400, { error: "unknown sound" });
+    const last = g.sounds.get(whoKey) || 0;
+    if (nowMs() - last < 4000) return send(res, 429, { error: "easy on the soundboard" });
+    g.sounds.set(whoKey, nowMs());
+    tell(g, "sound", { name, by: me.name });
+    return send(res, 200, { ok: true });
+  }
+  if (action === "encore") { // most of the room wants the song again: it plays once more
+    if (!me) return send(res, 403, { error: "join the group first" });
+    const cur = g.queue[g.index];
+    if (!cur) return send(res, 409, { error: "nothing is playing" });
+    if (g.encoreSong !== cur.id) { g.encore.clear(); g.encoreSong = cur.id; }
+    if (g.encore.has(whoKey)) g.encore.delete(whoKey); else g.encore.add(whoKey);
+    const needed = Math.max(1, Math.ceil((uniquePeople(g) + (g.radio ? 0 : 1)) / 2));
+    let happening = false;
+    if (g.encore.size >= needed) {
+      happening = true;
+      g.encore.clear();
+      g.encoreSong = null;
+      if (g.radio) {
+        g.queue.splice(g.index + 1, 0, { ...cur, requested: true });
+        g.addedBy.set(cur.id, "Encore!");
+      } else {
+        g.commands.push({ cid: crypto.randomUUID(), cmd: "encore", index: g.index, songId: cur.id, position: 0, by: me.name });
+        g.commands = g.commands.slice(-50);
+      }
+      tell(g, "encore", { title: cur.title });
+    }
+    broadcast(g);
+    return send(res, 200, { votes: g.encore.size, needed, happening });
+  }
+  if (action === "boost") { // spend one of your 3 tokens: your pick jumps to next
+    if (!me) return send(res, 403, { error: "join the group first" });
+    const left = g.tokens.has(whoKey) ? g.tokens.get(whoKey) : 3;
+    if (left <= 0) return send(res, 429, { error: "no tokens left this session" });
+    const index = g.queue.findIndex((x, i) => i > g.index && x.id === b.songId);
+    if (index < 0) return send(res, 404, { error: "that song isn't up next any more" });
+    if (index === g.index + 1) return send(res, 409, { error: "it's already next" });
+    if (g.radio) {
+      const [song] = g.queue.splice(index, 1);
+      g.queue.splice(g.index + 1, 0, song);
+    } else {
+      g.commands.push({ cid: crypto.randomUUID(), cmd: "playNext", index, songId: g.queue[index].id, position: 0, by: me.name });
+      g.commands = g.commands.slice(-50);
+    }
+    g.tokens.set(whoKey, left - 1);
+    broadcast(g);
+    return send(res, 200, { tokens: left - 1 });
   }
   if (action === "upvote") { // toggle your vote for a queued song
     if (!me) return send(res, 403, { error: "join the group first" });
@@ -1644,7 +1740,14 @@ async function groupRoute(req, res, p, get, post, url) {
       if (dj && dj.id !== mineId) return send(res, 403, { error: `It's ${dj.name}'s turn to pick` });
       g.djTurn = (g.djTurn + 1) % djOrder(g).length;
     }
+    if (g.approval && !isHost) { // the request line: the host approves guests' picks first
+      for (const song of songs) g.pending.push({ rid: crypto.randomUUID(), song, by });
+      g.pending = g.pending.slice(-60);
+      broadcast(g);
+      return send(res, 200, { added: songs.length, pending: true });
+    }
     for (const song of songs) { g.requests.push({ rid: crypto.randomUUID(), song, by }); g.addedBy.set(song.id, by); }
+    g.session.adders.set(by, (g.session.adders.get(by) || 0) + songs.length);
     broadcast(g);
     return send(res, 200, { added: songs.length });
   }
@@ -1668,6 +1771,14 @@ async function groupRoute(req, res, p, get, post, url) {
     if (g.schedule.some((s) => s.start < end && start < s.end)) return send(res, 409, { error: "someone already has that slot" });
     g.schedule.push({ id: crypto.randomUUID().slice(0, 8), profile: prof.id, name: prof.name, start, end });
     g.schedule.sort((a, b2) => a.start - b2.start);
+    broadcast(g);
+    return send(res, 200, { ok: true });
+  }
+  if (g.radio && action === "vibe") { // a room's owner (or the booked DJ) sets a blind round, a theme night or the room's look
+    if (!isOwner && !isDj) return send(res, 403, { error: "only the room's owner or the DJ can do that" });
+    if (typeof b.blind === "boolean") g.blind = b.blind;
+    if (b.themeNight !== undefined) g.themeNight = cleanThemeNight(b.themeNight);
+    if (ROOM_THEMES.includes(b.roomTheme)) g.roomTheme = b.roomTheme;
     broadcast(g);
     return send(res, 200, { ok: true });
   }
@@ -1710,6 +1821,7 @@ async function groupRoute(req, res, p, get, post, url) {
     if (!isHost && !g.guestControl && !own) return send(res, 403, { error: "the host hasn't let guests control playback" });
     if ((cmd === "playIndex" || cmd === "remove" || cmd === "playNext") && (!target || target.id !== b.songId))
       return send(res, 409, { error: "the queue changed - try again" });
+    if (cmd === "next") g.session.skips++;
     g.commands.push({ cid: crypto.randomUUID(), cmd, index, songId: target ? target.id : null,
       position: Number.isFinite(b.position) ? Math.max(0, b.position) : 0, by: me.name });
     g.commands = g.commands.slice(-50);
@@ -1722,6 +1834,11 @@ async function groupRoute(req, res, p, get, post, url) {
     if (Number.isInteger(b.index)) g.index = Math.max(0, b.index);
     if (typeof b.playing === "boolean") g.playing = b.playing;
     if (Number.isFinite(b.position)) g.position = Math.max(0, b.position);
+    const now = g.queue[g.index];
+    if (now && g.session.lastSong !== now.id) { // a new song started: count it for the session summary
+      g.session.lastSong = now.id;
+      const pl = g.session.plays.get(now.id) || { song: now, n: 0 }; pl.n++; g.session.plays.set(now.id, pl);
+    }
     g.updatedAt = nowMs();
     if (Array.isArray(b.applied)) { // requests and controls the host's app has carried out
       g.requests = g.requests.filter((r) => !b.applied.includes(r.rid));
@@ -1736,6 +1853,10 @@ async function groupRoute(req, res, p, get, post, url) {
     if (typeof b.listed === "boolean") g.listed = b.listed;
     if (typeof b.djRotation === "boolean") { g.djRotation = b.djRotation; g.djTurn = 0; }
     if (typeof b.watchVideo === "boolean") g.watchVideo = b.watchVideo;
+    if (typeof b.approval === "boolean") { g.approval = b.approval; if (!b.approval) { for (const r of g.pending) { g.requests.push(r); g.addedBy.set(r.song.id, r.by); } g.pending = []; } }
+    if (typeof b.blind === "boolean") g.blind = b.blind;
+    if (b.themeNight !== undefined) g.themeNight = cleanThemeNight(b.themeNight);
+    if (ROOM_THEMES.includes(b.roomTheme)) g.roomTheme = b.roomTheme;
     if (typeof b.name === "string" && b.name.trim()) g.name = clean1(b.name, 60);
     broadcast(g);
     return send(res, 200, { ok: true });
@@ -1748,7 +1869,29 @@ async function groupRoute(req, res, p, get, post, url) {
     broadcast(g);
     return send(res, 200, { ok: true });
   }
-  if (action === "end") { endGroup(g); return send(res, 200, { ok: true }); }
+  if (action === "approve") { // the request line: let a guest's pick in, or not
+    const r = g.pending.find((x) => x.rid === b.rid);
+    if (!r) return send(res, 404, { error: "already handled" });
+    g.pending = g.pending.filter((x) => x !== r);
+    if (b.accept) { g.requests.push(r); g.addedBy.set(r.song.id, r.by); g.session.adders.set(r.by, (g.session.adders.get(r.by) || 0) + 1); }
+    broadcast(g);
+    return send(res, 200, { ok: true });
+  }
+  if (action === "countdown") { // "3, 2, 1" on every screen, then the host's player starts
+    const at = nowMs() + 3500;
+    tell(g, "countdown", { at, by: g.hostName, serverNow: nowMs() });
+    return send(res, 200, { at, serverNow: nowMs() });
+  }
+  if (action === "end") {
+    const summary = sessionSummary(g);
+    if (summary.songs > 0) {
+      scrapbook = [...scrapbook, summary].slice(-60);
+      fs.writeFileSync(SCRAPBOOK, JSON.stringify(scrapbook));
+      tell(g, "summary", summary);
+    }
+    endGroup(g);
+    return send(res, 200, { ok: true, summary });
+  }
   return send(res, 404, { error: "not found" });
 }
 
