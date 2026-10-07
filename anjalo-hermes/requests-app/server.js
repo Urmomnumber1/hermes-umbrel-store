@@ -50,6 +50,8 @@ const DEFAULTS = {
   artistMaxAlbums: 10, includeSingles: false,
   // Downtify app, used only when our own YouTube search/download fails
   downtifyEnabled: false, downtifyUrl: "http://downtify_downtify_1:8000", downtifyUser: "admin", downtifyPassword: "", downtifyToken: "",
+  // Navidrome on this Umbrel: Sour Player profiles are tied to Navidrome accounts (blank = find it by itself)
+  navidromeUrl: "",
   // queue
   paused: false, ratePerMinute: 5,
   // security
@@ -94,6 +96,12 @@ function updateConfig(b) {
   if (typeof b.downtifyUser === "string") next.downtifyUser = b.downtifyUser.trim().slice(0, 100);
   if (typeof b.downtifyPassword === "string" && b.downtifyPassword) next.downtifyPassword = secret(b.downtifyPassword);
   if (b.downtifyToken === "-") next.downtifyToken = ""; // "unpair"
+  if (typeof b.navidromeUrl === "string") {
+    const u = b.navidromeUrl.trim().replace(/\/+$/, "");
+    if (u && !/^https?:\/\/\S{1,200}$/.test(u)) return "Navidrome address must start with http:// or https://";
+    if (u !== next.navidromeUrl) navidromeFound = "";
+    next.navidromeUrl = u;
+  }
   if (typeof b.paused === "boolean") next.paused = b.paused;
   if (int(b.ratePerMinute, 1, 30) != null) next.ratePerMinute = int(b.ratePerMinute, 1, 30);
   if (typeof b.newPin === "string" && b.newPin) {
@@ -1737,7 +1745,7 @@ const keyHashes = (p) => p.keyHashes || (p.keyHash ? [p.keyHash] : []);
 // profiles about them and refuses them for everyone else. Anjalo's: the Determination font.
 const PERKS = { determination: ["05b2befa-218"] };
 const perksOf = (id) => Object.keys(PERKS).filter((k) => PERKS[k].includes(id));
-const ownProfile = (id, key) => { const p = profiles[id]; return p && key && keyHashes(p).includes(hashKey(key)) ? p : null; };
+const ownProfile = (id, key) => { const p = profiles[id]; return p && !p.mergedInto && key && keyHashes(p).includes(hashKey(key)) ? p : null; };
 const privacy = (p) => (p.custom && p.custom.privacy) || {};
 const isInvisible = (p) => !!(p.custom && p.custom.invisible);
 function topEntries(obj, n) { return Object.entries(obj || {}).sort((a, b) => (b[1].n ?? b[1]) - (a[1].n ?? a[1])).slice(0, n); }
@@ -1803,9 +1811,66 @@ function publicProfile(p, self = false) {
     away: !online ? p.away || "" : "",
   };
   if (!hidden && !priv.hideStats) out.stats = profileStats(p);
-  if (self) Object.assign(out, { avatarHistory: (p.avatarHistory || []).map((h) => h.v), resume: p.lastPlayback || null, perks: perksOf(p.id) });
+  if (self) Object.assign(out, { account: p.navidrome || null, avatarHistory: (p.avatarHistory || []).map((h) => h.v), resume: p.lastPlayback || null, perks: perksOf(p.id) });
   return out;
 }
+
+// ---- Sour Player accounts = Navidrome accounts ----
+// Sour Player sends the login token it already uses for Navidrome; Hermes Music asks Navidrome itself (on this
+// Umbrel, never an address the app picks) whether it's valid. Passwords and tokens are never stored.
+let navidromeFound = "";
+const NAVIDROME_GUESSES = ["http://navidrome_server_1:4533", "http://navidrome_app_1:4533", "http://navidrome_web_1:4533",
+  "http://host.docker.internal:4533", "http://172.17.0.1:4533"];
+async function navidromeBase() {
+  const tries = [process.env.NAVIDROME_URL, config.navidromeUrl, navidromeFound, ...NAVIDROME_GUESSES].filter(Boolean);
+  for (const base of [...new Set(tries)]) {
+    try { // a Subsonic server answers ping even without a login (with an error inside)
+      const r = await fetch(`${base}/rest/ping.view?v=1.16.1&c=hermes&f=json`, { signal: AbortSignal.timeout(4000) });
+      const j = await r.json().catch(() => null);
+      if (j && j["subsonic-response"]) { navidromeFound = base; return base; }
+    } catch {}
+  }
+  return null;
+}
+// the Navidrome username a Sour Player login belongs to, or null if Navidrome says no
+async function navidromeUser(credential) {
+  const q = new URLSearchParams(String(credential || "").slice(0, 1000));
+  const u = q.get("u"), t = q.get("t"), s = q.get("s"), pw = q.get("p");
+  if (!u || !((t && s) || pw)) return { error: "Sour Player didn't send a Navidrome login" };
+  const base = await navidromeBase();
+  if (!base) return { error: "Hermes Music can't find Navidrome on this Umbrel (set its address in Hermes Music's config)" };
+  const auth = t && s ? `t=${encodeURIComponent(t)}&s=${encodeURIComponent(s)}` : `p=${encodeURIComponent(pw)}`;
+  try {
+    const r = await fetch(`${base}/rest/ping.view?u=${encodeURIComponent(u)}&${auth}&v=1.16.1&c=hermes&f=json`, { signal: AbortSignal.timeout(8000) });
+    const j = await r.json().catch(() => null);
+    const sr = j && j["subsonic-response"];
+    if (sr && sr.status === "ok") return { user: u.trim().toLowerCase(), name: u.trim() };
+    return { error: "Navidrome didn't accept that login" };
+  } catch (e) { return { error: "couldn't reach Navidrome: " + e.message }; }
+}
+// an older profile from the same person (made before accounts were tied to Navidrome): its look and favourites
+// fill in whatever the account's profile doesn't have yet, then it's hidden from everyone
+function mergeProfile(from, into) {
+  if (!from || !into || from === into) return;
+  for (const k of ["bio", "status", "color", "away"]) if (!into[k] && from[k]) into[k] = from[k];
+  if (!(into.favorites || []).length && (from.favorites || []).length) into.favorites = from.favorites;
+  if ((!into.custom || !Object.keys(into.custom).length) && from.custom) into.custom = from.custom;
+  for (const kind of ["avatar", "banner", "background"]) {
+    if (!into[kind] && from[kind]) {
+      const src = path.join(SOUR_DIR, `${from.id}-${kind}.${from[kind].ext}`);
+      if (fs.existsSync(src)) { fs.copyFileSync(src, path.join(SOUR_DIR, `${into.id}-${kind}.${from[kind].ext}`)); into[kind] = { ext: from[kind].ext, v: Date.now() }; }
+    }
+  }
+  if (from.stats) { // listening counts add up
+    const st = (into.stats ??= { songs: {}, artists: {}, seconds: 0 });
+    st.seconds = (st.seconds || 0) + (from.stats.seconds || 0);
+    for (const [id, x] of Object.entries(from.stats.songs || {})) { const t = (st.songs[id] ??= { song: x.song, n: 0 }); t.n += x.n; }
+    for (const [a, n] of Object.entries(from.stats.artists || {})) st.artists[a] = (st.artists[a] || 0) + n;
+  }
+  from.mergedInto = into.id;
+  from.keyHashes = []; delete from.keyHash;
+}
+const visibleProfiles = () => Object.values(profiles).filter((x) => !x.mergedInto);
 
 async function sourRoute(req, res, p, get, post) {
   let m;
@@ -1819,7 +1884,7 @@ async function sourRoute(req, res, p, get, post) {
   if (post && p === "/api/profiles/claim") { // link another computer to a profile with a one-time code
     const b = await readBody(req);
     const code = String(b.code || "").trim().toUpperCase();
-    const prof = Object.values(profiles).find((x) => x.link && x.link.code === code && x.link.until > Date.now());
+    const prof = visibleProfiles().find((x) => x.link && x.link.code === code && x.link.until > Date.now());
     if (!prof) return send(res, 404, { error: "that code is wrong or has expired" });
     const key = crypto.randomUUID();
     prof.keyHashes = [...keyHashes(prof), hashKey(key)].slice(-5);
@@ -1827,8 +1892,28 @@ async function sourRoute(req, res, p, get, post) {
     saveProfiles();
     return send(res, 200, { id: prof.id, key, profile: publicProfile(prof, true) });
   }
+  if (post && p === "/api/profiles/navidrome") { // sign in with the Navidrome account Sour Player is logged into
+    const b = await readBody(req);
+    const who = await navidromeUser(b.credential);
+    if (!who.user) return send(res, 401, { error: who.error });
+    const linked = visibleProfiles().find((x) => x.navidrome === who.user);
+    const old = b.profile ? ownProfile(String(b.profile), b.key) : null;
+    let prof = linked;
+    if (!prof && old && !old.navidrome && !old.mergedInto) { prof = old; prof.navidrome = who.user; }
+    if (!prof) {
+      const id = crypto.randomUUID().slice(0, 12);
+      prof = profiles[id] = { id, keyHashes: [], name: clean1(b.name, 40).trim() || who.name, navidrome: who.user, created: new Date().toISOString(), lastSeen: Date.now() };
+    }
+    let merged = null;
+    if (old && old !== prof && !old.navidrome) { mergeProfile(old, prof); merged = old.id; }
+    const key = crypto.randomUUID();
+    prof.keyHashes = [...keyHashes(prof), hashKey(key)].slice(-8);
+    delete prof.keyHash;
+    saveProfiles();
+    return send(res, 200, { id: prof.id, key, account: who.user, merged, profile: publicProfile(prof, true) });
+  }
   if (get && p === "/api/profiles") {
-    return send(res, 200, Object.values(profiles).map((x) => publicProfile(x))
+    return send(res, 200, visibleProfiles().map((x) => publicProfile(x))
       .sort((a, b) => (b.online - a.online) || (b.lastSeen || 0) - (a.lastSeen || 0)));
   }
   if (post && p === "/api/presence") { // heartbeat: still here, what's playing, where (for listen along / resume)
@@ -1857,7 +1942,7 @@ async function sourRoute(req, res, p, get, post) {
   }
   if (get && p === "/api/leaderboard") { // this week: listening hours, requests, skip votes
     const w = groupStats.weeks[weekKey()] || { people: {} };
-    return send(res, 200, Object.entries(w.people).filter(([id]) => profiles[id] && !privacy(profiles[id]).hideStats && !privacy(profiles[id]).private)
+    return send(res, 200, Object.entries(w.people).filter(([id]) => profiles[id] && !profiles[id].mergedInto && !privacy(profiles[id]).hideStats && !privacy(profiles[id]).private)
       .map(([id, s]) => ({ id, name: profiles[id].name, avatar: profiles[id].avatar ? profiles[id].avatar.v : 0,
         hours: Math.round(s.seconds / 360) / 10, requests: s.requests || 0, skips: s.skips || 0 }))
       .sort((a, b) => b.hours - a.hours));
@@ -1877,7 +1962,7 @@ async function sourRoute(req, res, p, get, post) {
     if (get) {
       const w = groupStats.weeks[weekKey()] || { songs: {}, people: {} };
       return send(res, 200, { name: friendGroup.name, bio: friendGroup.bio, picture: friendGroup.picture ? friendGroup.picture.v : 0,
-        members: Object.values(profiles).map((x) => ({ id: x.id, name: x.name, avatar: x.avatar ? x.avatar.v : 0 })),
+        members: visibleProfiles().map((x) => ({ id: x.id, name: x.name, avatar: x.avatar ? x.avatar.v : 0 })),
         topSongs: topEntries(w.songs, 10).map(([, s]) => ({ ...s.song, plays: s.n })),
         hoursWeek: Math.round(Object.values(w.people).reduce((t, x) => t + x.seconds, 0) / 360) / 10 });
     }
@@ -2056,7 +2141,7 @@ function throwbackSongs(n, avoid) {
 }
 function birthdayPeople() {
   const today = new Date().toISOString().slice(5, 10); // MM-DD
-  return Object.values(profiles).filter((x) => x.custom && String(x.custom.birthday || "").slice(-5) === today);
+  return visibleProfiles().filter((x) => x.custom && String(x.custom.birthday || "").slice(-5) === today);
 }
 function serverFill(g) {
   const avoid = new Set(g.queue.map((q) => q.id));
@@ -2312,6 +2397,11 @@ http.createServer(async (req, res) => {
       Object.assign(dt, { cookie: "", blockedUntil: 0, failed: "" });
       return send(res, 200, publicConfig());
     } catch (e) { return send(res, 400, { error: e.message }); }
+  }
+  if (get && p === "/api/navidrome/test") { // can Hermes Music reach Navidrome (for Sour Player accounts)?
+    navidromeFound = "";
+    const base = await navidromeBase();
+    return send(res, 200, base ? { ok: true, message: `found Navidrome at ${base}` } : { ok: false, message: "Navidrome not found - type its address (for example http://navidrome_server_1:4533)" });
   }
   if (get && p === "/api/downtify/test") { // checks the address, the login and the shared folder
     try {

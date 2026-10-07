@@ -404,6 +404,11 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
       <div class="row"><label for="c-dtpass">Password<small id="dthint">blank = default (downtify)</small></label><input type="password" id="c-dtpass" placeholder="blank = keep, - = remove" autocomplete="off"></div>
       <div class="row"><label>Connection<small>save first, then test</small></label><button class="btn" id="c-dttest" style="margin:0">Test</button><span id="dtmsg" class="sub2" style="margin:0"></span></div>
 
+      <div class="grp">&#9662; Sour Player accounts</div>
+      <p class="sub2">Sour Player profiles are tied to Navidrome accounts: signing in to Navidrome in Sour Player is all it takes, on every computer. Hermes Music finds Navidrome on this Umbrel by itself; type its address only if the test can&#39;t.</p>
+      <div class="row"><label for="c-ndurl">Navidrome address<small>blank = find it automatically</small></label><input type="text" id="c-ndurl" spellcheck="false" autocomplete="off" placeholder="automatic"></div>
+      <div class="row"><label>Connection<small>save first, then test</small></label><button class="btn" id="c-ndtest" style="margin:0">Test</button><span id="ndmsg" class="sub2" style="margin:0"></span></div>
+
       <div class="grp">&#9662; Queue</div>
       <div class="row"><label for="c-paused">Pause requests<small>worker skips the queue</small></label><input type="checkbox" id="c-paused"></div>
       <div class="row"><label for="c-rate">Requests per minute<small>per device, stops spam</small></label><input type="number" id="c-rate" min="1" max="30"></div>
@@ -736,6 +741,7 @@ function fillCfg() {
   $("keyhint").textContent = cfg.hasKey ? "a key is saved" : "optional";
   $("c-fmt").value = cfg.audioFormat; $("c-max").value = cfg.maxMinutes; $("c-art").checked = cfg.embedArt;
   $("c-paused").checked = cfg.paused; $("c-rate").value = cfg.ratePerMinute; $("c-folders").checked = cfg.artistFolders; $("c-maxalb").value = cfg.artistMaxAlbums;
+  $("c-ndurl").value = cfg.navidromeUrl || "";
   $("c-dten").checked = cfg.downtifyEnabled; $("c-dturl").value = cfg.downtifyUrl || ""; $("c-dtuser").value = cfg.downtifyUser || ""; $("c-dtpass").value = "";
   $("dthint").textContent = cfg.hasDowntifyPassword ? "a password is saved" : "blank = default (downtify)";
   $("pairhint").textContent = cfg.downtifyPaired ? "\u2714 paired (type - and Save to unpair)" : "best: no password needed"; $("c-dtcode").value = "";
@@ -752,6 +758,7 @@ $("c-save").onclick = async () => {
       localUrl: $("c-url").value, localModel: $("c-lmodel").value, contextLength: +$("c-ctx").value, localKey: $("c-key").value,
       audioFormat: $("c-fmt").value, maxMinutes: +$("c-max").value, embedArt: $("c-art").checked, artistFolders: $("c-folders").checked,
       artistMaxAlbums: +$("c-maxalb").value, includeSingles: $("c-singles").checked,
+      navidromeUrl: $("c-ndurl").value,
       downtifyEnabled: $("c-dten").checked, downtifyUrl: $("c-dturl").value, downtifyUser: $("c-dtuser").value, downtifyPassword: $("c-dtpass").value, downtifyToken: $("c-dtcode").value.trim() === "-" ? "-" : undefined,
       paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, claudeToken: $("c-token").value,
       currentPin: $("c-cur").value, newPin: $("c-pin").value }) });
@@ -765,6 +772,11 @@ $("c-dtpair").onclick = async () => {
     cfg = DEMO ? { ...cfg, downtifyPaired: true } : await api("api/downtify/pair", { method: "POST", body: JSON.stringify({ code: $("c-dtcode").value, currentPin: $("c-cur").value }) });
     fillCfg(); m.style.color = "#4ade80"; m.textContent = "paired with Downtify";
   } catch (e) { m.style.color = "#f87171"; m.textContent = e.message; }
+};
+$("c-ndtest").onclick = async () => {
+  const m = $("ndmsg"); m.style.color = ""; m.textContent = "looking for Navidrome...";
+  try { const r = DEMO ? { ok: true, message: "found Navidrome" } : await (await fetch("api/navidrome/test")).json(); m.style.color = r.ok ? "#4ade80" : "#f87171"; m.textContent = r.message; }
+  catch (e) { m.style.color = "#f87171"; m.textContent = e.message; }
 };
 $("c-dttest").onclick = async () => {
   const m = $("dtmsg"); m.style.color = ""; m.textContent = "testing...";
