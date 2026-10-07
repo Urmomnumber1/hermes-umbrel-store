@@ -1169,8 +1169,10 @@ const cleanAvatar = (v) => (typeof v === "string" && /^data:image\/(png|jpeg|web
 function groupState(g) {
   return {
     code: g.code, name: g.name, host: g.hostName, ended: !!g.ended, guestControl: g.guestControl, listed: g.listed,
+    radio: !!g.radio, needSongs: !!g.radio && radioUpcoming() < 3, votes: g.votes ? g.votes.size : 0,
+    hostProfile: g.hostProfile || null,
     hostAvatar: g.hostAvatar ? g.avatarVersion : 0,
-    members: [...g.members.entries()].map(([id, m]) => ({ id, name: m.name, avatar: m.avatar ? g.avatarVersion : 0 })),
+    members: [...g.members.entries()].map(([id, m]) => ({ id, name: m.name, avatar: m.avatar ? g.avatarVersion : 0, profile: m.profile || null })),
     queue: g.queue.map((x) => ({ ...x, by: g.addedBy.get(x.id) || g.hostName })),
     index: g.index, playing: g.playing, position: g.position, updatedAt: g.updatedAt,
     requests: g.requests, commands: g.commands, serverNow: Date.now(),
@@ -1188,9 +1190,44 @@ function endGroup(g) {
   groups.delete(g.code);
 }
 setInterval(() => { // tidy up groups whose host disappeared
-  for (const g of groups.values()) if (Date.now() - g.hostSeen > 6 * 3600 * 1000) endGroup(g);
+  for (const g of groups.values()) if (!g.radio && Date.now() - g.hostSeen > 6 * 3600 * 1000) endGroup(g);
 }, 60000);
 setInterval(() => { for (const g of groups.values()) for (const res of g.streams) { if (!res.writableEnded) try { res.write(": ping\n\n"); } catch {} } }, 20000);
+
+// Sour Radio: a group that's always on. Hermes Music keeps the clock itself (no host), plays songs back to back
+// and asks the listeners' apps for random songs from the library when fewer than 3 are left. Songs people add
+// play before the random ones. Anyone can vote to skip; half the listeners (rounded up) skips the song.
+const RADIO = "RADIO";
+const radio = {
+  code: RADIO, radio: true, hostKey: crypto.randomUUID(), name: "Sour Radio", hostName: "Sour Radio",
+  members: new Map(), streams: new Set(), queue: [], index: 0, playing: false, position: 0, guestControl: false,
+  updatedAt: Date.now(), requests: [], commands: [], addedBy: new Map(), hostSeen: Date.now(), listed: true,
+  hostAvatar: null, avatarVersion: 1, songStart: 0, votes: new Set(), lastBeat: 0,
+};
+groups.set(RADIO, radio);
+const songSeconds = (song) => (song && song.duration > 0 ? song.duration / 1000 : 180);
+function radioAdvance() {
+  radio.index++;
+  radio.votes.clear();
+  if (radio.index > 30) { // forget songs played long ago
+    const drop = radio.index - 30;
+    for (const old of radio.queue.slice(0, drop)) if (!radio.queue.slice(drop).some((x) => x.id === old.id)) radio.addedBy.delete(old.id);
+    radio.queue.splice(0, drop);
+    radio.index -= drop;
+  }
+  radio.songStart = Date.now();
+  radio.playing = !!radio.queue[radio.index];
+}
+setInterval(() => {
+  const now = Date.now(), cur = radio.queue[radio.index];
+  let changed = false;
+  if (!radio.playing && cur) { radio.playing = true; radio.songStart = now; changed = true; } // songs arrived
+  if (radio.playing && cur && now - radio.songStart >= songSeconds(cur) * 1000) { radioAdvance(); changed = true; }
+  radio.position = radio.playing ? (now - radio.songStart) / 1000 : 0;
+  radio.updatedAt = now;
+  if (changed || now - radio.lastBeat > 10000) { radio.lastBeat = now; broadcast(radio); }
+}, 1000);
+const radioUpcoming = () => radio.queue.length - radio.index - 1;
 
 const CONTROLS = new Set(["play", "pause", "next", "previous", "seek", "playIndex", "remove", "playNext"]);
 async function groupRoute(req, res, p, get, post, url) {
@@ -1198,7 +1235,7 @@ async function groupRoute(req, res, p, get, post, url) {
   if (get && p === "/api/group/list") { // groups anyone can see and join (the host can hide theirs)
     return send(res, 200, [...groups.values()].filter((g) => g.listed && !g.ended).map((g) => {
       const now = g.queue[g.index];
-      return { code: g.code, name: g.name, host: g.hostName, listening: g.members.size + 1, playing: g.playing,
+      return { code: g.code, name: g.name, host: g.hostName, listening: g.members.size + (g.radio ? 0 : 1), playing: g.playing, radio: !!g.radio,
         nowPlaying: now ? { title: now.title, artist: now.artist, imageId: now.imageId || null } : null };
     }));
   }
@@ -1209,7 +1246,7 @@ async function groupRoute(req, res, p, get, post, url) {
       code, hostKey, name: clean1(b.name, 60) || "Group Play", hostName: clean1(b.user, 40) || "Host",
       members: new Map(), streams: new Set(), queue: [], index: 0, playing: false, position: 0, guestControl: false,
       updatedAt: Date.now(), requests: [], commands: [], addedBy: new Map(), hostSeen: Date.now(),
-      listed: b.listed !== false, hostAvatar: cleanAvatar(b.avatar), avatarVersion: 1,
+      listed: b.listed !== false, hostAvatar: cleanAvatar(b.avatar), avatarVersion: 1, hostProfile: clean1(b.profile, 40) || null,
     };
     groups.set(code, g);
     return send(res, 200, { code, hostKey, state: groupState(g) });
@@ -1247,7 +1284,7 @@ async function groupRoute(req, res, p, get, post, url) {
 
   if (action === "join") {
     const id = crypto.randomUUID();
-    g.members.set(id, { name: clean1(b.user, 40) || "Guest", avatar: cleanAvatar(b.avatar) });
+    g.members.set(id, { name: clean1(b.user, 40) || "Guest", avatar: cleanAvatar(b.avatar), profile: clean1(b.profile, 40) || null });
     if (g.members.get(id).avatar) g.avatarVersion++;
     broadcast(g);
     return send(res, 200, { member: id, state: groupState(g) });
@@ -1268,9 +1305,36 @@ async function groupRoute(req, res, p, get, post, url) {
     const songs = (Array.isArray(b.songs) ? b.songs : []).map(groupSong).filter(Boolean).slice(0, 200);
     if (!songs.length) return send(res, 400, { error: "no songs to add" });
     const by = me ? me.name : clean1(b.user, 40) || "someone";
+    if (g.radio) {
+      let at = g.index + 1;
+      while (g.queue[at] && g.queue[at].requested) at++;
+      g.queue.splice(Math.min(at, g.queue.length), 0, ...songs.map((x) => ({ ...x, requested: true })));
+      for (const song of songs) g.addedBy.set(song.id, by);
+      broadcast(g);
+      return send(res, 200, { added: songs.length });
+    }
     for (const song of songs) { g.requests.push({ rid: crypto.randomUUID(), song, by }); g.addedBy.set(song.id, by); }
     broadcast(g);
     return send(res, 200, { added: songs.length });
+  }
+  if (g.radio && action === "fill") { // a listener's app sends random songs when the radio runs low
+    if (!me) return send(res, 403, { error: "join the radio first" });
+    if (radioUpcoming() >= 3) return send(res, 200, { added: 0 });
+    const songs = cleanSongs(b.songs, 20).filter((x) => !g.queue.slice(g.index).some((q) => q.id === x.id));
+    g.queue.push(...songs);
+    for (const song of songs) g.addedBy.set(song.id, "Sour Radio");
+    broadcast(g);
+    return send(res, 200, { added: songs.length });
+  }
+  if (g.radio && action === "control") { // the radio has no host: skipping is a vote
+    if (!me) return send(res, 403, { error: "join the radio first" });
+    if (b.cmd !== "next") return send(res, 403, { error: "the radio can't be paused or reordered - vote to skip instead" });
+    g.votes.add(String(b.member || "host"));
+    const needed = Math.max(1, Math.ceil(g.members.size / 2));
+    const skipped = g.votes.size >= needed;
+    if (skipped) radioAdvance();
+    broadcast(g);
+    return send(res, 200, { skipped, votes: skipped ? 0 : g.votes.size, needed });
   }
   if (action === "control") { // a guest using the group's controls; the host's Feishin carries it out
     if (!me) return send(res, 403, { error: "you're not in this group any more" });
@@ -1322,6 +1386,128 @@ async function groupRoute(req, res, p, get, post, url) {
   return send(res, 404, { error: "not found" });
 }
 
+// ---------- Sour Player: profiles, who's online, playlist themes ----------
+// Each Sour Player gets a profile (no passwords: the app keeps a private key, and only that key can change it).
+// Pictures (PNG, JPEG, WebP or GIF) are stored as files in /data/sour. Presence comes from a heartbeat the app
+// sends every 15 seconds with what it's playing.
+const SOUR_DIR = "/data/sour", PROFILES = "/data/profiles.json", THEMES = "/data/playlist-themes.json";
+fs.mkdirSync(SOUR_DIR, { recursive: true });
+let profiles = {}, playlistThemes = {};
+try { profiles = JSON.parse(fs.readFileSync(PROFILES, "utf8")); } catch {}
+try { playlistThemes = JSON.parse(fs.readFileSync(THEMES, "utf8")); } catch {}
+let profilesDirty = false;
+const saveProfiles = () => { profilesDirty = false; fs.writeFileSync(PROFILES, JSON.stringify(profiles)); };
+const saveThemes = () => fs.writeFileSync(THEMES, JSON.stringify(playlistThemes));
+setInterval(() => { if (profilesDirty) saveProfiles(); }, 30000); // heartbeats only touch "last seen"
+const hashKey = (k) => crypto.createHash("sha256").update(String(k)).digest("hex");
+const ONLINE_MS = 45000;
+const cleanColor = (v) => (typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v) ? v.toLowerCase() : null);
+const cleanSongs = (list, n) => (Array.isArray(list) ? list : []).map(groupSong).filter(Boolean).slice(0, n);
+const IMAGE_TYPES = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif" };
+const MIME = { png: "image/png", jpg: "image/jpeg", webp: "image/webp", gif: "image/gif" };
+// a data URL from the app -> { ext, buf }, or null if it isn't a picture or is too big
+function decodeImage(data, maxBytes) {
+  const m = typeof data === "string" && data.match(/^data:(image\/[a-z]+);base64,([A-Za-z0-9+/=]+)$/);
+  if (!m || !IMAGE_TYPES[m[1]]) return null;
+  const buf = Buffer.from(m[2], "base64");
+  return buf.length && buf.length <= maxBytes ? { ext: IMAGE_TYPES[m[1]], buf } : null;
+}
+function storeImage(name, img, old) {
+  if (old) fs.rmSync(path.join(SOUR_DIR, `${name}.${old.ext}`), { force: true });
+  if (!img) return null;
+  fs.writeFileSync(path.join(SOUR_DIR, `${name}.${img.ext}`), img.buf);
+  return { ext: img.ext, v: Date.now() };
+}
+function sendImage(res, name, meta) {
+  if (!meta) return send(res, 404, { error: "no picture" });
+  const file = path.join(SOUR_DIR, `${name}.${meta.ext}`);
+  if (!fs.existsSync(file)) return send(res, 404, { error: "no picture" });
+  return send(res, 200, fs.readFileSync(file), MIME[meta.ext], { "cache-control": "max-age=604800" });
+}
+function publicProfile(p) {
+  const online = Date.now() - (p.lastSeen || 0) < ONLINE_MS;
+  return {
+    id: p.id, name: p.name, bio: p.bio || "", status: p.status || "", color: p.color || null,
+    avatar: p.avatar ? p.avatar.v : 0, banner: p.banner ? p.banner.v : 0, favorites: p.favorites || [],
+    online, lastSeen: p.lastSeen || null, created: p.created,
+    listening: online && p.listening ? p.listening : null, playing: online && !!p.playing,
+  };
+}
+const ownProfile = (id, key) => { const p = profiles[id]; return p && key && p.keyHash === hashKey(key) ? p : null; };
+
+async function sourRoute(req, res, p, get, post) {
+  let m;
+  if (post && p === "/api/profiles") { // new profile for this Sour Player
+    const b = await readBody(req);
+    const id = crypto.randomUUID().slice(0, 12), key = crypto.randomUUID();
+    profiles[id] = { id, keyHash: hashKey(key), name: clean1(b.name, 40).trim() || "Listener", created: new Date().toISOString(), lastSeen: Date.now() };
+    saveProfiles();
+    return send(res, 201, { id, key, profile: publicProfile(profiles[id]) });
+  }
+  if (get && p === "/api/profiles") {
+    return send(res, 200, Object.values(profiles).map(publicProfile)
+      .sort((a, b) => (b.online - a.online) || (b.lastSeen || 0) - (a.lastSeen || 0)));
+  }
+  if (post && p === "/api/presence") { // heartbeat: still here, and what's playing
+    const b = await readBody(req, 20000);
+    const me = ownProfile(String(b.id || ""), b.key);
+    if (!me) return send(res, 403, { error: "unknown profile" });
+    me.lastSeen = Date.now();
+    me.listening = b.listening ? groupSong(b.listening) : null;
+    me.playing = !!b.playing;
+    profilesDirty = true;
+    return send(res, 200, { ok: true });
+  }
+  if ((m = p.match(/^\/api\/profiles\/([\w-]{1,40})(?:\/(avatar|banner|image))?$/))) {
+    const prof = profiles[m[1]];
+    if (!prof) return send(res, 404, { error: "no such profile" });
+    if (get && (m[2] === "avatar" || m[2] === "banner")) return sendImage(res, `${prof.id}-${m[2]}`, prof[m[2]]);
+    if (get && !m[2]) return send(res, 200, publicProfile(prof));
+    if (!post) return send(res, 404, { error: "not found" });
+    const b = await readBody(req, 9000000); // pictures can be a few MB (GIFs)
+    if (!ownProfile(prof.id, b.key)) return send(res, 403, { error: "that isn't your profile" });
+    if (m[2] === "image") { // { kind: avatar|banner, data: data URL or null to remove }
+      const kind = b.kind === "banner" ? "banner" : "avatar";
+      const img = b.data ? decodeImage(b.data, kind === "banner" ? 6000000 : 3000000) : null;
+      if (b.data && !img) return send(res, 400, { error: `pictures must be PNG, JPEG, WebP or GIF, up to ${kind === "banner" ? 6 : 3} MB` });
+      prof[kind] = storeImage(`${prof.id}-${kind}`, img, prof[kind]);
+      saveProfiles();
+      return send(res, 200, publicProfile(prof));
+    }
+    if (typeof b.name === "string" && b.name.trim()) prof.name = clean1(b.name, 40).trim();
+    if (typeof b.bio === "string") prof.bio = clean1(b.bio, 500);
+    if (typeof b.status === "string") prof.status = clean1(b.status, 80);
+    if (b.color !== undefined) prof.color = cleanColor(b.color);
+    if (Array.isArray(b.favorites)) prof.favorites = cleanSongs(b.favorites, 100);
+    saveProfiles();
+    return send(res, 200, publicProfile(prof));
+  }
+  if ((m = p.match(/^\/api\/playlist-themes\/([\w-]{1,80})(\/image)?$/))) { // a playlist's look, shared by everyone
+    const id = m[1], t = playlistThemes[id];
+    if (get && m[2]) return sendImage(res, `playlist-${id}`, t && t.image);
+    if (get) return t ? send(res, 200, { color: t.color, image: t.image ? t.image.v : 0, owner: t.owner, ownerName: profiles[t.owner]?.name || null })
+      : send(res, 404, { error: "no theme" });
+    if (!post || m[2]) return send(res, 404, { error: "not found" });
+    const b = await readBody(req, 9000000);
+    const me = ownProfile(String(b.profile || ""), b.key);
+    if (!me) return send(res, 403, { error: "set up your profile first" });
+    if (t && t.owner !== me.id) return send(res, 403, { error: `only ${profiles[t.owner]?.name || "whoever themed it"} can change this playlist's theme` });
+    if (b.remove) { if (t) storeImage(`playlist-${id}`, null, t.image); delete playlistThemes[id]; saveThemes(); return send(res, 200, { removed: true }); }
+    const theme = t || { owner: me.id, color: null, image: null };
+    if (b.color !== undefined) theme.color = cleanColor(b.color);
+    if (b.image !== undefined) {
+      const img = b.image ? decodeImage(b.image, 6000000) : null;
+      if (b.image && !img) return send(res, 400, { error: "the picture must be PNG, JPEG, WebP or GIF, up to 6 MB" });
+      theme.image = storeImage(`playlist-${id}`, img, theme.image);
+    }
+    theme.updated = new Date().toISOString();
+    playlistThemes[id] = theme;
+    saveThemes();
+    return send(res, 200, { color: theme.color, image: theme.image ? theme.image.v : 0, owner: theme.owner, ownerName: me.name });
+  }
+  return send(res, 404, { error: "not found" });
+}
+
 // ---------- http ----------
 const send = (res, code, body, type = "application/json", extra = {}) => {
   res.writeHead(code, { "content-type": type, ...extra });
@@ -1338,7 +1524,8 @@ const rate = new Map(); // ip -> timestamps
 http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   const p = url.pathname, get = req.method === "GET", post = req.method === "POST";
-  if (p.startsWith("/api/group/") || p.startsWith("/api/videos/") || p === "/api/requests" || p === "/api/status") { // used by the custom Feishin
+  if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/profiles") || p.startsWith("/api/playlist-themes")
+    || ["/api/requests", "/api/status", "/api/presence", "/api/now", "/api/bump"].includes(p)) { // used by Sour Player (the custom Feishin)
     res.setHeader("access-control-allow-origin", "*");
     if (req.method === "OPTIONS") {
       res.writeHead(204, { "access-control-allow-methods": "GET, POST", "access-control-allow-headers": "content-type", "access-control-max-age": "86400" });
@@ -1346,6 +1533,7 @@ http.createServer(async (req, res) => {
     }
   }
   if (p.startsWith("/api/group/")) return groupRoute(req, res, p, get, post, url);
+  if (p.startsWith("/api/profiles") || p === "/api/presence" || p.startsWith("/api/playlist-themes")) return sourRoute(req, res, p, get, post);
 
   if (get && p === "/") return send(res, 200, PAGE, "text/html");
 

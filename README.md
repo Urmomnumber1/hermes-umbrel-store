@@ -41,6 +41,11 @@ Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbr
   add a profile picture (a 96px image, served at `/api/group/CODE/avatar?id=`).
 - The custom Feishin can send requests too (the + button: `POST /api/requests` with `by`), and shows "Your most played"
   on Home from plays counted on that computer.
+- **Sour Player** (the custom Feishin, download links on the page's help tab) adds: profiles with a picture (PNG/GIF),
+  banner, bio, colour and favourite songs (`/api/profiles`, presence heartbeat `/api/presence`); who's online and what
+  they're playing; **Sour Radio**, an always-on group (`RADIO`) whose clock Hermes Music keeps and whose random songs
+  come from the listeners' libraries (vote to skip); and shared playlist themes (`/api/playlist-themes/<id>`).
+  Pictures are stored in the app's data folder (`data/sour`).
 - `/duplicate` lists copies of the same song (same artist, title and length) and keeps the best-quality one;
   `/duplicate confirm` (plus your PIN, if set) moves the extras to the hidden `.duplicates` folder in your music folder.
 - Songs already in the music folder are skipped: the app indexes the folder's tags on start and every 30 minutes.

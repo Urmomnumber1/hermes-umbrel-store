@@ -84,6 +84,10 @@ select option{background:#02080d}
 input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
 .btn{margin-top:14px;padding:6px 16px;border:1px solid var(--acc);border-radius:6px;background:transparent;color:var(--acc);font:inherit;letter-spacing:.1em;text-transform:uppercase;font-size:.75rem;cursor:pointer}
 .btn:hover{background:var(--acc);color:#fff}
+.dl{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0}
+.dl a{display:inline-block;padding:8px 14px;border:1px solid var(--acc);border-radius:6px;color:var(--acc);text-decoration:none}
+.dl a.pick{background:var(--acc);color:#fff}
+.dl a small{display:block;opacity:.75;font-size:.7rem}
 #cfgmsg{margin-left:12px;font-size:.8rem;color:#4ade80}
 
 @media(max-width:1250px){ .wrap{flex-direction:column} .help{width:100%;max-width:1000px} }
@@ -140,7 +144,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             <div id="sess">Session: -</div>
           </div>
           <div class="rt">
-            <h2>Hermes Music v2.10.0</h2>
+            <h2>Hermes Music v2.11.0</h2>
             <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
             <div class="sec"><span class="k">&#9662; Workers</span><br><span id="w-worker" class="d">-</span></div>
             <div class="sec"><span class="k">&#9662; Library</span><br><span class="d" id="w-lib">-</span></div>
@@ -156,6 +160,26 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
         <h3>Instructions</h3>
 
         <details open>
+          <summary>Download Sour Player</summary>
+          <div class="in">
+            <p>Sour Player is the music player for Hermes Music: music videos, Group Play, Sour Radio, profiles and requests. It plays the music from the shared library.</p>
+            <p id="dl-guess"></p>
+            <div class="dl">
+              <a id="dl-win" href="https://github.com/Urmomnumber1/feishin/releases/latest/download/Sour-Player-win-x64.exe">Windows<small>Sour-Player-win-x64.exe</small></a>
+              <a id="dl-appimage" href="https://github.com/Urmomnumber1/feishin/releases/latest/download/Sour-Player-linux-x86_64.AppImage">Linux (any)<small>AppImage</small></a>
+              <a id="dl-deb" href="https://github.com/Urmomnumber1/feishin/releases/latest/download/Sour-Player-linux-amd64.deb">Linux (Ubuntu / Mint / Debian)<small>.deb</small></a>
+            </div>
+            <ol>
+              <li><b>Not sure which you have?</b> If your computer has a Start button with the Windows logo, pick <b>Windows</b>. Almost every PC and laptop from a shop runs Windows. Linux is something you would have installed on purpose.</li>
+              <li><b>Windows:</b> open the downloaded file. If Windows says the app is unrecognised, click <b>More info</b> &gt; <b>Run anyway</b>.</li>
+              <li><b>Linux AppImage:</b> right-click it &gt; Properties &gt; allow running as a program (or <code>chmod +x</code>), then open it. <b>.deb:</b> double-click it, or <code>sudo apt install ./Sour-Player-linux-amd64.deb</code>.</li>
+              <li>In Sour Player: add your music server (Navidrome), then <b>Settings &gt; General &gt; Music videos</b> &gt; Hermes Music address: <code id="dl-addr">this page&#39;s address</code>.</li>
+              <li>It updates itself: when a new version is ready, an <b>Update</b> button shows up in the player bar.</li>
+            </ol>
+          </div>
+        </details>
+
+        <details>
           <summary>Request a song</summary>
           <div class="in">
             <ol>
@@ -619,6 +643,20 @@ $("f").onsubmit = async (e) => {
   } catch (err) { push("err", err.message); }
   render(); load();
 };
+
+(function sourDownload() {
+  const ua = navigator.userAgent, guess = $("dl-guess");
+  if (!guess) return;
+  let pick = null, text = "";
+  if (/Android|iPhone|iPad/i.test(ua)) text = "You're on a phone or tablet: Sour Player is a computer app, so download it on your PC.";
+  else if (/Windows/i.test(ua)) { pick = "dl-win"; text = "This computer runs <b>Windows</b> - use the highlighted button."; }
+  else if (/Mac OS X|Macintosh/i.test(ua)) text = "Sour Player isn't available for Mac yet.";
+  else if (/Ubuntu|Debian|Mint/i.test(ua)) { pick = "dl-deb"; text = "This computer runs <b>Linux</b> - use the highlighted button."; }
+  else if (/Linux/i.test(ua)) { pick = "dl-appimage"; text = "This computer runs <b>Linux</b> - use the highlighted button."; }
+  guess.innerHTML = text;
+  if (pick) $(pick).classList.add("pick");
+  if ($("dl-addr") && location.protocol !== "file:") $("dl-addr").textContent = location.origin;
+})();
 
 function tab(name) {
   const view = name === "cfg" ? "cfg" : "req";
