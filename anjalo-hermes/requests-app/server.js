@@ -1145,10 +1145,12 @@ setTimeout(() => {
   }
 }, 15000);
 
-// ---------- Group Play: one host, any number of members, everyone listens to the same song ----------
-// The host's Feishin is the source of truth: it reports the queue, the song and the position here, and members'
-// Feishin follow it. Members can only ask for songs to be added; the host's Feishin adds them to its queue.
-// Groups live in memory and close when the host leaves or after 6 hours without the host.
+// ---------- Group Play: works like a Spotify Jam ----------
+// The host's Feishin plays the music and is the source of truth: it reports the queue, the song and the position
+// here, and everyone else's Feishin follows it. Anyone can add songs (shown with who added them) and remove their
+// own; when the host lets guests control playback they can also play/pause, skip, play a queued song or remove any.
+// Guests' requests are relayed to the host's Feishin, which applies them. Groups live in memory and close when the
+// host ends them or after 6 hours without the host.
 const groups = new Map();
 const clean1 = (v, n = 200) => String(v ?? "").slice(0, n);
 function newCode() {
@@ -1163,15 +1165,17 @@ const groupSong = (x) => (x && typeof x.id === "string" && x.id.length <= 200 ? 
 } : null);
 function groupState(g) {
   return {
-    code: g.code, name: g.name, host: g.hostName, ended: !!g.ended,
-    members: [...g.members.values()].map((m) => m.name),
-    queue: g.queue, index: g.index, playing: g.playing, position: g.position, updatedAt: g.updatedAt,
-    requests: g.requests, serverNow: Date.now(),
+    code: g.code, name: g.name, host: g.hostName, ended: !!g.ended, guestControl: g.guestControl,
+    members: [...g.members.entries()].map(([id, m]) => ({ id, name: m.name })),
+    queue: g.queue.map((x) => ({ ...x, by: g.addedBy.get(x.id) || g.hostName })),
+    index: g.index, playing: g.playing, position: g.position, updatedAt: g.updatedAt,
+    requests: g.requests, commands: g.commands, serverNow: Date.now(),
   };
 }
+const sse = (res, event, data) => { if (res.writableEnded) return; try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch {} };
 function broadcast(g) {
-  const data = `event: state\ndata: ${JSON.stringify(groupState(g))}\n\n`;
-  for (const res of g.streams) { try { res.write(data); } catch {} }
+  const state = groupState(g);
+  for (const res of g.streams) sse(res, "state", state);
 }
 function endGroup(g) {
   g.ended = true;
@@ -1182,8 +1186,9 @@ function endGroup(g) {
 setInterval(() => { // tidy up groups whose host disappeared
   for (const g of groups.values()) if (Date.now() - g.hostSeen > 6 * 3600 * 1000) endGroup(g);
 }, 60000);
-setInterval(() => { for (const g of groups.values()) for (const res of g.streams) { try { res.write(": ping\n\n"); } catch {} } }, 20000);
+setInterval(() => { for (const g of groups.values()) for (const res of g.streams) { if (!res.writableEnded) try { res.write(": ping\n\n"); } catch {} } }, 20000);
 
+const CONTROLS = new Set(["play", "pause", "next", "previous", "seek", "playIndex", "remove", "playNext"]);
 async function groupRoute(req, res, p, get, post, url) {
   const m = p.match(/^\/api\/group\/([A-Z0-9]{5})(?:\/(\w+))?$/);
   if (post && p === "/api/group/create") {
@@ -1191,8 +1196,8 @@ async function groupRoute(req, res, p, get, post, url) {
     const code = newCode(), hostKey = crypto.randomUUID();
     const g = {
       code, hostKey, name: clean1(b.name, 60) || "Group Play", hostName: clean1(b.user, 40) || "Host",
-      members: new Map(), streams: new Set(), queue: [], index: 0, playing: false, position: 0,
-      updatedAt: Date.now(), requests: [], hostSeen: Date.now(),
+      members: new Map(), streams: new Set(), queue: [], index: 0, playing: false, position: 0, guestControl: false,
+      updatedAt: Date.now(), requests: [], commands: [], addedBy: new Map(), hostSeen: Date.now(),
     };
     groups.set(code, g);
     return send(res, 200, { code, hostKey, state: groupState(g) });
@@ -1204,18 +1209,22 @@ async function groupRoute(req, res, p, get, post, url) {
 
   if (get && action === "events") { // live updates (Server-Sent Events)
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
-    res.write(`event: state\ndata: ${JSON.stringify(groupState(g))}\n\n`);
+    res.on("error", () => {}); // a dropped connection must never take the server down
+    sse(res, "state", groupState(g));
     g.streams.add(res);
     const member = url.searchParams.get("member");
+    if (member && g.members.has(member)) g.members.get(member).stream = res;
     req.on("close", () => {
       g.streams.delete(res);
-      if (member && g.members.has(member)) { g.members.delete(member); broadcast(g); }
+      const mm = member && g.members.get(member);
+      if (mm && mm.stream === res) { g.members.delete(member); broadcast(g); }
     });
     return;
   }
   if (!post) return send(res, 404, { error: "not found" });
   const b = await readBody(req, 2000000); // a host queue can be long
   const isHost = b.hostKey === g.hostKey;
+  const me = isHost ? { name: g.hostName } : g.members.get(String(b.member || ""));
 
   if (action === "join") {
     const id = crypto.randomUUID();
@@ -1223,13 +1232,33 @@ async function groupRoute(req, res, p, get, post, url) {
     broadcast(g);
     return send(res, 200, { member: id, state: groupState(g) });
   }
-  if (action === "add") { // anyone in the group can ask for songs
+  if (action === "leave") {
+    if (g.members.delete(String(b.member || ""))) broadcast(g);
+    return send(res, 200, { ok: true });
+  }
+  if (action === "add") { // anyone in the group can add songs
     const songs = (Array.isArray(b.songs) ? b.songs : []).map(groupSong).filter(Boolean).slice(0, 200);
     if (!songs.length) return send(res, 400, { error: "no songs to add" });
-    const by = clean1(b.user, 40) || "someone";
-    for (const song of songs) g.requests.push({ rid: crypto.randomUUID(), song, by });
+    const by = me ? me.name : clean1(b.user, 40) || "someone";
+    for (const song of songs) { g.requests.push({ rid: crypto.randomUUID(), song, by }); g.addedBy.set(song.id, by); }
     broadcast(g);
     return send(res, 200, { added: songs.length });
+  }
+  if (action === "control") { // a guest using the group's controls; the host's Feishin carries it out
+    if (!me) return send(res, 403, { error: "you're not in this group any more" });
+    const cmd = String(b.cmd || "");
+    if (!CONTROLS.has(cmd)) return send(res, 400, { error: "unknown control" });
+    const index = Number.isInteger(b.index) ? b.index : -1;
+    const target = g.queue[index];
+    const own = cmd === "remove" && target && (g.addedBy.get(target.id) || g.hostName) === me.name;
+    if (!isHost && !g.guestControl && !own) return send(res, 403, { error: "the host hasn't let guests control playback" });
+    if ((cmd === "playIndex" || cmd === "remove" || cmd === "playNext") && (!target || target.id !== b.songId))
+      return send(res, 409, { error: "the queue changed - try again" });
+    g.commands.push({ cid: crypto.randomUUID(), cmd, index, songId: target ? target.id : null,
+      position: Number.isFinite(b.position) ? Math.max(0, b.position) : 0, by: me.name });
+    g.commands = g.commands.slice(-50);
+    broadcast(g);
+    return send(res, 200, { ok: true });
   }
   if (!isHost) return send(res, 403, { error: "only the host can do that" });
   g.hostSeen = Date.now();
@@ -1239,7 +1268,24 @@ async function groupRoute(req, res, p, get, post, url) {
     if (typeof b.playing === "boolean") g.playing = b.playing;
     if (Number.isFinite(b.position)) g.position = Math.max(0, b.position);
     g.updatedAt = Date.now();
-    if (Array.isArray(b.applied)) g.requests = g.requests.filter((r) => !b.applied.includes(r.rid)); // added by the host
+    if (Array.isArray(b.applied)) { // requests and controls the host's Feishin has carried out
+      g.requests = g.requests.filter((r) => !b.applied.includes(r.rid));
+      g.commands = g.commands.filter((c) => !b.applied.includes(c.cid));
+    }
+    broadcast(g);
+    return send(res, 200, { ok: true });
+  }
+  if (action === "settings") {
+    if (typeof b.guestControl === "boolean") g.guestControl = b.guestControl;
+    if (typeof b.name === "string" && b.name.trim()) g.name = clean1(b.name, 60);
+    broadcast(g);
+    return send(res, 200, { ok: true });
+  }
+  if (action === "kick") {
+    const mm = g.members.get(String(b.target || ""));
+    if (!mm) return send(res, 404, { error: "they already left" });
+    g.members.delete(String(b.target));
+    if (mm.stream) { g.streams.delete(mm.stream); sse(mm.stream, "kicked", {}); try { mm.stream.end(); } catch {} }
     broadcast(g);
     return send(res, 200, { ok: true });
   }

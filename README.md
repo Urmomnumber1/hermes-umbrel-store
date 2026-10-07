@@ -32,9 +32,11 @@ Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbr
 - The custom Feishin updates itself from this fork's releases (downloads in the background, installs when you close it).
 - Music videos play muted in step with the song in the custom Feishin. Hermes Music lines each video up with the song
   in the background by matching the sound (the video's audio is fetched for that and deleted right after).
-- Group Play (custom Feishin, people icon): a host creates a group and shares the 5-letter code; members join, hear what
-  the host plays, and can add songs (right-click > Add to group queue). Only the host skips or seeks. Hermes Music relays
-  the state (`/api/group/...`, Server-Sent Events); groups live in memory.
+- Group Play (custom Feishin, people icon) works like a Spotify Jam: a host starts a group and shares the 5-letter code;
+  everyone hears the same song at the same moment and adds to one shared queue that shows who added each song. Guests
+  remove their own songs; with **Let guests control playback** on they can also play/pause, skip, play now, play next
+  and remove any song. The host can remove people. Hermes Music relays the state (`/api/group/...`, Server-Sent
+  Events) and guests' controls; the host's Feishin carries them out. Groups live in memory.
 - `/duplicate` lists copies of the same song (same artist, title and length) and keeps the best-quality one;
   `/duplicate confirm` (plus your PIN, if set) moves the extras to the hidden `.duplicates` folder in your music folder.
 - Songs already in the music folder are skipped: the app indexes the folder's tags on start and every 30 minutes.
