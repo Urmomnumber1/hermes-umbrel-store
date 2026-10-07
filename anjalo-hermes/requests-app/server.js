@@ -1162,6 +1162,7 @@ function newCode() {
 }
 const groupSong = (x) => (x && typeof x.id === "string" && x.id.length <= 200 ? {
   id: x.id, title: clean1(x.title), artist: clean1(x.artist), album: clean1(x.album), duration: Number(x.duration) || 0,
+  imageId: typeof x.imageId === "string" ? x.imageId.slice(0, 200) : null, // cover id on the shared Navidrome (no URL/credentials)
 } : null);
 function groupState(g) {
   return {
