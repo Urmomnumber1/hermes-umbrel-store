@@ -1164,10 +1164,13 @@ const groupSong = (x) => (x && typeof x.id === "string" && x.id.length <= 200 ? 
   id: x.id, title: clean1(x.title), artist: clean1(x.artist), album: clean1(x.album), duration: Number(x.duration) || 0,
   imageId: typeof x.imageId === "string" ? x.imageId.slice(0, 200) : null, // cover id on the shared Navidrome (no URL/credentials)
 } : null);
+// a profile picture: a small image as a data URL (Feishin shrinks it to 96px before sending)
+const cleanAvatar = (v) => (typeof v === "string" && /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(v) && v.length <= 150000 ? v : null);
 function groupState(g) {
   return {
-    code: g.code, name: g.name, host: g.hostName, ended: !!g.ended, guestControl: g.guestControl,
-    members: [...g.members.entries()].map(([id, m]) => ({ id, name: m.name })),
+    code: g.code, name: g.name, host: g.hostName, ended: !!g.ended, guestControl: g.guestControl, listed: g.listed,
+    hostAvatar: g.hostAvatar ? g.avatarVersion : 0,
+    members: [...g.members.entries()].map(([id, m]) => ({ id, name: m.name, avatar: m.avatar ? g.avatarVersion : 0 })),
     queue: g.queue.map((x) => ({ ...x, by: g.addedBy.get(x.id) || g.hostName })),
     index: g.index, playing: g.playing, position: g.position, updatedAt: g.updatedAt,
     requests: g.requests, commands: g.commands, serverNow: Date.now(),
@@ -1192,13 +1195,21 @@ setInterval(() => { for (const g of groups.values()) for (const res of g.streams
 const CONTROLS = new Set(["play", "pause", "next", "previous", "seek", "playIndex", "remove", "playNext"]);
 async function groupRoute(req, res, p, get, post, url) {
   const m = p.match(/^\/api\/group\/([A-Z0-9]{5})(?:\/(\w+))?$/);
+  if (get && p === "/api/group/list") { // groups anyone can see and join (the host can hide theirs)
+    return send(res, 200, [...groups.values()].filter((g) => g.listed && !g.ended).map((g) => {
+      const now = g.queue[g.index];
+      return { code: g.code, name: g.name, host: g.hostName, listening: g.members.size + 1, playing: g.playing,
+        nowPlaying: now ? { title: now.title, artist: now.artist, imageId: now.imageId || null } : null };
+    }));
+  }
   if (post && p === "/api/group/create") {
-    const b = await readBody(req);
+    const b = await readBody(req, 200000);
     const code = newCode(), hostKey = crypto.randomUUID();
     const g = {
       code, hostKey, name: clean1(b.name, 60) || "Group Play", hostName: clean1(b.user, 40) || "Host",
       members: new Map(), streams: new Set(), queue: [], index: 0, playing: false, position: 0, guestControl: false,
       updatedAt: Date.now(), requests: [], commands: [], addedBy: new Map(), hostSeen: Date.now(),
+      listed: b.listed !== false, hostAvatar: cleanAvatar(b.avatar), avatarVersion: 1,
     };
     groups.set(code, g);
     return send(res, 200, { code, hostKey, state: groupState(g) });
@@ -1208,6 +1219,13 @@ async function groupRoute(req, res, p, get, post, url) {
   if (!g) return send(res, 404, { error: "that group doesn't exist (or has ended)" });
   const action = m[2] || "";
 
+  if (get && action === "avatar") { // /api/group/CODE/avatar?id=host|<member id>
+    const id = url.searchParams.get("id") || "";
+    const data = id === "host" ? g.hostAvatar : g.members.get(id)?.avatar;
+    if (!data) return send(res, 404, { error: "no picture" });
+    const [, type, b64] = data.match(/^data:(image\/\w+);base64,(.*)$/);
+    return send(res, 200, Buffer.from(b64, "base64"), type, { "cache-control": "max-age=86400" });
+  }
   if (get && action === "events") { // live updates (Server-Sent Events)
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
     res.on("error", () => {}); // a dropped connection must never take the server down
@@ -1229,9 +1247,18 @@ async function groupRoute(req, res, p, get, post, url) {
 
   if (action === "join") {
     const id = crypto.randomUUID();
-    g.members.set(id, { name: clean1(b.user, 40) || "Guest" });
+    g.members.set(id, { name: clean1(b.user, 40) || "Guest", avatar: cleanAvatar(b.avatar) });
+    if (g.members.get(id).avatar) g.avatarVersion++;
     broadcast(g);
     return send(res, 200, { member: id, state: groupState(g) });
+  }
+  if (action === "profile") {
+    if (!me) return send(res, 403, { error: "you're not in this group any more" });
+    const avatar = cleanAvatar(b.avatar);
+    if (isHost) g.hostAvatar = avatar; else me.avatar = avatar;
+    g.avatarVersion++;
+    broadcast(g);
+    return send(res, 200, { ok: true });
   }
   if (action === "leave") {
     if (g.members.delete(String(b.member || ""))) broadcast(g);
@@ -1278,6 +1305,7 @@ async function groupRoute(req, res, p, get, post, url) {
   }
   if (action === "settings") {
     if (typeof b.guestControl === "boolean") g.guestControl = b.guestControl;
+    if (typeof b.listed === "boolean") g.listed = b.listed;
     if (typeof b.name === "string" && b.name.trim()) g.name = clean1(b.name, 60);
     broadcast(g);
     return send(res, 200, { ok: true });
@@ -1310,7 +1338,7 @@ const rate = new Map(); // ip -> timestamps
 http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   const p = url.pathname, get = req.method === "GET", post = req.method === "POST";
-  if (p.startsWith("/api/group/") || p.startsWith("/api/videos/")) { // used by the custom Feishin
+  if (p.startsWith("/api/group/") || p.startsWith("/api/videos/") || p === "/api/requests" || p === "/api/status") { // used by the custom Feishin
     res.setHeader("access-control-allow-origin", "*");
     if (req.method === "OPTIONS") {
       res.writeHead(204, { "access-control-allow-methods": "GET, POST", "access-control-allow-headers": "content-type", "access-control-max-age": "86400" });
@@ -1512,6 +1540,7 @@ http.createServer(async (req, res) => {
     const type = ["song", "album", "artist"].includes(b.type) ? b.type : "song";
     if (q.length < 2) return send(res, 400, { error: `Enter ${type === "song" ? "a song" : type === "album" ? "an album" : "an artist"} name` });
     const item = { id: newId(), type, query: q, status: "pending", created: new Date().toISOString() };
+    if (b.by) item.by = String(b.by).slice(0, 40); // name of who asked (from Feishin)
     const link = q.match(SPOTIFY_LINK); // a pasted Spotify link decides the type by itself
     if (link) {
       item.type = link[1].toLowerCase() === "track" ? "song" : link[1].toLowerCase();

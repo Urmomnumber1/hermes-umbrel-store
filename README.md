@@ -37,6 +37,10 @@ Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbr
   remove their own songs; with **Let guests control playback** on they can also play/pause, skip, play now, play next
   and remove any song. The host can remove people. Hermes Music relays the state (`/api/group/...`, Server-Sent
   Events) and guests' controls; the host's Feishin carries them out. Groups live in memory.
+- Open groups are listed in Feishin's Group Play screen (`GET /api/group/list`; the host can hide theirs), and people can
+  add a profile picture (a 96px image, served at `/api/group/CODE/avatar?id=`).
+- The custom Feishin can send requests too (the + button: `POST /api/requests` with `by`), and shows "Your most played"
+  on Home from plays counted on that computer.
 - `/duplicate` lists copies of the same song (same artist, title and length) and keeps the best-quality one;
   `/duplicate confirm` (plus your PIN, if set) moves the extras to the hidden `.duplicates` folder in your music folder.
 - Songs already in the music folder are skipped: the app indexes the folder's tags on start and every 30 minutes.
