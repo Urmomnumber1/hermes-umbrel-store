@@ -1248,7 +1248,19 @@ setTimeout(() => {
 // year) when fewer than 3 are left. Songs people add play first; anyone votes to skip (half the listeners, counted
 // once per person), a room's owner or a booked DJ skips straight away.
 const groups = new Map();
-const clean1 = (v, n = 200) => String(v ?? "").slice(0, n);
+// cuts text to n characters without breaking an emoji in half (half an emoji shows as a broken box)
+const clean1 = (v, n = 200) => {
+  const str = String(v ?? "");
+  if (str.length <= n) return str;
+  const cut = str.slice(0, n), last = cut.charCodeAt(cut.length - 1);
+  return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+};
+// one whole emoji (family, flag, skin tone and "heart on fire" emoji are several code points)
+const oneEmoji = (v) => {
+  const str = String(v ?? "").trim().slice(0, 40);
+  for (const part of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(str)) return part.segment;
+  return "";
+};
 function newCode() {
   const abc = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   for (;;) {
@@ -1534,7 +1546,7 @@ async function groupRoute(req, res, p, get, post, url) {
   }
   if (action === "react") {
     if (!me) return send(res, 403, { error: "join the group first" });
-    const emoji = clean1(b.emoji, 8).trim();
+    const emoji = oneEmoji(b.emoji);
     if (!emoji) return send(res, 400, { error: "pick a reaction" });
     tell(g, "reaction", { by: me.name, profile: me.profile || null, emoji, at: nowMs() });
     return send(res, 200, { ok: true });
