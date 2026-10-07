@@ -51,6 +51,15 @@ Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbr
   presence (`/api/leaderboard`, `/api/song-of-the-day`, `/api/group-top`, `/api/milestones`, `/api/friend-group`); request
   upvotes and screenshot requests (`/api/requests/screenshot`, needs the Claude token); followed artists (`/api/follows`,
   `/follow`); synced lyrics from LRCLIB saved as `.lrc`; `/issues`, `/fix N`, `/upgrade N` for the library.
+- **3.1:** Sour Player profiles follow Navidrome accounts (`POST /api/profiles/navidrome`: the app sends its Navidrome
+  login token and Hermes Music checks it with Navidrome on the Umbrel, found by itself or set in Config; nothing is stored;
+  older duplicate profiles merge). Social extras: gifts, time capsules, song sticky notes, duels and the Hall of Fame,
+  the daily hot seat, play-this-next asks, an activity feed, duo stats, heatmaps, monthly eras, opt-in profile visits,
+  recap nights, a colour-of-the-day vote and a "sourness" score (data in `data/social.json`). Group Play: encore votes,
+  a soundboard, skip-the-line tokens, a request line, blind rounds, theme nights, room looks, a countdown start,
+  spectators, reactions pinned to moments and session summaries (`/api/group/scrapbook`). Library tools:
+  `/api/library/tags`, `/api/library/covers` + `/api/library/cover`, `/api/library/lyrics`, `/api/library/archive`
+  (moves songs to the hidden `.archive` folder, restorable) and mood bundles (`/api/requests/mood`).
 - `/duplicate` lists copies of the same song (same artist, title and length) and keeps the best-quality one;
   `/duplicate confirm` (plus your PIN, if set) moves the extras to the hidden `.duplicates` folder in your music folder.
 - Songs already in the music folder are skipped: the app indexes the folder's tags on start and every 30 minutes.
