@@ -78,6 +78,11 @@ input::placeholder{color:var(--mut)}
 .row small{display:block}
 .sub2{margin:6px 0 4px;color:var(--mut);font-size:.78rem;max-width:60em}
 .grp{margin:20px 0 2px;color:var(--hi);font-weight:700;letter-spacing:.04em}
+.ulist{flex:1;min-width:0}
+.urow{display:flex;align-items:center;gap:10px;padding:4px 0}
+.urow span{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.urow small{color:var(--mut)}
+.urow .btn{margin:0;padding:3px 10px}
 input[type=text],input[type=password]{width:24em;max-width:100%}
 select,input[type=number],input[type=text],input[type=password]{background:transparent;color:var(--fg);border:1px solid var(--bd);border-radius:4px;padding:5px 8px;font:inherit}
 select option{background:#02080d}
@@ -144,7 +149,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             <div id="sess">Session: -</div>
           </div>
           <div class="rt">
-            <h2>Hermes Music v3.1.0</h2>
+            <h2>Hermes Music v3.2.0</h2>
             <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
             <div class="sec"><span class="k">&#9662; Workers</span><br><span id="w-worker" class="d">-</span></div>
             <div class="sec"><span class="k">&#9662; Library</span><br><span class="d" id="w-lib">-</span></div>
@@ -408,6 +413,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
       <p class="sub2">Sour Player profiles are tied to Navidrome accounts: signing in to Navidrome in Sour Player is all it takes, on every computer. Hermes Music finds Navidrome on this Umbrel by itself; type its address only if the test can&#39;t.</p>
       <div class="row"><label for="c-ndurl">Navidrome address<small>blank = find it automatically</small></label><input type="text" id="c-ndurl" spellcheck="false" autocomplete="off" placeholder="automatic"></div>
       <div class="row"><label>Connection<small>save first, then test</small></label><button class="btn" id="c-ndtest" style="margin:0">Test</button><span id="ndmsg" class="sub2" style="margin:0"></span></div>
+      <div class="row" style="align-items:flex-start"><label>People<small>remove someone from Sour Player (needs the Current PIN below if one is set)</small></label><div id="sourusers" class="ulist">loading...</div></div>
 
       <div class="grp">&#9662; Queue</div>
       <div class="row"><label for="c-paused">Pause requests<small>worker skips the queue</small></label><input type="checkbox" id="c-paused"></div>
@@ -724,7 +730,7 @@ function tab(name) {
   $("title").textContent = view === "req" ? "Requests" : "Config";
   document.querySelectorAll("nav a").forEach((a) => a.classList.toggle("on", a.dataset.tab === name));
   const body = document.querySelector(".body");
-  if (view === "cfg") { if (cfg) fillCfg(); body.scrollTop = 0; }
+  if (view === "cfg") { if (cfg) fillCfg(); loadSourUsers(); body.scrollTop = 0; }
   else if (name === "help") body.scrollTop = $("help").offsetTop - 60;
   else { firstRender = true; render(); }
 }
@@ -773,6 +779,33 @@ $("c-dtpair").onclick = async () => {
     fillCfg(); m.style.color = "#4ade80"; m.textContent = "paired with Downtify";
   } catch (e) { m.style.color = "#f87171"; m.textContent = e.message; }
 };
+// Sour Player people (config): remove someone for good
+async function loadSourUsers() {
+  const box = $("sourusers");
+  try {
+    const list = DEMO ? [{ id: "a1", name: "Anjalo", account: "anjalo", lastSeen: Date.now() }, { id: "b2", name: "Listener", account: null, lastSeen: Date.now() - 86400000 * 9 }]
+      : await api("api/config/sour-users");
+    box.textContent = list.length ? "" : "nobody uses Sour Player yet";
+    for (const u of list) {
+      const row = document.createElement("div"); row.className = "urow";
+      const who = document.createElement("span"); who.textContent = u.name + " ";
+      const info = document.createElement("small");
+      const days = u.lastSeen ? Math.floor((Date.now() - u.lastSeen) / 86400000) : null;
+      info.textContent = [u.account ? "Navidrome: " + u.account : "no Navidrome account", days === null ? "" : days < 1 ? "seen today" : "seen " + days + "d ago"].filter(Boolean).join(" · ");
+      who.appendChild(info);
+      const del = document.createElement("button"); del.className = "btn"; del.textContent = "Remove";
+      del.onclick = async () => {
+        if (!confirm("Remove " + u.name + " from Sour Player?\n\nTheir profile, pictures and listening stats are deleted for good. If they sign in to Sour Player again they start with a new, empty profile.")) return;
+        del.disabled = true;
+        try {
+          if (!DEMO) await api("api/config/sour-users/delete", { method: "POST", body: JSON.stringify({ id: u.id, currentPin: $("c-cur").value }) });
+          row.remove();
+        } catch (e) { del.disabled = false; alert(e.message); }
+      };
+      row.append(who, del); box.appendChild(row);
+    }
+  } catch (e) { box.textContent = e.message; }
+}
 $("c-ndtest").onclick = async () => {
   const m = $("ndmsg"); m.style.color = ""; m.textContent = "looking for Navidrome...";
   try { const r = DEMO ? { ok: true, message: "found Navidrome" } : await (await fetch("api/navidrome/test")).json(); m.style.color = r.ok ? "#4ade80" : "#f87171"; m.textContent = r.message; }

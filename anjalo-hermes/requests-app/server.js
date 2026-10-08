@@ -1954,8 +1954,17 @@ const dayKey = (t = Date.now()) => new Date(t).toISOString().slice(0, 10);
 const keyHashes = (p) => p.keyHashes || (p.keyHash ? [p.keyHash] : []);
 // Fonts only some people may use (for their name and their playlists). Hermes Music tells only those
 // profiles about them and refuses them for everyone else. Anjalo's: the Determination font.
-const PERKS = { determination: ["05b2befa-218"] };
+// "admin" isn't a font: it lets that profile fix friends' profiles (name, bio, pictures...) from Sour Player.
+const PERKS = { determination: ["05b2befa-218"], admin: ["05b2befa-218"] };
 const perksOf = (id) => Object.keys(PERKS).filter((k) => PERKS[k].includes(id));
+// removes a Sour Player profile for good (and the old profiles merged into it), with its pictures
+function deleteProfile(id) {
+  if (!profiles[id]) return false;
+  for (const x of Object.values(profiles)) if (x.mergedInto === id) deleteProfile(x.id);
+  try { for (const f of fs.readdirSync(SOUR_DIR)) if (f.startsWith(`${id}-`)) fs.rmSync(path.join(SOUR_DIR, f), { force: true }); } catch {}
+  delete profiles[id];
+  return true;
+}
 const ownProfile = (id, key) => { const p = profiles[id]; return p && !p.mergedInto && key && keyHashes(p).includes(hashKey(key)) ? p : null; };
 const privacy = (p) => (p.custom && p.custom.privacy) || {};
 const isInvisible = (p) => !!(p.custom && p.custom.invisible);
@@ -2532,12 +2541,19 @@ async function sourRoute(req, res, p, get, post, url) {
     }
     return send(res, 200, { artist: artist.name, deezerId: artist.id });
   }
-  if ((m = p.match(/^\/api\/profiles\/([\w-]{1,40})(?:\/(avatar|banner|background|image|me|wall|nickname|ping|inbox|link|stats))?$/))) {
+  if ((m = p.match(/^\/api\/profiles\/([\w-]{1,40})(?:\/(avatar|banner|background|image|me|wall|nickname|ping|inbox|link|stats|added))?$/))) {
     const prof = profiles[m[1]];
     if (!prof) return send(res, 404, { error: "no such profile" });
     const sub = m[2] || "";
     if (get && ["avatar", "banner", "background"].includes(sub)) return sendImage(res, `${prof.id}-${sub}`, prof[sub]);
     if (get && sub === "stats") return privacy(prof).hideStats || privacy(prof).private ? send(res, 403, { error: "hidden" }) : send(res, 200, profileStats(prof));
+    if (get && sub === "added") { // what they had Hermes Music add to the library (for their profile)
+      if (privacy(prof).hideStats || privacy(prof).private) return send(res, 403, { error: "hidden" });
+      const month = new Date().toISOString().slice(0, 7);
+      const theirs = items.filter((i) => !i.parent && i.profile === prof.id && i.status === "done");
+      return send(res, 200, { total: theirs.length, month: theirs.filter((i) => String(i.created || "").startsWith(month)).length,
+        items: theirs.slice(-8).reverse().map((i) => ({ type: i.type || "song", title: i.title || i.query || "", artist: i.artist || "", created: i.created || null })) });
+    }
     if (get && !sub) return send(res, 200, publicProfile(prof));
     if (!post) return send(res, 404, { error: "not found" });
     const b = await readBody(req, 9000000); // pictures can be a few MB (GIFs)
@@ -2568,8 +2584,13 @@ async function sourRoute(req, res, p, get, post, url) {
       saveProfiles();
       return send(res, 200, publicProfile(prof));
     }
-    if (!ownProfile(prof.id, b.key)) return send(res, 403, { error: "that isn't your profile" });
-    if (sub === "me") return send(res, 200, publicProfile(prof, true));
+    // the owner, or an admin helping a friend (signed with the admin's own profile in `as`): admins can
+    // change the profile and its pictures, but not sign in as them or read their inbox
+    const owner = ownProfile(prof.id, b.key);
+    const helper = !owner && b.as && perksOf(String(b.as)).includes("admin") ? ownProfile(String(b.as), b.key) : null;
+    if (!owner && !(helper && ["", "me", "image"].includes(sub))) return send(res, 403, { error: "that isn't your profile" });
+    const mine = () => (helper ? { ...publicProfile(prof, true), visits: [], resume: null } : publicProfile(prof, true));
+    if (sub === "me") return send(res, 200, mine());
     if (sub === "inbox") { // pings and new wall notes since you last looked
       const since = Number(b.since) || 0;
       const out = { pings: prof.pings || [], notes: (prof.wall || []).filter((n) => n.at > since && n.from !== prof.id) };
@@ -2597,7 +2618,7 @@ async function sourRoute(req, res, p, get, post, url) {
         if (cur && fs.existsSync(tmp)) { fs.renameSync(tmp, path.join(SOUR_DIR, `${prof.id}-avatar-${cur.v}.${cur.ext}`)); prof.avatarHistory.unshift(cur); }
         prof.avatar = { ext: old.ext, v: Date.now() };
         saveProfiles();
-        return send(res, 200, publicProfile(prof, true));
+        return send(res, 200, mine());
       }
       const img = b.data ? decodeImage(b.data, IMAGE_KINDS[kind]) : null;
       if (b.data && !img) return send(res, 400, { error: `pictures must be PNG, JPEG, WebP or GIF, up to ${IMAGE_KINDS[kind] / 1000000} MB` });
@@ -2613,7 +2634,7 @@ async function sourRoute(req, res, p, get, post, url) {
       }
       prof[kind] = storeImage(`${prof.id}-${kind}`, img, prof[kind]);
       saveProfiles();
-      return send(res, 200, publicProfile(prof, true));
+      return send(res, 200, mine());
     }
     if (typeof b.name === "string" && b.name.trim()) prof.name = clean1(b.name, 40).trim();
     if (typeof b.bio === "string") prof.bio = clean1(b.bio, 500);
@@ -2628,7 +2649,7 @@ async function sourRoute(req, res, p, get, post, url) {
       prof.custom = custom || {};
     }
     saveProfiles();
-    return send(res, 200, publicProfile(prof, true));
+    return send(res, 200, mine());
   }
   if ((m = p.match(/^\/api\/playlist-themes\/([\w-]{1,80})(\/image)?$/))) { // a playlist's look, shared by everyone
     const id = m[1], t = playlistThemes[id];
@@ -3049,6 +3070,20 @@ http.createServer(async (req, res) => {
       const how = config.downtifyToken ? "paired" : dt.noAuth ? "no sign-in needed" : "logged in";
       return send(res, 200, { ok: true, message: `connected to Downtify (${how})${fs.existsSync(DOWNTIFY_DIR) ? "" : " - but its download folder isn't mounted"}` });
     } catch (e) { return send(res, 200, { ok: false, message: e.message }); }
+  }
+  if (get && p === "/api/config/sour-users") { // Sour Player profiles, for removing someone in the config page
+    return send(res, 200, visibleProfiles().map((x) => ({ id: x.id, name: x.name, account: x.navidrome || null, created: x.created || null, lastSeen: x.lastSeen || null }))
+      .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0)));
+  }
+  if (post && p === "/api/config/sour-users/delete") {
+    const b = await readBody(req);
+    if (config.pin && String(b.currentPin || "") !== config.pin) return send(res, 403, { error: "wrong PIN (enter it in Current PIN first)" });
+    const prof = profiles[String(b.id || "")];
+    if (!prof || prof.mergedInto) return send(res, 404, { error: "that profile is already gone" });
+    deleteProfile(prof.id);
+    saveProfiles();
+    console.log(`Sour Player profile removed: ${prof.name}${prof.navidrome ? ` (${prof.navidrome})` : ""}`);
+    return send(res, 200, { removed: prof.name });
   }
   if (post && p === "/api/config") {
     const err = updateConfig(await readBody(req));

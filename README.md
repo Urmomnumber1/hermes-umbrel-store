@@ -60,6 +60,10 @@ Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbr
   spectators, reactions pinned to moments and session summaries (`/api/group/scrapbook`). Library tools:
   `/api/library/tags`, `/api/library/covers` + `/api/library/cover`, `/api/library/lyrics`, `/api/library/archive`
   (moves songs to the hidden `.archive` folder, restorable) and mood bundles (`/api/requests/mood`).
+- **3.2:** Config lists everyone using Sour Player and can remove someone for good (profile, pictures and stats;
+  `GET /api/config/sour-users`, `POST /api/config/sour-users/delete`, PIN-protected). Profiles show what each person
+  added to the library (`GET /api/profiles/:id/added`). The `admin` perk lets a profile fix friends' profiles from
+  Sour Player (name, bio, pictures; sent with `as` = the admin's profile), but not sign in as them or read their inbox.
 - `/duplicate` lists copies of the same song (same artist, title and length) and keeps the best-quality one;
   `/duplicate confirm` (plus your PIN, if set) moves the extras to the hidden `.duplicates` folder in your music folder.
 - Songs already in the music folder are skipped: the app indexes the folder's tags on start and every 30 minutes.
