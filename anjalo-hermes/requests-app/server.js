@@ -719,6 +719,32 @@ function karaokeFile(artist, title) {
   const file = name && path.join(KARAOKE_DIR, name);
   return file && fs.existsSync(file) ? file : null;
 }
+// Instrumentals are often mastered louder than the album version. Both are measured once (integrated
+// loudness, LUFS) and Sour Player plays the instrumental that much quieter (or louder) so they match.
+const KARAOKE_GAIN = "/data/karaoke-gain.json";
+const karaokeGains = readJsonEarly(KARAOKE_GAIN);
+async function loudness(file) {
+  const r = await run("ffmpeg", ["-hide_banner", "-nostats", "-i", file, "-map", "0:a:0", "-af", "ebur128=framelog=quiet", "-f", "null", "-"], { timeout: 120000 });
+  const m = [...String(r.err).matchAll(/I:\s*(-?\d+(?:\.\d+)?)\s*LUFS/g)].pop(); // the summary comes last
+  const v = m ? Number(m[1]) : NaN;
+  return Number.isFinite(v) && v > -70 ? v : null;
+}
+async function karaokeGain(artist, title, file) {
+  const key = karaokeKey(artist, title);
+  if (typeof karaokeGains[key] === "number") return karaokeGains[key];
+  let gain = 1;
+  try {
+    const original = findInLibrary(`${artist} - ${plainSongTitle(title)}`)[0];
+    if (original && fs.existsSync(original.file)) {
+      const [song, backing] = await Promise.all([loudness(original.file), loudness(file)]);
+      if (song !== null && backing !== null) gain = Math.min(2, Math.max(0.25, Math.pow(10, (song - backing) / 20)));
+      else return 1; // couldn't measure now: try again next time
+    } else return 1;
+  } catch { return 1; }
+  karaokeGains[key] = Math.round(gain * 1000) / 1000;
+  fs.writeFileSync(KARAOKE_GAIN, JSON.stringify(karaokeGains));
+  return karaokeGains[key];
+}
 function destFor(meta, ext) {
   if (meta.karaoke) return { dir: KARAOKE_DIR, dest: path.join(KARAOKE_DIR, `${clean(meta.artist)} - ${clean(meta.title)}.${ext}`) };
   const artist = clean(meta.artist), title = clean(meta.title);
@@ -2819,8 +2845,11 @@ async function sourRoute(req, res, p, get, post, url) {
   if (get && p === "/api/playlist-themes") { // every themed playlist (the Sour Stage uses a playlist's picture as its backdrop)
     return send(res, 200, Object.entries(playlistThemes).map(([id, t]) => ({ id, color: t.color || null, image: t.image ? t.image.v : 0 })));
   }
-  if (get && p === "/api/karaoke") { // is there an instrumental for this song?
-    return send(res, 200, { available: !!karaokeFile(url.searchParams.get("artist"), url.searchParams.get("title")) });
+  if (get && p === "/api/karaoke") { // is there an instrumental for this song? (and how loud to play it)
+    const artist = url.searchParams.get("artist"), title = url.searchParams.get("title");
+    const file = karaokeFile(artist, title);
+    if (!file) return send(res, 200, { available: false });
+    return send(res, 200, { available: true, gain: await karaokeGain(artist, title, file) });
   }
   if (get && p === "/api/karaoke/file") { // the instrumental itself (with seeking)
     const file = karaokeFile(url.searchParams.get("artist"), url.searchParams.get("title"));
