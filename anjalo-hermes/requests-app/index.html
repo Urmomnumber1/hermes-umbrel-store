@@ -152,7 +152,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             <div id="sess">Session: -</div>
           </div>
           <div class="rt">
-            <h2>Hermes Music v3.3.1</h2>
+            <h2>Hermes Music v3.4.0</h2>
             <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
             <div class="sec"><span class="k">&#9662; Workers</span><br><span id="w-worker" class="d">-</span></div>
             <div class="sec"><span class="k">&#9662; Library</span><br><span class="d" id="w-lib">-</span></div>
@@ -420,7 +420,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
       <p class="sub2">Sour Player profiles are tied to Navidrome accounts: signing in to Navidrome in Sour Player is all it takes, on every computer. Hermes Music finds Navidrome on this Umbrel by itself; type its address only if the test can&#39;t.</p>
       <div class="row"><label for="c-ndurl">Navidrome address<small>blank = find it automatically</small></label><input type="text" id="c-ndurl" spellcheck="false" autocomplete="off" placeholder="automatic"></div>
       <div class="row"><label>Connection<small>save first, then test</small></label><button class="btn" id="c-ndtest" style="margin:0">Test</button><span id="ndmsg" class="sub2" style="margin:0"></span></div>
-      <div class="row" style="align-items:flex-start"><label>People<small>remove someone from Sour Player (needs the Current PIN below if one is set)</small></label><div id="sourusers" class="ulist">loading...</div></div>
+      <div class="row" style="align-items:flex-start"><label>People<small>make someone an admin (Navidrome admins already are) or remove them from Sour Player; needs the Current PIN below if one is set</small></label><div id="sourusers" class="ulist">loading...</div></div>
 
       <div class="grp">&#9662; Queue</div>
       <div class="row"><label for="c-paused">Pause requests<small>worker skips the queue</small></label><input type="checkbox" id="c-paused"></div>
@@ -825,6 +825,13 @@ async function loadSourUsers() {
       const days = u.lastSeen ? Math.floor((Date.now() - u.lastSeen) / 86400000) : null;
       info.textContent = [u.account ? "Navidrome: " + u.account : "no Navidrome account", days === null ? "" : days < 1 ? "seen today" : "seen " + days + "d ago"].filter(Boolean).join(" · ");
       who.appendChild(info);
+      if (u.admin) info.textContent += " \u00b7 admin" + (u.navidromeAdmin ? " (Navidrome)" : "");
+      const adm = document.createElement("button"); adm.className = "btn"; adm.textContent = u.admin && !u.navidromeAdmin ? "Remove admin" : "Make admin";
+      adm.style.display = u.navidromeAdmin ? "none" : "";
+      adm.onclick = async () => {
+        try { if (!DEMO) await api("api/config/sour-users/admin", { method: "POST", body: JSON.stringify({ id: u.id, admin: !u.admin, currentPin: $("c-cur").value }) }); loadSourUsers(); }
+        catch (e) { alert(e.message); }
+      };
       const del = document.createElement("button"); del.className = "btn"; del.textContent = "Remove";
       del.onclick = async () => {
         if (!confirm("Remove " + u.name + " from Sour Player?\n\nTheir profile, pictures and listening stats are deleted for good. If they sign in to Sour Player again they start with a new, empty profile.")) return;
@@ -834,7 +841,7 @@ async function loadSourUsers() {
           row.remove();
         } catch (e) { del.disabled = false; alert(e.message); }
       };
-      row.append(who, del); box.appendChild(row);
+      row.append(who, adm, del); box.appendChild(row);
     }
   } catch (e) { box.textContent = e.message; }
 }

@@ -707,7 +707,20 @@ function tagArgs(src, cover, out, fmt, tags) {
   return a;
 }
 // Where a song goes in the library.
+// Instrumentals (from /karaoke) live in a hidden folder Navidrome doesn't scan, so they never show up as
+// songs: only Sour Player's karaoke mode plays them (streamed from here, in step with the real song).
+const KARAOKE_DIR = path.join(MUSIC, ".karaoke"), KARAOKE_LIST = "/data/karaoke.json";
+let karaoke = readJsonEarly(KARAOKE_LIST);
+function readJsonEarly(file) { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return {}; } }
+const plainSongTitle = (t) => String(t || "").replace(/\s*[([](instrumental|karaoke|off vocal)[^)\]]*[)\]]/i, "").trim();
+const karaokeKey = (artist, title) => songKey(artist, plainSongTitle(title));
+function karaokeFile(artist, title) {
+  const name = karaoke[karaokeKey(artist, title)];
+  const file = name && path.join(KARAOKE_DIR, name);
+  return file && fs.existsSync(file) ? file : null;
+}
 function destFor(meta, ext) {
+  if (meta.karaoke) return { dir: KARAOKE_DIR, dest: path.join(KARAOKE_DIR, `${clean(meta.artist)} - ${clean(meta.title)}.${ext}`) };
   const artist = clean(meta.artist), title = clean(meta.title);
   const albumArtist = clean(meta.albumArtist || artist), album = clean(meta.album);
   const dir = config.artistFolders ? path.join(MUSIC, albumArtist, ...(album ? [album] : [])) : MUSIC;
@@ -738,9 +751,14 @@ async function finishSong(raw, ext, meta, thumb) {
   fs.mkdirSync(dir, { recursive: true });
   fs.copyFileSync(file, dest, fs.constants.COPYFILE_EXCL); // /music is a different disk mount, so copy (never overwrite)
   fs.rmSync(ST(), { recursive: true, force: true });
+  console.log("added", dest);
+  if (meta.karaoke) { // not a library song: remembered for karaoke only
+    karaoke[karaokeKey(artist, title)] = path.basename(dest);
+    fs.writeFileSync(KARAOKE_LIST, JSON.stringify(karaoke));
+    return null;
+  }
   library.keys.add(songKey(artist, title));
   library.keys.add(songKey(albumArtist, title));
-  console.log("added", dest);
   saveLyrics(dest, meta).catch(() => {}); // in the background; a song without lyrics is fine
   return null;
 }
@@ -1000,8 +1018,8 @@ async function processKaraoke(item) {
   }
   const plainTitle = String(base.title).replace(/\s*[([](instrumental|karaoke)[^)\]]*[)\]]/i, "").trim();
   const title = `${plainTitle} (Instrumental)`;
-  if (inLibrary(base.artist, title) || inLibrary(base.artist, `${plainTitle} (Karaoke)`))
-    return { status: "done", artist: base.artist, title, note: "already in the library" };
+  if (karaokeFile(base.artist, plainTitle))
+    return { status: "done", artist: base.artist, title, note: "already there - pick Karaoke in Sour Player's Stage" };
   const first = String(base.artist).split(", ")[0], t = norm(plainTitle), a = norm(first);
   let best = null;
   for (const q of [`${first} ${plainTitle} instrumental`, `${first} ${plainTitle} karaoke`, `${plainTitle} instrumental`]) {
@@ -1018,9 +1036,11 @@ async function processKaraoke(item) {
     if (best && best.s >= 30) break;
   }
   if (!best || best.s < -10) return { status: "failed", artist: base.artist, title, note: "no instrumental or karaoke version found on YouTube" };
-  const meta = { ...base, title, album: base.album ? `${cleanAlbum(base.album)} (Instrumentals)` : "Instrumentals",
+  const meta = { ...base, title, karaoke: true, album: base.album ? `${cleanAlbum(base.album)} (Instrumentals)` : "Instrumentals",
     albumArtist: base.albumArtist || first, releaseType: base.album ? base.releaseType || "album" : "single", seconds: best.seconds };
-  return songDone(meta, await saveSong(best.id, meta));
+  const skipped = await saveSong(best.id, meta);
+  if (skipped) { karaoke[karaokeKey(base.artist, plainTitle)] = path.basename(destFor(meta, config.audioFormat).dest); fs.writeFileSync(KARAOKE_LIST, JSON.stringify(karaoke)); }
+  return { status: "done", artist: base.artist, title, note: "ready - pick Karaoke in Sour Player's Stage while the song plays" };
 }
 function insertChildren(parent, kids) {
   const at = items.indexOf(parent) + 1 + items.filter((k) => k.parent === parent.id).length;
@@ -2065,7 +2085,8 @@ const keyHashes = (p) => p.keyHashes || (p.keyHash ? [p.keyHash] : []);
 // Determination font (for their name, playlists and the app), the Soul visualizer, fixing friends' profiles
 // from Sour Player, and a royal blue name. Hermes Music tells only those profiles and refuses them for others.
 const PERKS = { determination: true, admin: true };
-const perksOf = (id) => (profiles[id] && !profiles[id].mergedInto && profiles[id].admin ? Object.keys(PERKS) : []);
+const isAdmin = (p) => !!p && !p.mergedInto && !!(p.admin || p.adminManual);
+const perksOf = (id) => (isAdmin(profiles[id]) ? Object.keys(PERKS) : []);
 // removes a Sour Player profile for good (and the old profiles merged into it), with its pictures
 function deleteProfile(id) {
   if (!profiles[id]) return false;
@@ -2145,7 +2166,7 @@ function publicProfile(p, self = false) {
     custom: hidden ? { privacy: { private: true } } : p.custom || {},
     wall: hidden ? [] : (p.wall || []).slice(0, 30), nicknames: hidden ? [] : (p.nicknames || []).slice(0, 20),
     away: !online ? p.away || "" : "",
-    admin: !!p.admin && !p.mergedInto,
+    admin: isAdmin(p),
   };
   if (!hidden && !priv.hideStats) out.stats = profileStats(p);
   if (self) Object.assign(out, { account: p.navidrome || null, visits: p.custom && p.custom.visits ? p.visits || [] : [], avatarHistory: (p.avatarHistory || []).map((h) => h.v), resume: p.lastPlayback || null, perks: perksOf(p.id) });
@@ -2795,6 +2816,27 @@ async function sourRoute(req, res, p, get, post, url) {
     saveProfiles();
     return send(res, 200, mine());
   }
+  if (get && p === "/api/playlist-themes") { // every themed playlist (the Sour Stage uses a playlist's picture as its backdrop)
+    return send(res, 200, Object.entries(playlistThemes).map(([id, t]) => ({ id, color: t.color || null, image: t.image ? t.image.v : 0 })));
+  }
+  if (get && p === "/api/karaoke") { // is there an instrumental for this song?
+    return send(res, 200, { available: !!karaokeFile(url.searchParams.get("artist"), url.searchParams.get("title")) });
+  }
+  if (get && p === "/api/karaoke/file") { // the instrumental itself (with seeking)
+    const file = karaokeFile(url.searchParams.get("artist"), url.searchParams.get("title"));
+    if (!file) return send(res, 404, { error: "no instrumental for that song" });
+    const size = fs.statSync(file).size, range = String(req.headers.range || "").match(/bytes=(\d*)-(\d*)/);
+    const type = { mp3: "audio/mpeg", m4a: "audio/mp4", opus: "audio/ogg", ogg: "audio/ogg", flac: "audio/flac", wav: "audio/wav", aac: "audio/aac" }[path.extname(file).slice(1).toLowerCase()] || "application/octet-stream";
+    const head = { "content-type": type, "accept-ranges": "bytes", "access-control-allow-origin": "*", "cache-control": "private, max-age=3600" };
+    if (range && (range[1] || range[2])) {
+      const start = range[1] ? Math.min(Number(range[1]), size - 1) : Math.max(0, size - Number(range[2]));
+      const end = range[1] && range[2] ? Math.min(Number(range[2]), size - 1) : size - 1;
+      res.writeHead(206, { ...head, "content-range": `bytes ${start}-${end}/${size}`, "content-length": end - start + 1 });
+      return fs.createReadStream(file, { start, end }).pipe(res);
+    }
+    res.writeHead(200, { ...head, "content-length": size });
+    return fs.createReadStream(file).pipe(res);
+  }
   if ((m = p.match(/^\/api\/playlist-themes\/([\w-]{1,80})(\/image)?$/))) { // a playlist's look, shared by everyone
     const id = m[1], t = playlistThemes[id];
     if (get && m[2]) return sendImage(res, `playlist-${id}`, t && t.image);
@@ -2911,7 +2953,7 @@ http.createServer(async (req, res) => {
   const p = url.pathname, get = req.method === "GET", post = req.method === "POST";
   const SOUR_ROUTES = ["/api/presence", "/api/leaderboard", "/api/song-of-the-day", "/api/group-top", "/api/milestones", "/api/follows"];
   const SOUR_PREFIXES = ["/api/profiles", "/api/playlist-themes", "/api/friend-group", "/api/activity", "/api/gifts", "/api/capsules", "/api/song-notes",
-    "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/"];
+    "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke"];
   const isSour = SOUR_PREFIXES.some((x) => p.startsWith(x)) || SOUR_ROUTES.includes(p);
   if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/requests") || p.startsWith("/api/library") || p.startsWith("/api/duplicates") || isSour
     || ["/api/status", "/api/now", "/api/bump"].includes(p)) { // used by Sour Player (the custom Feishin)
@@ -3216,8 +3258,18 @@ http.createServer(async (req, res) => {
     } catch (e) { return send(res, 200, { ok: false, message: e.message }); }
   }
   if (get && p === "/api/config/sour-users") { // Sour Player profiles, for removing someone in the config page
-    return send(res, 200, visibleProfiles().map((x) => ({ id: x.id, name: x.name, account: x.navidrome || null, created: x.created || null, lastSeen: x.lastSeen || null }))
+    return send(res, 200, visibleProfiles().map((x) => ({ id: x.id, name: x.name, account: x.navidrome || null, created: x.created || null, lastSeen: x.lastSeen || null,
+      admin: isAdmin(x), navidromeAdmin: !!x.admin }))
       .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0)));
+  }
+  if (post && p === "/api/config/sour-users/admin") { // make someone a Sour Player admin by hand (or take it back)
+    const b = await readBody(req);
+    if (config.pin && String(b.currentPin || "") !== config.pin) return send(res, 403, { error: "wrong PIN (enter it in Current PIN first)" });
+    const prof = profiles[String(b.id || "")];
+    if (!prof || prof.mergedInto) return send(res, 404, { error: "no such profile" });
+    prof.adminManual = !!b.admin;
+    saveProfiles();
+    return send(res, 200, { admin: isAdmin(prof) });
   }
   if (post && p === "/api/config/sour-users/delete") {
     const b = await readBody(req);
