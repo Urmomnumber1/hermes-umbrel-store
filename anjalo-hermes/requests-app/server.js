@@ -641,7 +641,7 @@ If none match, reply {"error":"short reason"}.` },
 // Album/artist tracks: we already know the exact song and its length, so match without AI.
 async function findVideo(meta) {
   const first = meta.artist.split(", ")[0]; // Spotify lists every artist; search with the main one
-  for (const q of [`${first} ${meta.title}`, `${first} ${meta.title} audio`]) { // second search if the first finds nothing good
+  for (const q of [`${first} ${meta.title}`, `${first} ${meta.title} audio`, `${meta.title} ${first} official`]) { // more searches if the first finds nothing good
     const id = await bestVideo(await ytSearch(q), meta, first);
     if (id) return id;
   }
@@ -652,7 +652,9 @@ function bestVideo(results, meta, artist) {
   let best = null;
   for (const v of results) {
     const vt = norm(v.title), ch = norm(v.channel);
-    if (!vt.includes(t)) continue;
+    // the title, or (for longer titles) most of its words: uploads often spell titles a little differently
+    const tw = t.split(" ").filter(Boolean), vw = new Set(vt.split(" "));
+    if (!vt.includes(t) && (tw.length < 2 || tw.filter((w) => vw.has(w)).length / tw.length < 0.75)) continue;
     let s = 0;
     if (!wantVersion && VERSION.test(v.title.replace(/remaster(ed)?/i, ""))) s -= 60;
     if (/ - topic$/i.test(v.channel)) s += 25;
@@ -905,13 +907,104 @@ async function processSong(item) {
     if (!r.error && !/^[\w-]{11}$/.test(r.video_id || "")) throw new Error(`bad video id '${r.video_id}'`);
     if (!r.error && (!clean(r.artist) || !clean(r.title))) throw new Error("missing artist/title");
   } catch (e) {
-    return withBackup(async () => { throw e; }, null, item.query);
+    return askOrBackup(item, e.message.split("\n")[0].slice(0, 200));
   }
-  if (r.error) return withBackup(async () => null, null, item.query, String(r.error).slice(0, 200));
+  if (r.error) return askOrBackup(item, String(r.error).slice(0, 200));
   meta = await enrich({ title: r.title, artist: r.artist }); // album tags from iTunes, then Deezer
   if (inLibrary(meta.artist, meta.title) || inLibrary(meta.albumArtist, meta.title))
     return { status: "done", artist: meta.artist, title: meta.title, note: "already in the library" };
-  return withBackup(async () => songDone(meta, await saveSong(r.video_id, meta)), meta, item.query);
+  return withBackup(async () => {
+    try {
+      return songDone(meta, await saveSong(r.video_id, meta));
+    } catch (e) { // that video wouldn't download (removed, blocked...): try another upload of the same song
+      const other = await findVideo(meta).catch(() => null);
+      if (other && other !== r.video_id) return songDone(meta, await saveSong(other, meta));
+      throw e;
+    }
+  }, meta, item.query);
+}
+
+// ---------- "Is this the song?" ----------
+// When nobody is sure which song a request means (the AI gave up or couldn't find it), Hermes Music looks the
+// words up in iTunes and Deezer. A clear match downloads straight away; otherwise it asks whoever requested
+// it, one candidate at a time ("Is this the song? Hotel - Toby Fox").
+async function catalogCandidates(query) {
+  const found = new Map();
+  // both catalogues list their best matches first (Deezer by popularity): earlier results get a small head start
+  const add = (m, i) => {
+    const k = songKey(m.artist, m.title);
+    if (m.title && m.artist && !found.has(k)) found.set(k, { ...m, early: 0.4 * (1 - i / 8) });
+  };
+  const SKIP = /\b(karaoke|tribute|best of|greatest hits|now that)\b/i; // soundtracks are fine (game and film music)
+  try { (await itunes("search", { term: query, entity: "song", limit: 8 })).forEach((r, i) => { if (!SKIP.test(r.collectionName || "")) add(trackMeta(r), i); }); } catch {}
+  try {
+    ((await deezer(`search/track?limit=8&q=${encodeURIComponent(query)}`)).data || []).forEach((t, i) => {
+      if (SKIP.test(t.album?.title || "")) return;
+      add({ title: unremaster(t.title), artist: t.artist?.name || "", album: unremaster(t.album?.title || ""), seconds: Number(t.duration) || 0,
+        cover: t.album?.cover_xl || t.album?.cover_big || "", lookup: true }, i);
+    });
+  } catch {}
+  const q = norm(query), words = new Set(q.split(" ")), dash = String(query).match(/^(.+?)\s+-\s+(.+)$/);
+  const COVERISH = /\b(piano|lofi|lo fi|cover|covers|tribute|8 ?bit|music box|arranged|arrangement|orchestral|acoustic|karaoke|instrumental|remix|version|sped|slowed|nightcore)\b/i;
+  const score = (m) => {
+    const t = norm(m.title), a = norm(m.artist), tw = t.split(" ");
+    let s = tw.filter((w) => words.has(w)).length / Math.max(1, tw.length) + m.early;
+    if (t && q.includes(t)) s += 3;
+    if (a && (q.includes(a) || q.includes(primaryArtist(m.artist)))) s += 3;
+    if (dash && ((norm(dash[2]) === t && norm(dash[1]) === a) || (norm(dash[1]) === t && norm(dash[2]) === a))) s += 2;
+    // "hotel undertale": the words that aren't the title often name the album (or the game)
+    if (norm(m.album || "").split(" ").some((w) => w.length > 3 && words.has(w) && !tw.includes(w))) s += 1.5;
+    if (COVERISH.test(`${m.title} ${m.album || ""} ${m.artist}`) && !COVERISH.test(query)) s -= 1.5;
+    return s;
+  };
+  return [...found.values()].map(({ early, ...m }) => ({ ...m, score: score({ ...m, early }) })).sort((x, y) => y.score - x.score).slice(0, 6);
+}
+async function askOrBackup(item, why) {
+  const candidates = await catalogCandidates(item.query).catch(() => []);
+  // title and artist both in the request (and nothing else as good): no need to ask
+  if (candidates[0] && candidates[0].score >= 6.5 && !(candidates[1] && candidates[1].score >= candidates[0].score)) {
+    const { score, ...meta } = candidates[0];
+    Object.assign(item, { meta, title: meta.title, artist: meta.artist });
+    return processSong(item);
+  }
+  if (candidates.length) return { status: "ask", candidates: candidates.map(({ score, ...c }) => c), note: "Is this the song?" };
+  return withBackup(async () => null, null, item.query, why);
+}
+
+// ---------- /karaoke: the instrumental of a song, to sing along to in Sour Player's Stage ----------
+const INSTRUMENTAL = /instrumental|karaoke|off ?vocal|backing track|no vocals|minus one/i;
+async function processKaraoke(item) {
+  let base = item.meta;
+  if (!base) {
+    const dash = String(item.query).match(/^(.+?)\s+-\s+(.+)$/);
+    const top = (await catalogCandidates(item.query).catch(() => []))[0];
+    base = top ? (({ score, ...m }) => m)(top) : dash ? { artist: dash[1].trim(), title: dash[2].trim() } : null;
+    if (!base) return { status: "failed", note: "which song? try /karaoke ARTIST - SONG" };
+    if (base.lookup) base = await enrich(base);
+  }
+  const plainTitle = String(base.title).replace(/\s*[([](instrumental|karaoke)[^)\]]*[)\]]/i, "").trim();
+  const title = `${plainTitle} (Instrumental)`;
+  if (inLibrary(base.artist, title) || inLibrary(base.artist, `${plainTitle} (Karaoke)`))
+    return { status: "done", artist: base.artist, title, note: "already in the library" };
+  const first = String(base.artist).split(", ")[0], t = norm(plainTitle), a = norm(first);
+  let best = null;
+  for (const q of [`${first} ${plainTitle} instrumental`, `${first} ${plainTitle} karaoke`, `${plainTitle} instrumental`]) {
+    for (const v of await ytSearch(q).catch(() => [])) {
+      if (!norm(v.title).includes(t) || !INSTRUMENTAL.test(v.title)) continue;
+      let s = 0;
+      if (/ - topic$/i.test(v.channel)) s += 30;
+      if (norm(v.channel).includes(a)) s += 20;
+      if (/instrumental/i.test(v.title)) s += 10;
+      if (/\b(piano|guitar|orchestra|8.?bit|music box|lofi|lo-fi|cover|remix|live|sped|slowed|nightcore|8d)\b/i.test(v.title)) s -= 40;
+      if (base.seconds) { const d = Math.abs(v.seconds - base.seconds); s += d <= 5 ? 30 : d <= 15 ? 10 : d > 40 ? -30 : 0; }
+      if (!best || s > best.s) best = { ...v, s };
+    }
+    if (best && best.s >= 30) break;
+  }
+  if (!best || best.s < -10) return { status: "failed", artist: base.artist, title, note: "no instrumental or karaoke version found on YouTube" };
+  const meta = { ...base, title, album: base.album ? `${cleanAlbum(base.album)} (Instrumentals)` : "Instrumentals",
+    albumArtist: base.albumArtist || first, releaseType: base.album ? base.releaseType || "album" : "single", seconds: best.seconds };
+  return songDone(meta, await saveSong(best.id, meta));
 }
 function insertChildren(parent, kids) {
   const at = items.indexOf(parent) + 1 + items.filter((k) => k.parent === parent.id).length;
@@ -1051,7 +1144,7 @@ async function processItem(item, w) {
   try {
     const type = item.type || "song";
     const result = type === "album" ? await expandAlbum(item) : type === "artist" ? await expandArtist(item)
-      : type === "playlist" ? await expandPlaylist(item) : await processSong(item);
+      : type === "playlist" ? await expandPlaylist(item) : type === "karaoke" ? await processKaraoke(item) : await processSong(item);
     Object.assign(item, result);
   } catch (e) {
     w.lastError = e.message;
@@ -1952,11 +2045,11 @@ const weekKey = (t = Date.now()) => { // ISO week, e.g. 2026-W41
 };
 const dayKey = (t = Date.now()) => new Date(t).toISOString().slice(0, 10);
 const keyHashes = (p) => p.keyHashes || (p.keyHash ? [p.keyHash] : []);
-// Fonts only some people may use (for their name and their playlists). Hermes Music tells only those
-// profiles about them and refuses them for everyone else. Anjalo's: the Determination font.
-// "admin" isn't a font: it lets that profile fix friends' profiles (name, bio, pictures...) from Sour Player.
-const PERKS = { determination: ["05b2befa-218"], admin: ["05b2befa-218"] };
-const perksOf = (id) => Object.keys(PERKS).filter((k) => PERKS[k].includes(id));
+// Extras only Navidrome admins get (Hermes Music asks Navidrome whenever Sour Player signs in): the
+// Determination font (for their name, playlists and the app), the Soul visualizer, fixing friends' profiles
+// from Sour Player, and a royal blue name. Hermes Music tells only those profiles and refuses them for others.
+const PERKS = { determination: true, admin: true };
+const perksOf = (id) => (profiles[id] && !profiles[id].mergedInto && profiles[id].admin ? Object.keys(PERKS) : []);
 // removes a Sour Player profile for good (and the old profiles merged into it), with its pictures
 function deleteProfile(id) {
   if (!profiles[id]) return false;
@@ -2036,6 +2129,7 @@ function publicProfile(p, self = false) {
     custom: hidden ? { privacy: { private: true } } : p.custom || {},
     wall: hidden ? [] : (p.wall || []).slice(0, 30), nicknames: hidden ? [] : (p.nicknames || []).slice(0, 20),
     away: !online ? p.away || "" : "",
+    admin: !!p.admin && !p.mergedInto,
   };
   if (!hidden && !priv.hideStats) out.stats = profileStats(p);
   if (self) Object.assign(out, { account: p.navidrome || null, visits: p.custom && p.custom.visits ? p.visits || [] : [], avatarHistory: (p.avatarHistory || []).map((h) => h.v), resume: p.lastPlayback || null, perks: perksOf(p.id) });
@@ -2371,8 +2465,15 @@ async function navidromeUser(credential) {
     const r = await fetch(`${base}/rest/ping.view?u=${encodeURIComponent(u)}&${auth}&v=1.16.1&c=hermes&f=json`, { signal: AbortSignal.timeout(8000) });
     const j = await r.json().catch(() => null);
     const sr = j && j["subsonic-response"];
-    if (sr && sr.status === "ok") return { user: u.trim().toLowerCase(), name: u.trim() };
-    return { error: "Navidrome didn't accept that login" };
+    if (!sr || sr.status !== "ok") return { error: "Navidrome didn't accept that login" };
+    // is this account a Navidrome admin? (unknown when Navidrome doesn't say: keep what we knew)
+    let admin = null;
+    try {
+      const g = await fetch(`${base}/rest/getUser.view?u=${encodeURIComponent(u)}&${auth}&username=${encodeURIComponent(u)}&v=1.16.1&c=hermes&f=json`, { signal: AbortSignal.timeout(8000) });
+      const gu = ((await g.json().catch(() => null)) || {})["subsonic-response"];
+      if (gu && gu.status === "ok" && gu.user) admin = gu.user.adminRole === true;
+    } catch {}
+    return { user: u.trim().toLowerCase(), name: u.trim(), admin };
   } catch (e) { return { error: "couldn't reach Navidrome: " + e.message }; }
 }
 // an older profile from the same person (made before accounts were tied to Navidrome): its look and favourites
@@ -2432,6 +2533,7 @@ async function sourRoute(req, res, p, get, post, url) {
       const id = crypto.randomUUID().slice(0, 12);
       prof = profiles[id] = { id, keyHashes: [], name: clean1(b.name, 40).trim() || who.name, navidrome: who.user, created: new Date().toISOString(), lastSeen: Date.now() };
     }
+    if (who.admin !== null) prof.admin = who.admin;
     let merged = null;
     if (old && old !== prof && !old.navidrome) { mergeProfile(old, prof); merged = old.id; }
     const key = crypto.randomUUID();
@@ -2439,6 +2541,16 @@ async function sourRoute(req, res, p, get, post, url) {
     delete prof.keyHash;
     saveProfiles();
     return send(res, 200, { id: prof.id, key, account: who.user, merged, profile: publicProfile(prof, true) });
+  }
+  if (post && p === "/api/profiles/navidrome/check") { // refreshes whether a signed-in account is a Navidrome admin
+    const b = await readBody(req);
+    const prof = ownProfile(String(b.id || ""), b.key);
+    if (!prof) return send(res, 403, { error: "unknown profile" });
+    const who = await navidromeUser(b.credential);
+    if (!who.user) return send(res, 401, { error: who.error });
+    if (prof.navidrome !== who.user) return send(res, 403, { error: "that login belongs to another account" });
+    if (who.admin !== null && prof.admin !== who.admin) { prof.admin = who.admin; saveProfiles(); }
+    return send(res, 200, { admin: !!prof.admin, perks: perksOf(prof.id) });
   }
   if (get && p === "/api/profiles") {
     return send(res, 200, visibleProfiles().map((x) => publicProfile(x))
@@ -2526,12 +2638,28 @@ async function sourRoute(req, res, p, get, post, url) {
     const b = await readBody(req);
     const me = b.profile ? ownProfile(String(b.profile), b.key) : { id: null, name: "the request page" };
     if (!me) return send(res, 403, { error: "set up your profile first" });
-    if (b.remove) { follows = follows.filter((f) => String(f.deezerId) !== String(b.remove)); fs.writeFileSync(FOLLOWS, JSON.stringify(follows)); return send(res, 200, { ok: true }); }
+    if (b.remove) { // unfollow, by Deezer id or by name
+      const gone = norm(String(b.remove));
+      follows = follows.filter((f) => String(f.deezerId) !== String(b.remove) && norm(f.artist) !== gone);
+      fs.writeFileSync(FOLLOWS, JSON.stringify(follows));
+      return send(res, 200, { ok: true });
+    }
     const name = clean1(b.artist, 100).trim();
     if (!name) return send(res, 400, { error: "which artist?" });
-    let artist;
-    try { artist = ((await deezer(`search/artist?limit=5&q=${encodeURIComponent(name)}`)).data || []).find((a) => norm(a.name) === norm(name)) || null; }
-    catch (e) { return send(res, 502, { error: "couldn't reach Deezer: " + e.message }); }
+    // "Toby Fox, Laura Shigihara" or "X feat. Y": the exact name first, then each artist on its own
+    let artist = null;
+    try {
+      const names = [name, ...name.split(/\s*(?:,|&|;|\bfeat\.?|\bft\.?|\bwith\b|\bx\b)\s*/i).map((x) => x.trim()).filter((x) => x.length > 1)];
+      for (const q of [...new Set(names)]) {
+        const list = (await deezer(`search/artist?limit=8&q=${encodeURIComponent(q)}`)).data || [];
+        artist = list.find((a) => norm(a.name) === norm(q)) || null;
+        if (artist) break;
+      }
+      if (!artist) { // close enough: Deezer's top hit when the names nearly match
+        const top = ((await deezer(`search/artist?limit=3&q=${encodeURIComponent(name)}`)).data || [])[0];
+        if (top && (norm(name).includes(norm(top.name)) || norm(top.name).includes(norm(name)))) artist = top;
+      }
+    } catch (e) { return send(res, 502, { error: "couldn't reach Deezer: " + e.message }); }
     if (!artist) return send(res, 404, { error: `couldn't find ${name} on Deezer` });
     if (!follows.some((f) => f.deezerId === artist.id)) {
       let seen = [];
@@ -2787,7 +2915,7 @@ http.createServer(async (req, res) => {
     const c = (s) => tops.filter((i) => i.status === s).length;
     return send(res, 200, {
       workers: WORKERS.filter(workerEnabled).map((w) => ({ id: w.id, label: w.label, state: workerState(w), current: w.current, lastError: w.lastError })),
-      pending: c("pending"), working: c("working"), done: c("done"), failed: c("failed"),
+      pending: c("pending"), working: c("working"), done: c("done"), failed: c("failed"), asking: c("ask"),
       library: { files: library.files, scanning: library.scanning, scanned: library.scanned },
     });
   }
@@ -3104,9 +3232,13 @@ http.createServer(async (req, res) => {
   }
   if (get && p === "/api/requests") {
     const pos = new Map(queueOrder().map((i, n) => [i.id, n + 1]));
-    const list = items.filter((i) => !i.parent).slice(-50).reverse().map(({ id, type, query, status, title, artist, note, created, priority, askedBy, profile, votes }) => {
+    const list = items.filter((i) => !i.parent).slice(-50).reverse().map(({ id, type, query, status, title, artist, note, created, priority, askedBy, profile, votes, candidates }) => {
       const r = { id, type: type || "song", query, status, title, artist, note, created, priority: !!priority, by: askedBy, askedBy, profile,
         votes: (votes || []).length, voters: votes || [], pos: pos.get(id) };
+      if (status === "ask" && candidates && candidates[0]) { // "Is this the song?"
+        const c = candidates[0];
+        r.ask = { title: c.title, artist: c.artist, album: c.album || "", cover: c.cover || "", left: candidates.length };
+      }
       if (r.type !== "song") r.progress = songStats(id);
       if (r.type === "artist") { // how many albums / EPs / singles are finished
         r.releases = {};
@@ -3121,6 +3253,26 @@ http.createServer(async (req, res) => {
       return r;
     });
     return send(res, 200, list);
+  }
+  if (post && (m = p.match(/^\/api\/requests\/([\w-]+)\/answer$/))) { // "Is this the song?" yes (download it) or no (next one)
+    const b = await readBody(req);
+    const it = items.find((i) => i.id === m[1] && i.status === "ask");
+    if (!it) return send(res, 404, { error: "that question was already answered" });
+    const c = (it.candidates || [])[0];
+    if (b.yes && c) {
+      Object.assign(it, { meta: c, status: "pending", note: undefined, title: c.title, artist: c.artist });
+      delete it.candidates;
+      save(); wake();
+      return send(res, 200, { queued: true });
+    }
+    it.candidates = (it.candidates || []).slice(1);
+    if (!it.candidates.length) {
+      Object.assign(it, { status: "failed", note: "no match - try adding the artist, or paste a Spotify link" });
+      delete it.candidates;
+    }
+    save();
+    const next = it.candidates && it.candidates[0];
+    return send(res, 200, { next: next ? { title: next.title, artist: next.artist, album: next.album || "", cover: next.cover || "" } : null });
   }
   if (post && (m = p.match(/^\/api\/requests\/([\w-]+)\/vote$/))) { // upvote a waiting request: most-wanted downloads first
     const b = await readBody(req);
@@ -3165,8 +3317,8 @@ Reply with ONE line of JSON and nothing else: {"songs":["Artist - Title", ...]} 
     rate.set(ip, [...hits, Date.now()]);
     const b = await readBody(req);
     const q = String(b.query || "").trim().slice(0, 200);
-    const type = ["song", "album", "artist"].includes(b.type) ? b.type : "song";
-    if (q.length < 2) return send(res, 400, { error: `Enter ${type === "song" ? "a song" : type === "album" ? "an album" : "an artist"} name` });
+    const type = ["song", "album", "artist", "karaoke"].includes(b.type) ? b.type : "song";
+    if (q.length < 2) return send(res, 400, { error: `Enter ${type === "song" || type === "karaoke" ? "a song" : type === "album" ? "an album" : "an artist"} name` });
     const item = { id: newId(), type, query: q, status: "pending", created: new Date().toISOString() };
     if (b.by) item.askedBy = String(b.by).slice(0, 40); // name of who asked (from Sour Player)
     if (typeof b.profile === "string" && profiles[b.profile]) { item.profile = b.profile; sourStat(b.profile, "requests", 1); }

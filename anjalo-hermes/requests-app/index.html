@@ -41,7 +41,10 @@ nav.mnav{display:none}
 .ln{display:flex;gap:10px;padding:1px 0;white-space:pre-wrap;word-break:break-word}
 .t{color:var(--mut);flex:none}
 .s{flex:none;min-width:11em;color:var(--mut)}
-.pending .s{color:var(--mut)}.working .s{color:var(--acc)}.done .s{color:#4ade80}.failed .s{color:#f87171}
+.pending .s{color:var(--mut)}.working .s{color:var(--acc)}.done .s{color:#4ade80}.failed .s{color:#f87171}.ask .s{color:#facc15}
+.askq{display:block;margin-top:2px;color:var(--hi)}
+.askq button{margin-left:8px;padding:1px 10px;border:1px solid var(--acc);border-radius:4px;background:transparent;color:var(--acc);font:inherit;font-size:.8rem;cursor:pointer}
+.askq button:hover{background:var(--acc);color:#fff}
 .rel{display:block;color:var(--mut);font-size:.78rem}
 .rel b{color:var(--hi);font-weight:600}
 .sys{color:var(--mut)}.echo{color:var(--fg)}.echo::before{content:"\276F  ";color:var(--acc);font-weight:700}
@@ -149,12 +152,12 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             <div id="sess">Session: -</div>
           </div>
           <div class="rt">
-            <h2>Hermes Music v3.2.0</h2>
+            <h2>Hermes Music v3.3.0</h2>
             <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
             <div class="sec"><span class="k">&#9662; Workers</span><br><span id="w-worker" class="d">-</span></div>
             <div class="sec"><span class="k">&#9662; Library</span><br><span class="d" id="w-lib">-</span></div>
             <div class="sec"><span class="k">&#9662; Settings</span><br><span class="d" id="w-cfg">-</span></div>
-            <div class="sec"><span class="k">&#9656; Commands</span><br><span class="d">type a song &middot; /album &middot; /artist &middot; Spotify link &middot; /now &middot; /bump &middot; /video &middot; /duplicate &middot; /help</span></div>
+            <div class="sec"><span class="k">&#9656; Commands</span><br><span class="d">type a song &middot; /album &middot; /artist &middot; /karaoke &middot; Spotify link &middot; /now &middot; /bump &middot; /video &middot; /duplicate &middot; /help</span></div>
           </div>
         </div>
         <div id="log"></div>
@@ -432,7 +435,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
 const $ = (id) => document.getElementById(id);
 const DEMO = location.protocol === "file:";
 const TOUCH = matchMedia("(pointer: coarse)").matches;
-const label = { pending: "queued", working: "downloading", done: "added", failed: "failed" };
+const label = { pending: "queued", working: "downloading", done: "added", failed: "failed", ask: "is this it?" };
 let local = [], lastReqs = [], status = null, cfg = null, current = "req", firstRender = true;
 let clearedAt = 0; try { clearedAt = +localStorage.getItem("hm-cleared") || 0; } catch {}
 
@@ -494,7 +497,14 @@ function render() {
     if (i.pos) st += " #" + i.pos; // queue number, used by /now
     if (i.priority && (i.status === "pending" || i.status === "working")) st += " \u26a1";
     const row = line(i.status, [["t", hhmm(i.created)], ["s", "[" + st + "]"], ["", name]]);
-    if (i.note) { const n = document.createElement("small"); n.textContent = " (" + i.note + ")"; row.lastChild.append(n); }
+    if (i.note && !i.ask) { const n = document.createElement("small"); n.textContent = " (" + i.note + ")"; row.lastChild.append(n); }
+    if (i.ask) { // "Is this the song?"
+      const q = document.createElement("span"); q.className = "askq";
+      q.textContent = "Is this the song? " + i.ask.title + " - " + i.ask.artist + (i.ask.album ? " (" + i.ask.album + ")" : "");
+      const yes = document.createElement("button"); yes.textContent = "yes"; yes.onclick = () => answer(i, true);
+      const no = document.createElement("button"); no.textContent = i.ask.left > 1 ? "no, next" : "no"; no.onclick = () => answer(i, false);
+      q.append(yes, no); row.lastChild.append(q);
+    }
     if (i.releases && Object.keys(i.releases).length) { // artist: albums / EPs / singles finished
       const r = document.createElement("span"); r.className = "rel";
       Object.entries(i.releases).forEach(([k, v], n) => {
@@ -543,12 +553,23 @@ function render() {
 async function load() {
   try { [lastReqs, status, cfg] = await Promise.all([api("api/requests"), api("api/status"), api("api/config")]); render(); } catch {}
 }
+async function answer(item, yes) {
+  try {
+    const r = DEMO ? { queued: yes } : await api("api/requests/" + item.id + "/answer", { method: "POST", body: JSON.stringify({ yes }) });
+    if (r.queued) push("ok", "downloading " + item.ask.title + " - " + item.ask.artist);
+    else if (r.next) push("sys", "Is this the song? " + r.next.title + " - " + r.next.artist + " (/yes or /no)");
+    else if (!yes) push("sys", "no more guesses - try again with the artist's name, or paste a Spotify link");
+  } catch (e) { push("err", e.message); }
+  render(); load();
+}
 function push(cls, text) { local.push({ cls, text }); if (local.length > 200) local.shift(); }
 
 const HELP = [
   "song name        request one song (add the artist for best results)",
   "/album NAME      download a whole album, e.g. /album the killers hot fuss",
   "/artist NAME     download an artist's albums, e.g. /artist daft punk",
+  "/karaoke SONG    download the instrumental, to sing along in Sour Player's Stage, e.g. /karaoke toby fox hotel",
+  '/yes  /no        answer "Is this the song?" for the newest question (or use its buttons)',
   "spotify link     paste a Spotify song, album, playlist or artist link",
   "/now NUMBER      move that queue number to the front, e.g. /now 3",
   "/bump NAME       push something already queued to the front",
@@ -594,7 +615,7 @@ $("f").onsubmit = async (e) => {
   push("echo", v);
   firstRender = true; // jump to the bottom after your own command
   let type = "song", query = v;
-  const cmd = query.match(/^\/(album|artist)\b\s*(.*)$/i);
+  const cmd = query.match(/^\/(album|artist|karaoke)\b\s*(.*)$/i);
   if (cmd) { type = cmd[1].toLowerCase(); query = cmd[2].trim(); }
   else if (v[0] === "/") {
     const [c, ...args] = v.split(/\s+/);
@@ -602,6 +623,11 @@ $("f").onsubmit = async (e) => {
     if (name === "/help") HELP.forEach((h) => push("sys", h));
     else if (name === "/queue") push("sys", status ? status.pending + " waiting, " + status.working + " downloading, " + status.done + " added" : "no data yet");
     else if (name === "/config") { local.pop(); tab("cfg"); }
+    else if (name === "/yes" || name === "/no") {
+      const q = lastReqs.find((i) => i.status === "ask");
+      if (!q) push("sys", "nothing is waiting for an answer");
+      else await answer(q, name === "/yes");
+    }
     else if (name === "/clear") { local = []; clearedAt = Date.now(); try { localStorage.setItem("hm-cleared", String(clearedAt)); } catch {} render(); return; }
     else if (name === "/now") {
       const n = parseInt(args[0], 10);
@@ -703,6 +729,7 @@ $("f").onsubmit = async (e) => {
   try {
     const r = await api("api/requests", { method: "POST", body: JSON.stringify({ query, type }) });
     push("ok", "queued" + (type === "song" ? " - it will show up in the library soon"
+      : type === "karaoke" ? " - looking for the instrumental"
       : type === "album" ? " - looking up the tracklist" : " - looking up their albums (this can be a lot of songs)"));
   } catch (err) { push("err", err.message); }
   render(); load();

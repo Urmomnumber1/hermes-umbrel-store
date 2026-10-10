@@ -64,6 +64,11 @@ Hermes Music identifies it, downloads it with yt-dlp and saves it into your Umbr
   `GET /api/config/sour-users`, `POST /api/config/sour-users/delete`, PIN-protected). Profiles show what each person
   added to the library (`GET /api/profiles/:id/added`). The `admin` perk lets a profile fix friends' profiles from
   Sour Player (name, bio, pictures; sent with `as` = the admin's profile), but not sign in as them or read their inbox.
+- **3.3:** Unclear song requests get an "Is this the song?" question (status `ask`, guesses from iTunes and Deezer;
+  `POST /api/requests/:id/answer` with `yes`), clear ones download straight away; a video that won't download tries
+  another upload. `/karaoke SONG` (request type `karaoke`) downloads the instrumental as "Title (Instrumental)".
+  Admin extras now follow the Navidrome admin role (checked at sign-in and `POST /api/profiles/navidrome/check`).
+  Follows match "A, B" / "A feat. B" artist names and unfollow by name.
 - `/duplicate` lists copies of the same song (same artist, title and length) and keeps the best-quality one;
   `/duplicate confirm` (plus your PIN, if set) moves the extras to the hidden `.duplicates` folder in your music folder.
 - Songs already in the music folder are skipped: the app indexes the folder's tags on start and every 30 minutes.
