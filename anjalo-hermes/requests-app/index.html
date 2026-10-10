@@ -152,7 +152,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             <div id="sess">Session: -</div>
           </div>
           <div class="rt">
-            <h2>Hermes Music v3.3.0</h2>
+            <h2>Hermes Music v3.3.1</h2>
             <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
             <div class="sec"><span class="k">&#9662; Workers</span><br><span id="w-worker" class="d">-</span></div>
             <div class="sec"><span class="k">&#9662; Library</span><br><span class="d" id="w-lib">-</span></div>
@@ -411,6 +411,10 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
       <div class="row"><label for="c-dtuser">Username<small>only if not paired</small></label><input type="text" id="c-dtuser" spellcheck="false" autocomplete="off"></div>
       <div class="row"><label for="c-dtpass">Password<small id="dthint">blank = default (downtify)</small></label><input type="password" id="c-dtpass" placeholder="blank = keep, - = remove" autocomplete="off"></div>
       <div class="row"><label>Connection<small>save first, then test</small></label><button class="btn" id="c-dttest" style="margin:0">Test</button><span id="dtmsg" class="sub2" style="margin:0"></span></div>
+
+      <div class="grp">&#9662; YouTube sign-in</div>
+      <p class="sub2">Only needed when requests fail with &quot;YouTube asked this server to sign in&quot;. In a browser where you&#39;re logged into YouTube (a spare Google account is safest), export <b>cookies.txt</b> for youtube.com with a cookies.txt extension, open the file, and paste all of it here. It stays on this Umbrel and is only given to the downloader.</p>
+      <div class="row" style="align-items:flex-start"><label for="c-ytc">YouTube cookies<small id="ythint">none saved</small></label><textarea id="c-ytc" rows="3" spellcheck="false" placeholder="paste cookies.txt here ( - removes the saved one )" style="flex:1;min-width:0;font:inherit;font-size:.75rem;background:transparent;color:inherit;border:1px solid var(--bd);border-radius:6px;padding:6px"></textarea><button class="btn" id="c-ytsave" style="margin:0">Save</button><span id="ytmsg" class="sub2" style="margin:0"></span></div>
 
       <div class="grp">&#9662; Sour Player accounts</div>
       <p class="sub2">Sour Player profiles are tied to Navidrome accounts: signing in to Navidrome in Sour Player is all it takes, on every computer. Hermes Music finds Navidrome on this Umbrel by itself; type its address only if the test can&#39;t.</p>
@@ -775,6 +779,7 @@ function fillCfg() {
   $("c-fmt").value = cfg.audioFormat; $("c-max").value = cfg.maxMinutes; $("c-art").checked = cfg.embedArt;
   $("c-paused").checked = cfg.paused; $("c-rate").value = cfg.ratePerMinute; $("c-folders").checked = cfg.artistFolders; $("c-maxalb").value = cfg.artistMaxAlbums;
   $("c-ndurl").value = cfg.navidromeUrl || "";
+  $("ythint").textContent = cfg.hasYtCookies ? "cookies are saved" : "none saved";
   $("c-dten").checked = cfg.downtifyEnabled; $("c-dturl").value = cfg.downtifyUrl || ""; $("c-dtuser").value = cfg.downtifyUser || ""; $("c-dtpass").value = "";
   $("dthint").textContent = cfg.hasDowntifyPassword ? "a password is saved" : "blank = default (downtify)";
   $("pairhint").textContent = cfg.downtifyPaired ? "\u2714 paired (type - and Save to unpair)" : "best: no password needed"; $("c-dtcode").value = "";
@@ -833,6 +838,13 @@ async function loadSourUsers() {
     }
   } catch (e) { box.textContent = e.message; }
 }
+$("c-ytsave").onclick = async () => {
+  const m = $("ytmsg"); m.style.color = ""; m.textContent = "saving...";
+  try {
+    cfg = DEMO ? { ...cfg, hasYtCookies: true } : await api("api/config/youtube-cookies", { method: "POST", body: JSON.stringify({ cookies: $("c-ytc").value, currentPin: $("c-cur").value }) });
+    $("c-ytc").value = ""; fillCfg(); m.style.color = "#4ade80"; m.textContent = cfg.hasYtCookies ? "saved - try a request" : "removed";
+  } catch (e) { m.style.color = "#f87171"; m.textContent = e.message; }
+};
 $("c-ndtest").onclick = async () => {
   const m = $("ndmsg"); m.style.color = ""; m.textContent = "looking for Navidrome...";
   try { const r = DEMO ? { ok: true, message: "found Navidrome" } : await (await fetch("api/navidrome/test")).json(); m.style.color = r.ok ? "#4ade80" : "#f87171"; m.textContent = r.message; }

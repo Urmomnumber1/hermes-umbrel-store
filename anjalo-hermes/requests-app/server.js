@@ -119,8 +119,24 @@ function updateConfig(b) {
 // What the page may see: never the PIN or secrets.
 const publicConfig = () => {
   const { pin, localKey, claudeToken, downtifyPassword, downtifyToken, spotifyClientId, spotifySecret, ...rest } = config; // spotify*: left over from 2.2.0 configs
-  return { ...rest, hasPin: !!pin, hasKey: !!localKey, hasToken: !!claudeToken, hasDowntifyPassword: !!downtifyPassword, downtifyPaired: !!downtifyToken };
+  return { ...rest, hasPin: !!pin, hasKey: !!localKey, hasToken: !!claudeToken, hasDowntifyPassword: !!downtifyPassword, downtifyPaired: !!downtifyToken,
+    hasYtCookies: fs.existsSync(YT_COOKIES) };
 };
+// YouTube sometimes answers "Sign in to confirm you're not a bot". yt-dlp's own answer is to sign in: a
+// cookies.txt exported from a browser where you're logged into YouTube (Config > YouTube sign-in). It stays
+// on this Umbrel, is only handed to yt-dlp, and never leaves in any API answer.
+const YT_COOKIES = "/data/yt-cookies.txt", YT_CONFIG = "/data/home/.config/yt-dlp/config";
+function applyYtConfig() { // yt-dlp reads this file every time it runs (also when Claude Code runs it)
+  try {
+    fs.mkdirSync(path.dirname(YT_CONFIG), { recursive: true });
+    const lines = ["--js-runtimes node", "--remote-components ejs:github"];
+    if (fs.existsSync(YT_COOKIES)) lines.push(`--cookies ${YT_COOKIES}`);
+    fs.writeFileSync(YT_CONFIG, lines.join("\n") + "\n");
+  } catch {}
+}
+applyYtConfig();
+const BOT_CHECK = /confirm you.re not a bot|sign in to confirm/i;
+const botNote = (msg) => (BOT_CHECK.test(String(msg)) ? "YouTube asked this server to sign in - add YouTube cookies in Config > YouTube sign-in" : null);
 
 // ---------- helpers ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -604,7 +620,7 @@ async function ytSearch(query, n = 8) {
       if (/^[\w-]{11}$/.test(v.id || "")) rows.push({ id: v.id, title: v.title || "", channel: v.channel || "", seconds: Number(v.duration) || 0 });
     } catch {}
   }
-  if (!rows.length && s.err.trim()) throw new Error("YouTube search failed: " + s.err.trim().split("\n").pop().slice(0, 150));
+  if (!rows.length && s.err.trim()) throw new Error(botNote(s.err) || "YouTube search failed: " + s.err.trim().split("\n").pop().slice(0, 150));
   return rows.filter((v) => v.seconds > 0 && v.seconds <= config.maxMinutes * 60);
 }
 // Local model: we search YouTube ourselves and the model only picks from the results.
@@ -752,7 +768,7 @@ async function saveSong(videoId, meta) {
     ...(config.embedArt && !meta.cover ? ["--write-thumbnail", "--convert-thumbnails", "jpg"] : []),
     "-o", path.join(ST(), "song.%(ext)s"), `https://www.youtube.com/watch?v=${videoId}`]);
   const raw = path.join(ST(), `song.${fmt}`);
-  if (!fs.existsSync(raw)) throw new Error("download failed: " + (d.err.trim().split("\n").pop() || "unknown"));
+  if (!fs.existsSync(raw)) throw new Error(botNote(d.err) || "download failed: " + (d.err.trim().split("\n").pop() || "unknown"));
   return finishSong(raw, fmt, meta, path.join(ST(), "song.jpg"));
 }
 
@@ -1211,7 +1227,7 @@ async function ytSearchAny(query, n = 10) {
     try { const v = JSON.parse(l); if (/^[\w-]{11}$/.test(v.id || "")) rows.push({ id: v.id, title: v.title || "", channel: v.channel || "", seconds: Number(v.duration) || 0,
       views: Number(v.view_count) || 0, verified: !!v.channel_is_verified }); } catch {}
   }
-  if (!rows.length && s.err.trim()) throw new Error("YouTube search failed: " + s.err.trim().split("\n").pop().slice(0, 150));
+  if (!rows.length && s.err.trim()) throw new Error(botNote(s.err) || "YouTube search failed: " + s.err.trim().split("\n").pop().slice(0, 150));
   return rows;
 }
 // Picks the official music video: right title, the artist's own (or VEVO) channel, popular, not a fan edit,
@@ -3212,6 +3228,19 @@ http.createServer(async (req, res) => {
     saveProfiles();
     console.log(`Sour Player profile removed: ${prof.name}${prof.navidrome ? ` (${prof.navidrome})` : ""}`);
     return send(res, 200, { removed: prof.name });
+  }
+  if (post && p === "/api/config/youtube-cookies") { // paste a cookies.txt (or "-" to remove it)
+    const b = await readBody(req, 600000);
+    if (config.pin && String(b.currentPin || "") !== config.pin) return send(res, 403, { error: "wrong PIN (enter it in Current PIN first)" });
+    const text = String(b.cookies || "").trim();
+    if (!text || text === "-") {
+      fs.rmSync(YT_COOKIES, { force: true });
+    } else {
+      if (!/youtube\.com/i.test(text) || !/\t/.test(text)) return send(res, 400, { error: "that doesn't look like a cookies.txt for youtube.com (export it in the Netscape format)" });
+      fs.writeFileSync(YT_COOKIES, (text.startsWith("#") ? "" : "# Netscape HTTP Cookie File\n") + text + "\n", { mode: 0o600 });
+    }
+    applyYtConfig();
+    return send(res, 200, publicConfig());
   }
   if (post && p === "/api/config") {
     const err = updateConfig(await readBody(req));
