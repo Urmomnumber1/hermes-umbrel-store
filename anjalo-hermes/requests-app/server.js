@@ -2316,6 +2316,7 @@ function publicProfile(p, self = false) {
     online, lastSeen: hidden || priv.hideLastOnline ? null : isInvisible(p) && !self ? p.lastOfflineSeen || null : p.lastSeen || null,
     created: p.created,
     listening: online && !priv.hideListening && p.listening ? p.listening : null, playing: online && !!p.playing,
+    on: online && !priv.hideListening ? p.on || "computer" : null,
     position: online && !priv.hideListening ? p.position || 0 : 0, positionAt: p.positionAt || 0,
     group: online && !priv.hideListening ? p.group || null : null,
     custom: hidden ? { privacy: { private: true } } : p.custom || {},
@@ -2778,6 +2779,7 @@ async function sourRoute(req, res, p, get, post, url) {
     me.lastSeen = now;
     me.listening = song;
     me.playing = !!b.playing;
+    me.on = b.on === "phone" ? "phone" : "computer"; // where they listen (shown as "on their phone")
     me.position = Number(b.position) || 0;
     me.positionAt = now;
     me.group = b.group && typeof b.group.code === "string" ? { code: clean1(b.group.code, 5), name: clean1(b.group.name, 60) } : null;
