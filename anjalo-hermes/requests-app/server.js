@@ -48,6 +48,8 @@ const DEFAULTS = {
   audioFormat: "mp3", maxMinutes: 10, embedArt: true, artistFolders: true,
   // albums and artists
   artistMaxAlbums: 10, includeSingles: false,
+  // Spotify developer app (optional): whole playlists past 100 songs, and importing a profile's playlists
+  spotifyClientId: "", spotifySecret: "",
   // Downtify app, used only when our own YouTube search/download fails
   downtifyEnabled: false, downtifyUrl: "http://downtify_downtify_1:8000", downtifyUser: "admin", downtifyPassword: "", downtifyToken: "",
   // Navidrome on this Umbrel: Sour Player profiles are tied to Navidrome accounts (blank = find it by itself)
@@ -85,7 +87,7 @@ function updateConfig(b) {
   if (int(b.maxMinutes, 1, 30) != null) next.maxMinutes = int(b.maxMinutes, 1, 30);
   if (typeof b.embedArt === "boolean") next.embedArt = b.embedArt;
   if (typeof b.artistFolders === "boolean") next.artistFolders = b.artistFolders;
-  if (int(b.artistMaxAlbums, 1, 50) != null) next.artistMaxAlbums = int(b.artistMaxAlbums, 1, 50);
+  if (int(b.artistMaxAlbums, 1, 500) != null) next.artistMaxAlbums = int(b.artistMaxAlbums, 1, 500); // was capped at 50 (higher values were ignored)
   if (typeof b.includeSingles === "boolean") next.includeSingles = b.includeSingles;
   if (typeof b.downtifyEnabled === "boolean") next.downtifyEnabled = b.downtifyEnabled;
   if (typeof b.downtifyUrl === "string") {
@@ -94,6 +96,8 @@ function updateConfig(b) {
     next.downtifyUrl = u;
   }
   if (typeof b.downtifyUser === "string") next.downtifyUser = b.downtifyUser.trim().slice(0, 100);
+  if (typeof b.spotifyClientId === "string" && b.spotifyClientId) next.spotifyClientId = secret(b.spotifyClientId);
+  if (typeof b.spotifySecret === "string" && b.spotifySecret) next.spotifySecret = secret(b.spotifySecret);
   if (typeof b.downtifyPassword === "string" && b.downtifyPassword) next.downtifyPassword = secret(b.downtifyPassword);
   if (b.downtifyToken === "-") next.downtifyToken = ""; // "unpair"
   if (typeof b.navidromeUrl === "string") {
@@ -120,7 +124,7 @@ function updateConfig(b) {
 const publicConfig = () => {
   const { pin, localKey, claudeToken, downtifyPassword, downtifyToken, spotifyClientId, spotifySecret, ...rest } = config; // spotify*: left over from 2.2.0 configs
   return { ...rest, hasPin: !!pin, hasKey: !!localKey, hasToken: !!claudeToken, hasDowntifyPassword: !!downtifyPassword, downtifyPaired: !!downtifyToken,
-    hasYtCookies: fs.existsSync(YT_COOKIES) };
+    hasYtCookies: fs.existsSync(YT_COOKIES), hasSpotify: !!(spotifyClientId && spotifySecret) };
 };
 // YouTube sometimes answers "Sign in to confirm you're not a bot". yt-dlp's own answer is to sign in: a
 // cookies.txt exported from a browser where you're logged into YouTube (Config > YouTube sign-in). It stays
@@ -179,7 +183,7 @@ const primaryArtist = (a) => norm(String(a || "").split(/\s*(?:,|;|\/|&|\bfeat\.
 const titleKey = (t) => deaccent(t).toLowerCase().replace(/[([]\s*(feat|ft)\.?[^)\]]*[)\]]/g, " ").replace(/\b(feat|ft)\.?\s.*$/, " ")
   .replace(/[^a-z0-9]+/g, " ").trim();
 const songKey = (artist, title) => `${primaryArtist(artist)}|${titleKey(title)}`;
-const library = { keys: new Set(), files: 0, scanning: false, scanned: false, lastScan: 0 };
+const library = { keys: new Set(), albums: new Map(), files: 0, scanning: false, scanned: false, lastScan: 0 };
 let libCache = {};
 try { libCache = JSON.parse(fs.readFileSync(LIBCACHE, "utf8")); } catch {}
 
@@ -213,7 +217,16 @@ function guessFromPath(file, c) {
   else { c.t = base.replace(/^\d+[\s.\-_]+/, ""); c.a = c.a || (parts.length > 1 ? parts[0] : ""); }
   return c;
 }
-const addKeys = (set, c) => { for (const a of [c.a, c.aa]) if (a && c.t) set.add(songKey(a, c.t)); };
+// which albums each song is already on: a version on a different album (a live album, a deluxe re-recording,
+// the single vs the album cut...) is not a duplicate and still downloads
+const addKeys = (set, c) => {
+  for (const a of [c.a, c.aa]) {
+    if (!a || !c.t) continue;
+    const k = songKey(a, c.t);
+    set.add(k);
+    if (c.al) { if (!library.albums.has(k)) library.albums.set(k, new Set()); library.albums.get(k).add(albumBase(c.al)); }
+  }
+};
 // Known instantly at startup: the saved index from the last scan (the rescan then only reads new/changed files).
 for (const c of Object.values(libCache)) addKeys(library.keys, c);
 library.files = Object.keys(libCache).length;
@@ -233,9 +246,9 @@ async function scanLibrary() {
         const file = files[next++];
         let st; try { st = await fs.promises.stat(file); } catch { continue; }
         let c = libCache[file];
-        if (!c || c.m !== st.mtimeMs) { // only new or changed files are read
+        if (!c || c.m !== st.mtimeMs || c.al === undefined) { // only new or changed files are read (and, once, files indexed before albums were)
           const t = await probeTags(file);
-          c = guessFromPath(file, { m: st.mtimeMs, a: t.artist || "", aa: t.album_artist || t.albumartist || "", t: t.title || "" });
+          c = guessFromPath(file, { m: st.mtimeMs, a: t.artist || "", aa: t.album_artist || t.albumartist || "", t: t.title || "", al: t.album || "" });
           libCache[file] = c; // remembered right away, so a restart mid-scan doesn't start over
           if (++sinceSave >= 500) { sinceSave = 0; fs.promises.writeFile(LIBCACHE, JSON.stringify(libCache)).catch(() => {}); }
         }
@@ -258,10 +271,37 @@ async function scanLibrary() {
     library.scanning = false;
     library.lastScan = Date.now();
   }
-}const inLibrary = (artist, title) => library.keys.has(songKey(artist, title));
+}const inLibrary = (artist, title, album) => {
+  const k = songKey(artist, title);
+  if (!library.keys.has(k)) return false;
+  if (!album) return true;
+  const on = library.albums.get(k);
+  return !on || !on.size || on.has(albumBase(album)); // only on other albums: this one passes through
+};
 
 // ---------- /issues: songs with missing tags, no cover, or low quality (and fixing them) ----------
 const issues = { running: false, done: 0, total: 0, list: [] };
+// tags that say nothing: blank, "Untitled", "Unknown Artist", "Track 3", "[Unknown Album]"...
+const junkTag = (s) => !s || /^\[?(untitled|unknown|no title|track\s*\d*|audio\s*track|unknown (artist|album|title)|various)\]?$/i.test(String(s).trim());
+// /fix-all: every song with missing or junk tags or no cover gets proper tags, artist and album details and a
+// cover from iTunes/Deezer (titles that are junk come from the file name); runs in the background
+const fixAll = { running: false, total: 0, done: 0, fixed: 0, failed: 0, last: "" };
+async function runFixAll() {
+  if (fixAll.running) return;
+  Object.assign(fixAll, { running: true, total: 0, done: 0, fixed: 0, failed: 0, last: "" });
+  try {
+    await scanIssues();
+    while (issues.running) await sleep(1000);
+    const todo = issues.list.filter((x) => x.problems.some((p) => !/^low quality/.test(p)));
+    fixAll.total = todo.length;
+    for (const x of todo) {
+      try { const r = await fixSong(x.file, "retag"); fixAll.fixed++; fixAll.last = `${r.artist} - ${r.title}`; }
+      catch (e) { fixAll.failed++; fixAll.last = `${x.file}: ${e.message}`; }
+      fixAll.done++;
+    }
+    if (fixAll.fixed) scanLibrary();
+  } finally { fixAll.running = false; }
+}
 async function scanIssues() {
   if (issues.running) return;
   Object.assign(issues, { running: true, done: 0, list: [] });
@@ -275,7 +315,8 @@ async function scanIssues() {
       const r = await run("ffprobe", ["-v", "quiet", "-print_format", "json", "-show_entries", "format=bit_rate:stream=codec_type", file], { timeout: 20000 });
       let br = 0, cover = false;
       try { const j = JSON.parse(r.out); br = Number(j.format?.bit_rate) || 0; cover = (j.streams || []).some((x) => x.codec_type === "video"); } catch {}
-      if (!c.t || !(c.a || c.aa)) problems.push("missing tags");
+      if (junkTag(c.t) || junkTag(c.a || c.aa)) problems.push("missing tags");
+      else if (junkTag(c.al)) problems.push("no album");
       if (!cover && !/\.(opus|ogg)$/i.test(file)) problems.push("no cover");
       if (br && br < 128000 && !/\.(opus|ogg)$/i.test(file)) problems.push(`low quality (${Math.round(br / 1000)} kbps)`);
       if (problems.length) issues.list.push({ file: path.relative(MUSIC, file), artist: c.a || c.aa || "", title: c.t || "", problems });
@@ -289,7 +330,9 @@ async function scanIssues() {
 async function fixSong(rel, action) {
   const file = path.join(MUSIC, rel);
   if (!file.startsWith(MUSIC + path.sep) || !fs.existsSync(file)) throw new Error("that file isn't in the library any more");
-  const c = libCache[file] || guessFromPath(file, {});
+  const cached = libCache[file] || {};
+  // junk tags ("Untitled", "Unknown Artist") don't count: fall back to what the file name and folders say
+  const c = guessFromPath(file, { a: junkTag(cached.a) ? "" : cached.a, aa: junkTag(cached.aa) ? "" : cached.aa, t: junkTag(cached.t) ? "" : cached.t });
   const artist = c.a || c.aa, title = c.t;
   if (!artist || !title) throw new Error("not enough to go on - rename the file to 'Artist - Title' first");
   const meta = (await lookupMeta(artist, title).catch(() => null)) || (await dzLookupMeta(artist, title).catch(() => null)) || { artist, title };
@@ -573,15 +616,95 @@ async function spotifyAlbum(item, id) {
   })));
   return { status: "working", title: e.name, artist, note: "tracklist from Spotify" };
 }
+// Spotify Web API with the app keys from Config (client credentials: public data only, no user login)
+const sp = { token: "", until: 0 };
+async function spotifyApi(pathname) {
+  if (!config.spotifyClientId || !config.spotifySecret) return null;
+  if (Date.now() > sp.until) {
+    const r = await fetch("https://accounts.spotify.com/api/token", {
+      method: "POST", body: "grant_type=client_credentials", signal: AbortSignal.timeout(15000),
+      headers: { "content-type": "application/x-www-form-urlencoded", authorization: "Basic " + Buffer.from(`${config.spotifyClientId}:${config.spotifySecret}`).toString("base64") },
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.access_token) throw new Error("Spotify refused the keys in Config (check the Client ID and secret)");
+    sp.token = j.access_token; sp.until = Date.now() + (j.expires_in - 60) * 1000;
+  }
+  const r = await fetch(`https://api.spotify.com/v1${pathname}`, { headers: { authorization: `Bearer ${sp.token}` }, signal: AbortSignal.timeout(20000) });
+  if (!r.ok) throw new Error(`Spotify returned HTTP ${r.status}${r.status === 404 ? " (private or deleted?)" : ""}`);
+  return r.json();
+}
+async function spotifyPlaylistApi(item) { // every track, 100 at a time
+  const info = await spotifyApi(`/playlists/${item.spotifyId}?fields=name,owner(display_name)`);
+  if (!info) return null;
+  const tracks = [];
+  for (let next = `/playlists/${item.spotifyId}/tracks?limit=100&fields=next,items(track(name,duration_ms,uri,type,artists(name)))`; next;) {
+    const page = await spotifyApi(next);
+    for (const it of page.items || []) if (it.track && it.track.type === "track" && it.track.name) tracks.push(it.track);
+    next = page.next ? page.next.replace("https://api.spotify.com/v1", "") : null;
+    if (tracks.length > 5000) break;
+  }
+  if (!tracks.length) return { status: "failed", note: "playlist is empty or private" };
+  insertChildren(item, tracks.map((t) => {
+    const artist = (t.artists || []).map((a) => a.name).join(", ");
+    return { type: "song", query: `${artist} - ${t.name}`, meta: { title: t.name, artist, seconds: Math.round((t.duration_ms || 0) / 1000), spotifyUrl: spUrl(t.uri), lookup: true } };
+  }));
+  return { status: "working", title: info.name, artist: info.owner?.display_name || "", note: `${tracks.length} songs` };
+}
+// YouTube / YouTube Music playlists: yt-dlp lists them without downloading anything
+const YT_PLAYLIST = /(?:youtube\.com|youtu\.be)\/.*[?&]list=([\w-]{10,})/i;
+async function expandYouTubePlaylist(item) {
+  const r = await run("yt-dlp", ["--flat-playlist", "--no-warnings", "-J", `https://www.youtube.com/playlist?list=${item.ytList}`], { timeout: 300000 });
+  let j = null; try { j = JSON.parse(r.out); } catch {}
+  if (!j) throw new Error(botNote(r.err) || "couldn't read that YouTube playlist: " + (r.err.trim().split("\n").pop() || "unknown").slice(0, 150));
+  const entries = (j.entries || []).filter((e) => /^[\w-]{11}$/.test(e.id || "") && e.title && !/^\[(private|deleted)/i.test(e.title));
+  if (!entries.length) return { status: "failed", note: "playlist is empty or private" };
+  insertChildren(item, entries.map((e) => {
+    const channel = String(e.channel || e.uploader || "");
+    const topic = channel.match(/^(.+?) - Topic$/); // YouTube Music: "Artist - Topic" uploads are the official audio
+    if (topic) return { type: "song", query: `${topic[1]} - ${e.title}`, meta: { title: e.title, artist: topic[1], seconds: Number(e.duration) || 0, videoId: e.id, lookup: true } };
+    const dash = String(e.title).match(/^(.+?)\s+[-–]\s+(.+?)(?:\s*[([](official|lyric|audio|music video|video|hd|4k)[^)\]]*[)\]])*$/i);
+    if (dash) return { type: "song", query: `${dash[1]} - ${dash[2]}`, meta: { title: dash[2].trim(), artist: dash[1].trim(), seconds: Number(e.duration) || 0, videoId: e.id, lookup: true } };
+    return { type: "song", query: e.title }; // not sure what song it is: the normal search (and "Is this the song?")
+  }));
+  return { status: "working", title: j.title || "YouTube playlist", artist: j.uploader || j.channel || "", note: `${entries.length} videos` };
+}
 async function expandPlaylist(item) {
+  if (item.ytList) return expandYouTubePlaylist(item);
+  const full = await spotifyPlaylistApi(item).catch((e) => ({ status: "failed", note: e.message }));
+  if (full && full.status !== "failed") return full;
   const e = await spotifyEmbed("playlist", item.spotifyId);
   const tracks = (e.trackList || []).filter((t) => t.title && (t.entityType || "track") === "track");
-  if (!tracks.length) return { status: "failed", note: "playlist is empty or private" };
+  if (!tracks.length) return { status: "failed", note: full?.note || "playlist is empty or private" };
   insertChildren(item, tracks.map((t) => ({
     type: "song", query: `${t.subtitle} - ${t.title}`,
     meta: { title: t.title, artist: t.subtitle || "", seconds: Math.round((t.duration || 0) / 1000), spotifyUrl: spUrl(t.uri), lookup: true },
   })));
-  return { status: "working", title: e.name, artist: e.subtitle || "" };
+  return { status: "working", title: e.name, artist: e.subtitle || "",
+    note: tracks.length >= 100 && !config.spotifyClientId ? "Spotify only shows 100 songs without keys - add them in Config to get all" : undefined };
+}
+// ---- importing a profile: every public playlist of a Spotify user or a YouTube channel becomes a request
+const SPOTIFY_USER = /open\.spotify\.com\/(?:intl-[a-z-]+\/)?user\/([^/?#\s]+)/i;
+const YT_CHANNEL = /(?:youtube\.com|music\.youtube\.com)\/((?:@[\w.-]+)|(?:channel\/[\w-]+)|(?:c\/[\w.-]+)|(?:user\/[\w.-]+))/i;
+async function profilePlaylists(link) {
+  let m;
+  if ((m = link.match(SPOTIFY_USER))) {
+    if (!config.spotifyClientId) throw new Error("importing a Spotify profile needs the Spotify keys in Hermes Music's Config");
+    const out = [];
+    for (let next = `/users/${encodeURIComponent(decodeURIComponent(m[1]))}/playlists?limit=50`; next;) {
+      const page = await spotifyApi(next);
+      for (const p of page.items || []) if (p && p.id && p.public !== false) out.push({ spotifyId: p.id, name: p.name });
+      next = page.next ? page.next.replace("https://api.spotify.com/v1", "") : null;
+      if (out.length > 300) break;
+    }
+    return out;
+  }
+  if ((m = link.match(YT_CHANNEL))) {
+    const r = await run("yt-dlp", ["--flat-playlist", "--no-warnings", "-J", `https://www.youtube.com/${m[1]}/playlists`], { timeout: 300000 });
+    let j = null; try { j = JSON.parse(r.out); } catch {}
+    if (!j) throw new Error(botNote(r.err) || "couldn't read that YouTube channel");
+    return (j.entries || []).filter((e) => e.id && /^(PL|OL|VL|UU|LL|RD)?[\w-]{10,}$/.test(e.id)).map((e) => ({ ytList: e.id.replace(/^VL/, ""), name: e.title || "playlist" }));
+  }
+  return null;
 }
 
 // Picks the album whose name best matches the request.
@@ -757,7 +880,11 @@ function destFor(meta, ext) {
 async function finishSong(raw, ext, meta, thumb) {
   const artist = clean(meta.artist), title = clean(meta.title);
   const albumArtist = clean(meta.albumArtist || artist), album = clean(meta.album);
-  const { dir, dest } = destFor(meta, ext);
+  let { dir, dest } = destFor(meta, ext);
+  if (fs.existsSync(dest) && meta.album && !meta.karaoke) { // another version of the song (different album) has that name
+    const alt = dest.replace(/(\.[^.]+)$/, ` (${clean(cleanAlbum(meta.album))})$1`);
+    if (!fs.existsSync(alt)) dest = alt;
+  }
   if (fs.existsSync(dest)) return "already in the library";
   let cover = null;
   if (config.embedArt) {
@@ -954,9 +1081,9 @@ async function processSong(item) {
   if (item.meta?.lookup) item.meta = await enrich(item.meta); // playlist song: find its album
   let meta = item.meta;
   if (meta) { // from an album/artist/playlist request or link: exact song known
-    if (inLibrary(meta.artist, meta.title) || inLibrary(meta.albumArtist, meta.title)) return { status: "done", artist: meta.artist, title: meta.title, note: "already in the library" };
+    if (inLibrary(meta.artist, meta.title, meta.album) || inLibrary(meta.albumArtist, meta.title, meta.album)) return { status: "done", artist: meta.artist, title: meta.title, note: "already in the library" };
     return withBackup(async () => {
-      const id = await findVideo(meta);
+      const id = meta.videoId || await findVideo(meta);
       return id ? songDone(meta, await saveSong(id, meta)) : null; // null = no match, let the backup try
     }, meta, null, "no matching YouTube video");
   }
@@ -2063,6 +2190,8 @@ let profiles = readJson(PROFILES, {}), playlistThemes = readJson(THEMES, {});
 let groupStats = readJson(STATS, { weeks: {}, days: {}, totalSeconds: 0, totalRequests: 0, stationSeconds: 0 });
 let milestones = readJson(MILESTONES, []), friendGroup = readJson(FRIENDS, { name: "The group", bio: "", picture: null });
 let follows = readJson(FOLLOWS, []);
+const FEEDBACK = "/data/feedback.json";
+let feedback = readJson(FEEDBACK, []);
 let profilesDirty = false, statsDirty = false;
 const saveProfiles = () => { profilesDirty = false; fs.writeFileSync(PROFILES, JSON.stringify(profiles)); };
 const saveThemes = () => fs.writeFileSync(THEMES, JSON.stringify(playlistThemes));
@@ -2842,6 +2971,31 @@ async function sourRoute(req, res, p, get, post, url) {
     saveProfiles();
     return send(res, 200, mine());
   }
+  if (p === "/api/feedback") {
+    if (post) { // { kind: bug | idea, text, profile, key, version, platform } or, for admins, { id, done }
+      const b = await readBody(req, 20000);
+      const who = ownProfile(String(b.profile || ""), b.key);
+      if (!who) return send(res, 403, { error: "set up your profile first" });
+      if (b.id) {
+        if (!isAdmin(who)) return send(res, 403, { error: "only admins can do that" });
+        const f = feedback.find((x) => x.id === b.id);
+        if (!f) return send(res, 404, { error: "that report is gone" });
+        if (b.remove) feedback = feedback.filter((x) => x !== f); else f.done = !!b.done;
+        fs.writeFileSync(FEEDBACK, JSON.stringify(feedback));
+        return send(res, 200, { ok: true });
+      }
+      const text = clean1(b.text, 2000).trim();
+      if (text.length < 3) return send(res, 400, { error: "write a little more" });
+      feedback.unshift({ id: sid(), kind: b.kind === "idea" ? "idea" : "bug", text, by: who.id, byName: who.name, at: Date.now(),
+        version: clean1(b.version, 30), platform: clean1(b.platform, 40), done: false });
+      feedback = feedback.slice(0, 500);
+      fs.writeFileSync(FEEDBACK, JSON.stringify(feedback));
+      return send(res, 201, { ok: true });
+    }
+    const viewer = ownProfile(String(url.searchParams.get("profile") || ""), url.searchParams.get("key"));
+    if (!viewer || !isAdmin(viewer)) return send(res, 403, { error: "only admins can read the reports" });
+    return send(res, 200, feedback);
+  }
   if (get && p === "/api/playlist-themes") { // every themed playlist (the Sour Stage uses a playlist's picture as its backdrop)
     return send(res, 200, Object.entries(playlistThemes).map(([id, t]) => ({ id, color: t.color || null, image: t.image ? t.image.v : 0 })));
   }
@@ -2869,7 +3023,7 @@ async function sourRoute(req, res, p, get, post, url) {
   if ((m = p.match(/^\/api\/playlist-themes\/([\w-]{1,80})(\/image)?$/))) { // a playlist's look, shared by everyone
     const id = m[1], t = playlistThemes[id];
     if (get && m[2]) return sendImage(res, `playlist-${id}`, t && t.image);
-    if (get) return t ? send(res, 200, { color: t.color, image: t.image ? t.image.v : 0, owner: t.owner, ownerName: profiles[t.owner]?.name || null, font: t.font || null })
+    if (get) return t ? send(res, 200, { color: t.color, opacity: t.opacity ?? 100, image: t.image ? t.image.v : 0, owner: t.owner, ownerName: profiles[t.owner]?.name || null, font: t.font || null })
       : send(res, 404, { error: "no theme" });
     if (!post || m[2]) return send(res, 404, { error: "not found" });
     const b = await readBody(req, 9000000);
@@ -2879,6 +3033,7 @@ async function sourRoute(req, res, p, get, post, url) {
     if (b.remove) { if (t) storeImage(`playlist-${id}`, null, t.image); delete playlistThemes[id]; saveThemes(); return send(res, 200, { removed: true }); }
     const theme = t || { owner: me.id, color: null, image: null };
     if (b.color !== undefined) theme.color = cleanColor(b.color);
+    if (b.opacity !== undefined) { const o = Math.round(Number(b.opacity)); theme.opacity = o >= 10 && o <= 100 ? o : 100; }
     if (b.font !== undefined) {
       const font = b.font ? clean1(b.font, 30) : null;
       if (font && PERKS[font] && !perksOf(me.id).includes(font)) return send(res, 403, { error: "that font isn't yours to use" });
@@ -2892,7 +3047,7 @@ async function sourRoute(req, res, p, get, post, url) {
     theme.updated = new Date().toISOString();
     playlistThemes[id] = theme;
     saveThemes();
-    return send(res, 200, { color: theme.color, image: theme.image ? theme.image.v : 0, owner: theme.owner, ownerName: me.name, font: theme.font || null });
+    return send(res, 200, { color: theme.color, opacity: theme.opacity ?? 100, image: theme.image ? theme.image.v : 0, owner: theme.owner, ownerName: me.name, font: theme.font || null });
   }
   return send(res, 404, { error: "not found" });
 }
@@ -2961,7 +3116,7 @@ async function checkFollows() {
   }
   if (changed) { fs.writeFileSync(FOLLOWS, JSON.stringify(follows)); save(); wake(); }
 }
-setTimeout(() => { checkFollows(); setInterval(checkFollows, 6 * 3600 * 1000); }, 120000);
+setTimeout(() => { checkFollows(); setInterval(checkFollows, 30 * 60 * 1000); }, 120000); // every half hour (was 6 hours)
 
 // ---------- http ----------
 const send = (res, code, body, type = "application/json", extra = {}) => {
@@ -2982,7 +3137,7 @@ http.createServer(async (req, res) => {
   const p = url.pathname, get = req.method === "GET", post = req.method === "POST";
   const SOUR_ROUTES = ["/api/presence", "/api/leaderboard", "/api/song-of-the-day", "/api/group-top", "/api/milestones", "/api/follows"];
   const SOUR_PREFIXES = ["/api/profiles", "/api/playlist-themes", "/api/friend-group", "/api/activity", "/api/gifts", "/api/capsules", "/api/song-notes",
-    "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke"];
+    "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke", "/api/feedback"];
   const isSour = SOUR_PREFIXES.some((x) => p.startsWith(x)) || SOUR_ROUTES.includes(p);
   if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/requests") || p.startsWith("/api/library") || p.startsWith("/api/duplicates") || isSour
     || ["/api/status", "/api/now", "/api/bump"].includes(p)) { // used by Sour Player (the custom Feishin)
@@ -3127,6 +3282,10 @@ http.createServer(async (req, res) => {
   if (p === "/api/library/issues") {
     if (post) { scanIssues(); return send(res, 200, { started: true }); }
     return send(res, 200, issues);
+  }
+  if (p === "/api/library/fix-all") { // POST starts it, GET shows how far it got
+    if (post) { runFixAll(); return send(res, 200, { started: true }); }
+    return send(res, 200, fixAll);
   }
   if (post && p === "/api/library/fix") { // { file, action: retag | upgrade }
     const b = await readBody(req);
@@ -3432,6 +3591,18 @@ Reply with ONE line of JSON and nothing else: {"songs":["Artist - Title", ...]} 
     const item = { id: newId(), type, query: q, status: "pending", created: new Date().toISOString() };
     if (b.by) item.askedBy = String(b.by).slice(0, 40); // name of who asked (from Sour Player)
     if (typeof b.profile === "string" && profiles[b.profile]) { item.profile = b.profile; sourStat(b.profile, "requests", 1); }
+    if (SPOTIFY_USER.test(q) || (YT_CHANNEL.test(q) && !YT_PLAYLIST.test(q) && !/watch\?/.test(q))) { // a whole profile
+      try {
+        const lists = await profilePlaylists(q);
+        if (!lists || !lists.length) return send(res, 404, { error: "no public playlists found on that profile" });
+        for (const l of lists) items.push({ id: newId(), type: "playlist", query: l.name, status: "pending", created: item.created, ...(l.spotifyId ? { spotifyId: l.spotifyId } : { ytList: l.ytList }),
+          askedBy: item.askedBy, profile: item.profile });
+        save(); wake();
+        return send(res, 201, { ...item, type: "profile", status: "done", title: `${lists.length} playlists`, imported: lists.length });
+      } catch (e) { return send(res, 400, { error: e.message }); }
+    }
+    const yt = q.match(YT_PLAYLIST);
+    if (yt && !q.match(SPOTIFY_LINK)) { item.type = "playlist"; item.ytList = yt[1]; }
     const link = q.match(SPOTIFY_LINK); // a pasted Spotify link decides the type by itself
     if (link) {
       item.type = link[1].toLowerCase() === "track" ? "song" : link[1].toLowerCase();

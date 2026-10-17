@@ -152,7 +152,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             <div id="sess">Session: -</div>
           </div>
           <div class="rt">
-            <h2>Hermes Music v3.4.1</h2>
+            <h2>Hermes Music v3.5.0</h2>
             <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
             <div class="sec"><span class="k">&#9662; Workers</span><br><span id="w-worker" class="d">-</span></div>
             <div class="sec"><span class="k">&#9662; Library</span><br><span class="d" id="w-lib">-</span></div>
@@ -399,8 +399,13 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
       <div class="row"><label for="c-folders">Artist folders<small>music/Artist/Album/Song, off = all in one folder</small></label><input type="checkbox" id="c-folders"></div>
 
       <div class="grp">&#9662; Albums &amp; artists</div>
-      <div class="row"><label for="c-maxalb">Max albums per artist<small>newest first, for /artist</small></label><input type="number" id="c-maxalb" min="1" max="50"></div>
+      <div class="row"><label for="c-maxalb">Max albums per artist<small>newest first, for /artist</small></label><input type="number" id="c-maxalb" min="1" max="500"></div>
       <div class="row"><label for="c-singles">Include singles &amp; EPs<small>for /artist</small></label><input type="checkbox" id="c-singles"></div>
+
+      <div class="grp">&#9662; Spotify (optional)</div>
+      <p class="sub2">Without keys, Spotify playlists stop at 100 songs. With a free Spotify developer app you get whole playlists and can import a whole profile: developer.spotify.com/dashboard &rarr; Create app (any name, redirect URI http://localhost/callback, tick Web API) &rarr; Settings &rarr; copy the Client ID and secret here.</p>
+      <div class="row"><label for="c-spid">Client ID<small id="sphint">not set</small></label><input type="password" id="c-spid" placeholder="blank = keep" autocomplete="off"></div>
+      <div class="row"><label for="c-spsec">Client secret</label><input type="password" id="c-spsec" placeholder="blank = keep" autocomplete="off"></div>
 
       <div class="grp">&#9662; Downtify backup</div>
       <p class="sub2">Optional. Only used when Hermes Music can&#39;t find or download a song itself. Needs the Downtify app on this Umbrel.
@@ -575,6 +580,9 @@ const HELP = [
   "/karaoke SONG    download the instrumental, to sing along in Sour Player's Stage, e.g. /karaoke toby fox hotel",
   '/yes  /no        answer "Is this the song?" for the newest question (or use its buttons)',
   "spotify link     paste a Spotify song, album, playlist or artist link",
+  "youtube link     paste a YouTube or YouTube Music playlist link to download every song in it",
+  "profile link     paste a Spotify profile or YouTube channel link: all its public playlists get requested",
+  "/fix-all         fix every song with missing or junk tags (Untitled, Unknown Artist...) or no cover",
   "/now NUMBER      move that queue number to the front, e.g. /now 3",
   "/bump NAME       push something already queued to the front",
   "/duplicate       find copies of the same song (then /duplicate confirm)",
@@ -693,6 +701,23 @@ $("f").onsubmit = async (e) => {
         }
       } catch (e) { push("err", e.message); }
     }
+    else if (name === "/fix-all") {
+      try {
+        await api("api/library/fix-all", { method: "POST" });
+        push("sys", "checking every song, then fixing tags, artists, albums and covers (big libraries take a while)...");
+        render();
+        let r;
+        for (;;) {
+          await new Promise((ok) => setTimeout(ok, 3000)); r = await api("api/library/fix-all");
+          if (!r.running) break;
+          const pending = local[local.length - 1];
+          const text = r.total ? "fixing " + r.done + "/" + r.total + (r.last ? " - " + r.last : "") : "checking the library...";
+          if (pending && pending.cls === "sys" && /^(fixing|checking the library)/.test(pending.text)) pending.text = text; else push("sys", text);
+          render();
+        }
+        push("ok", r.total ? r.fixed + " fixed" + (r.failed ? ", " + r.failed + " couldn't be fixed (no match on iTunes/Deezer - rename them 'Artist - Title')" : "") : "nothing needed fixing");
+      } catch (e) { push("err", e.message); }
+    }
     else if (name === "/fix" || name === "/upgrade") {
       const n = parseInt(args[0], 10), it = lastIssues[n - 1];
       if (!it) push("err", "run /issues first, then use a number from its list, e.g. " + name + " 3");
@@ -784,6 +809,7 @@ function fillCfg() {
   $("dthint").textContent = cfg.hasDowntifyPassword ? "a password is saved" : "blank = default (downtify)";
   $("pairhint").textContent = cfg.downtifyPaired ? "\u2714 paired (type - and Save to unpair)" : "best: no password needed"; $("c-dtcode").value = "";
   $("c-singles").checked = cfg.includeSingles; $("c-token").value = "";
+  $("c-spid").value = ""; $("c-spsec").value = ""; $("sphint").textContent = cfg.hasSpotify ? "keys are saved" : "not set";
   $("tokhint").textContent = cfg.hasToken ? "a token is saved" : "run: claude setup-token";
   $("r-cur").style.display = cfg.hasPin ? "" : "none"; $("c-cur").value = ""; $("c-pin").value = "";
   showEngine();
@@ -796,6 +822,7 @@ $("c-save").onclick = async () => {
       localUrl: $("c-url").value, localModel: $("c-lmodel").value, contextLength: +$("c-ctx").value, localKey: $("c-key").value,
       audioFormat: $("c-fmt").value, maxMinutes: +$("c-max").value, embedArt: $("c-art").checked, artistFolders: $("c-folders").checked,
       artistMaxAlbums: +$("c-maxalb").value, includeSingles: $("c-singles").checked,
+      spotifyClientId: $("c-spid").value.trim(), spotifySecret: $("c-spsec").value.trim(),
       navidromeUrl: $("c-ndurl").value,
       downtifyEnabled: $("c-dten").checked, downtifyUrl: $("c-dturl").value, downtifyUser: $("c-dtuser").value, downtifyPassword: $("c-dtpass").value, downtifyToken: $("c-dtcode").value.trim() === "-" ? "-" : undefined,
       paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, claudeToken: $("c-token").value,
