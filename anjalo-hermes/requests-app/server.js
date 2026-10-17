@@ -2774,16 +2774,25 @@ async function sourRoute(req, res, p, get, post, url) {
         }
       }
     }
-    if (song && b.playing && (!me.listening || me.listening.id !== song.id)) countPlay(me, song);
+    // Each device (computer, phone...) reports on its own; what friends see comes from the one that's
+    // actually playing, so a phone playing and a computer sitting idle no longer take turns
+    const dev = clean1(b.device, 40) || "default";
+    me.devices = me.devices && typeof me.devices === "object" ? me.devices : {};
+    const before = me.devices[dev];
+    if (song && b.playing && (!before || !before.listening || before.listening.id !== song.id)) countPlay(me, song);
+    me.devices[dev] = { listening: song, playing: !!b.playing, position: Number(b.position) || 0, at: now, on: b.on === "phone" ? "phone" : "computer" };
+    for (const [k, d] of Object.entries(me.devices)) if (!d || now - (d.at || 0) > ONLINE_MS) delete me.devices[k];
+    const devs = Object.values(me.devices).sort((x, y) => y.at - x.at);
+    const best = devs.find((d) => d.playing && d.listening) || devs.find((d) => d.listening) || me.devices[dev];
     if (!isInvisible(me)) me.lastOfflineSeen = now;
     me.lastSeen = now;
-    me.listening = song;
-    me.playing = !!b.playing;
-    me.on = b.on === "phone" ? "phone" : "computer"; // where they listen (shown as "on their phone")
-    me.position = Number(b.position) || 0;
-    me.positionAt = now;
+    me.listening = best.listening;
+    me.playing = best.playing;
+    me.on = best.on; // where they listen (shown as "on their phone")
+    me.position = best.position;
+    me.positionAt = best.at;
     me.group = b.group && typeof b.group.code === "string" ? { code: clean1(b.group.code, 5), name: clean1(b.group.name, 60) } : null;
-    if (song) me.lastPlayback = { song, position: me.position, at: now, device: clean1(b.device, 40) };
+    if (song) me.lastPlayback = { song, position: Number(b.position) || 0, at: now, device: clean1(b.device, 40) };
     profilesDirty = true;
     return send(res, 200, { ok: true });
   }
