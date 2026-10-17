@@ -2267,7 +2267,9 @@ const keyHashes = (p) => p.keyHashes || (p.keyHash ? [p.keyHash] : []);
 // from Sour Player, and a royal blue name. Hermes Music tells only those profiles and refuses them for others.
 const PERKS = { determination: true, admin: true };
 const isAdmin = (p) => !!p && !p.mergedInto && !!(p.admin || p.adminManual);
-const perksOf = (id) => (isAdmin(profiles[id]) ? Object.keys(PERKS) : []);
+// Gavin's own extras: his Navidrome account or profile name is Gavin
+const isGavin = (p) => !!p && !p.mergedInto && [p.navidrome, p.name].some((n) => String(n || "").trim().toLowerCase() === "gavin");
+const perksOf = (id) => [...(isAdmin(profiles[id]) ? Object.keys(PERKS) : []), ...(isGavin(profiles[id]) ? ["gavin", "skyrim"] : [])];
 // removes a Sour Player profile for good (and the old profiles merged into it), with its pictures
 function deleteProfile(id) {
   if (!profiles[id]) return false;
@@ -2349,6 +2351,7 @@ function publicProfile(p, self = false) {
     wall: hidden ? [] : (p.wall || []).slice(0, 30), nicknames: hidden ? [] : (p.nicknames || []).slice(0, 20),
     away: !online ? p.away || "" : "",
     admin: isAdmin(p),
+    gavin: isGavin(p),
   };
   if (!hidden && !priv.hideStats) out.stats = profileStats(p);
   if (self) Object.assign(out, { account: p.navidrome || null, visits: p.custom && p.custom.visits ? p.visits || [] : [], avatarHistory: (p.avatarHistory || []).map((h) => h.v), resume: p.lastPlayback || null, perks: perksOf(p.id) });
