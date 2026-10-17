@@ -152,7 +152,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             <div id="sess">Session: -</div>
           </div>
           <div class="rt">
-            <h2>Hermes Music v3.5.2</h2>
+            <h2>Hermes Music v3.6.0</h2>
             <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
             <div class="sec"><span class="k">&#9662; Workers</span><br><span id="w-worker" class="d">-</span></div>
             <div class="sec"><span class="k">&#9662; Library</span><br><span class="d" id="w-lib">-</span></div>
@@ -177,11 +177,13 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
               <a id="dl-appimage" href="https://github.com/Urmomnumber1/feishin/releases/latest/download/Sour-Player-linux-x86_64.AppImage">Linux (any)<small>AppImage</small></a>
               <a id="dl-deb" href="https://github.com/Urmomnumber1/feishin/releases/latest/download/Sour-Player-linux-amd64.deb">Linux (Ubuntu / Mint / Debian)<small>.deb</small></a>
               <a id="dl-mac" href="https://github.com/Urmomnumber1/feishin/releases/latest/download/Sour-Player-mac-arm64.dmg">Mac (Apple chip, 2020+)<small>.dmg - test</small></a>
+              <a id="dl-android" href="api/android.apk">Android phone<small id="dl-android-v">.apk</small></a>
               <a id="dl-mac-intel" href="https://github.com/Urmomnumber1/feishin/releases/latest/download/Sour-Player-mac-x64.dmg">Mac (Intel)<small>.dmg - test</small></a>
             </div>
             <ol>
               <li><b>Not sure which you have?</b> If your computer has a Start button with the Windows logo, pick <b>Windows</b>. Almost every PC and laptop from a shop runs Windows. Linux is something you would have installed on purpose.</li>
               <li><b>Windows:</b> open the downloaded file. If Windows says the app is unrecognised, click <b>More info</b> &gt; <b>Run anyway</b>.</li>
+              <li><b>Android:</b> open this page on your phone and tap <b>Android phone</b>, then open the downloaded file (allow installing from your browser when Android asks). It updates itself after that.</li>
               <li><b>Linux AppImage:</b> right-click it &gt; Properties &gt; allow running as a program (or <code>chmod +x</code>), then open it. <b>.deb:</b> double-click it, or <code>sudo apt install ./Sour-Player-linux-amd64.deb</code>.</li>
               <li>In Sour Player: add your music server (Navidrome), then <b>Settings &gt; General &gt; Music videos</b> &gt; Hermes Music address: <code id="dl-addr">this page&#39;s address</code>.</li>
               <li>It updates itself: when a new version is ready, an <b>Update</b> button shows up in the player bar.</li>
@@ -768,7 +770,8 @@ $("f").onsubmit = async (e) => {
   const ua = navigator.userAgent, guess = $("dl-guess");
   if (!guess) return;
   let pick = null, text = "";
-  if (/Android|iPhone|iPad/i.test(ua)) text = "You're on a phone or tablet: Sour Player is a computer app, so download it on your PC.";
+  if (/Android/i.test(ua)) { pick = "dl-android"; text = "This is an <b>Android</b> phone - use the highlighted button."; }
+  else if (/iPhone|iPad/i.test(ua)) text = "You're on an iPhone or iPad: the iPhone version is on the way. Until then, use Sour Player on a computer or an Android phone.";
   else if (/Windows/i.test(ua)) { pick = "dl-win"; text = "This computer runs <b>Windows</b> - use the highlighted button."; }
   else if (/Mac OS X|Macintosh/i.test(ua)) { pick = "dl-mac"; text = "This is a <b>Mac</b> - the Mac version is new: the first time, right-click Sour Player and choose Open (it isn't signed by Apple). Older Intel Macs use the Intel download."; }
   else if (/Ubuntu|Debian|Mint/i.test(ua)) { pick = "dl-deb"; text = "This computer runs <b>Linux</b> - use the highlighted button."; }
@@ -776,6 +779,7 @@ $("f").onsubmit = async (e) => {
   guess.innerHTML = text;
   if (pick) $(pick).classList.add("pick");
   if ($("dl-addr") && location.protocol !== "file:") $("dl-addr").textContent = location.origin;
+  fetch("api/android.apk?info=1").then((r) => r.json()).then((j) => { if (j.version) $("dl-android-v").textContent = ".apk - v" + j.version; }).catch(() => {});
 })();
 
 function tab(name) {

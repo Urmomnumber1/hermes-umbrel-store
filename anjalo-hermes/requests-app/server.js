@@ -352,6 +352,7 @@ async function fixSong(rel, action) {
       const outExt = path.extname(src).slice(1).toLowerCase();
       let cover = null;
       if (meta.cover && await fetchFile(meta.cover, path.join(ST(), "cover.jpg")).catch(() => false)) cover = path.join(ST(), "cover.jpg");
+      else if (await fallbackCover(meta.artist, meta.title, path.join(ST(), "cover.jpg"))) cover = path.join(ST(), "cover.jpg");
       const out = path.join(ST(), `fixed.${outExt}`);
       const tags = { title: meta.title, artist: meta.artist, album_artist: meta.albumArtist || meta.artist, album: meta.album, date: meta.date, track: meta.track, genre: meta.genre };
       let t = await run("ffmpeg", tagArgs(src, cover, out, outExt, tags), { timeout: 120000 });
@@ -809,6 +810,30 @@ function bestVideo(results, meta, artist) {
 }
 
 // ---------- download + tag ----------
+// no cover from iTunes or Deezer: Spotify's album picture (with Spotify keys), else the song's YouTube /
+// YouTube Music thumbnail cut to a square (Topic uploads are the album art with bars on the sides)
+async function fallbackCover(artist, title, file) {
+  try {
+    const q = encodeURIComponent(`track:${title} artist:${artist}`);
+    const sp = await spotifyApi(`/v1/search?type=track&limit=1&q=${q}`);
+    const img = sp?.tracks?.items?.[0]?.album?.images?.[0]?.url;
+    if (img && await fetchFile(img, file)) return true;
+  } catch { /* no keys or nothing found */ }
+  try {
+    const hits = await ytSearch(`${artist} ${title}`, 3);
+    const hit = hits.find((h) => / - Topic$/.test(h.channel || "")) || hits[0];
+    if (!hit) return false;
+    const raw = file + ".thumb.jpg";
+    const got = await fetchFile(`https://i.ytimg.com/vi/${hit.id}/maxresdefault.jpg`, raw).catch(() => false)
+      || await fetchFile(`https://i.ytimg.com/vi/${hit.id}/hqdefault.jpg`, raw).catch(() => false);
+    if (!got) return false;
+    const r = await run("ffmpeg", ["-y", "-loglevel", "error", "-i", raw, "-vf", "crop='min(iw,ih)':'min(iw,ih)'", "-q:v", "2", file], { timeout: 60000 });
+    fs.rmSync(raw, { force: true });
+    return r.code === 0 && fs.existsSync(file);
+  } catch {
+    return false;
+  }
+}
 async function fetchFile(url, file) {
   const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
   if (!res.ok) return false;
@@ -2198,6 +2223,7 @@ const saveThemes = () => fs.writeFileSync(THEMES, JSON.stringify(playlistThemes)
 const saveStats = () => { statsDirty = false; fs.writeFileSync(STATS, JSON.stringify(groupStats)); };
 setInterval(() => { if (profilesDirty) saveProfiles(); if (statsDirty) saveStats(); }, 30000); // heartbeats change these a lot
 const hashKey = (k) => crypto.createHash("sha256").update(String(k)).digest("hex");
+let androidApk = null; // newest Android release, looked up at most every 30 minutes
 const ONLINE_MS = 45000;
 const cleanColor = (v) => (typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v) ? v.toLowerCase() : null);
 const cleanSongs = (list, n) => (Array.isArray(list) ? list : []).map(groupSong).filter(Boolean).slice(0, n);
@@ -3163,6 +3189,24 @@ http.createServer(async (req, res) => {
 
   if (get && p === "/") return send(res, 200, PAGE, "text/html");
 
+  if (get && p === "/api/android.apk") { // the newest Sour Player for Android (the mobile-v... releases)
+    try {
+      if (!androidApk || Date.now() - androidApk.at > 30 * 60 * 1000) {
+        const r = await fetch("https://api.github.com/repos/Urmomnumber1/feishin/releases?per_page=30", { signal: AbortSignal.timeout(15000), headers: { "user-agent": "hermes-music" } });
+        const list = await r.json();
+        const build = (rel) => Number(((rel.assets || []).find((a) => a.name.endsWith(".apk")) || {}).name?.match(/-(\d+)\.apk$/)?.[1] || 0);
+        const best = (Array.isArray(list) ? list : []).filter((rel) => String(rel.tag_name).startsWith("mobile-v") && (rel.assets || []).some((a) => a.name.endsWith(".apk")))
+          .sort((a, b) => build(b) - build(a) || new Date(b.published_at) - new Date(a.published_at))[0];
+        if (best) androidApk = { at: Date.now(), url: best.assets.find((a) => a.name.endsWith(".apk")).browser_download_url, version: best.tag_name.replace("mobile-v", "") };
+      }
+      if (!androidApk) return send(res, 404, { error: "no Android version yet" });
+      if (url.searchParams.get("info")) return send(res, 200, { version: androidApk.version, url: androidApk.url });
+      res.writeHead(302, { location: androidApk.url });
+      return res.end();
+    } catch {
+      return send(res, 502, { error: "GitHub didn't answer, try again in a minute" });
+    }
+  }
   if (get && p === "/api/status") {
     const tops = items.filter((i) => !i.parent);
     const c = (s) => tops.filter((i) => i.status === s).length;
