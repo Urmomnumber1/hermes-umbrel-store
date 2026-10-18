@@ -2274,7 +2274,9 @@ function serveWebApp(p, res) {
   }
   let rel = "";
   try { rel = decodeURIComponent(p.slice(5)); } catch { rel = ""; }
-  if (!rel || rel.endsWith("/")) rel += "index.html";
+  // a folder inside the app (e.g. /app/assets/, where Home Screen icons added before 3.7.2 open): the app
+  if (rel && rel.endsWith("/")) { res.writeHead(302, { location: "/app/" }); return res.end(); }
+  if (!rel) rel = "index.html";
   if (rel === "settings.js") { res.writeHead(200, { "content-type": "text/javascript", "cache-control": "no-cache" }); return res.end("// set by Hermes Music\n"); }
   const root = path.resolve(WEB_DIR);
   const file = path.resolve(root, rel);
@@ -2284,6 +2286,17 @@ function serveWebApp(p, res) {
     return serveWebApp("/app/", res);
   }
   const type = WEB_TYPES[path.extname(file).toLowerCase()] || "application/octet-stream";
+  // the manifest sits in assets/, so its "./" start address meant /app/assets/ (a white screen on the
+  // iPhone Home Screen): always start at the app itself
+  if (file.endsWith(".webmanifest")) {
+    try {
+      const m = JSON.parse(fs.readFileSync(file, "utf8"));
+      Object.assign(m, { start_url: "/app/", scope: "/app/", id: "/app/" });
+      m.icons = (m.icons || []).map((i) => ({ ...i, src: new URL(i.src, "http://x/app/assets/").pathname }));
+      res.writeHead(200, { "content-type": type, "cache-control": "no-cache" });
+      return res.end(JSON.stringify(m));
+    } catch { /* serve it as it is */ }
+  }
   if (file.endsWith("index.html")) {
     const html = fs.readFileSync(file, "utf8").replace("</head>", APPLE_META + "</head>");
     res.writeHead(200, { "content-type": type, "cache-control": "no-cache" });
