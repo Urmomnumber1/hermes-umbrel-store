@@ -2236,7 +2236,8 @@ async function updateWebApp() {
     const asset = (rel.assets || []).find((a) => a.name === "sour-web.tar.gz");
     if (!asset) return;
     const mark = path.join(WEB_DIR, ".version");
-    if (fs.existsSync(mark) && fs.readFileSync(mark, "utf8") === rel.tag_name) return;
+    const stamp = `${rel.tag_name}:${asset.id}`; // a re-uploaded web build counts as new
+    if (fs.existsSync(mark) && fs.readFileSync(mark, "utf8") === stamp) return;
     const tmp = WEB_DIR + ".new";
     fs.rmSync(tmp, { recursive: true, force: true });
     fs.mkdirSync(tmp, { recursive: true });
@@ -2247,7 +2248,7 @@ async function updateWebApp() {
     const t = await run("tar", ["-xzf", tgz, "-C", tmp], { timeout: 120000 });
     fs.rmSync(tgz, { force: true });
     if (t.code !== 0 || !fs.existsSync(path.join(tmp, "index.html"))) { console.warn("Sour Player web app: unpacking failed", t.err || t.out || ""); return; }
-    fs.writeFileSync(path.join(tmp, ".version"), rel.tag_name);
+    fs.writeFileSync(path.join(tmp, ".version"), stamp);
     fs.rmSync(WEB_DIR, { recursive: true, force: true });
     fs.renameSync(tmp, WEB_DIR);
     console.log("Sour Player web app updated to", rel.tag_name);
