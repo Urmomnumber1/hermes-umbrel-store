@@ -2223,6 +2223,74 @@ const saveThemes = () => fs.writeFileSync(THEMES, JSON.stringify(playlistThemes)
 const saveStats = () => { statsDirty = false; fs.writeFileSync(STATS, JSON.stringify(groupStats)); };
 setInterval(() => { if (profilesDirty) saveProfiles(); if (statsDirty) saveStats(); }, 30000); // heartbeats change these a lot
 const hashKey = (k) => crypto.createHash("sha256").update(String(k)).digest("hex");
+// ---- Sour Player in the browser, at /app/: on an iPhone, Safari > Share > Add to Home Screen makes it an
+// app (no App Store needed). The web build comes from the newest Sour Player release (sour-web.tar.gz).
+const WEB_DIR = "/data/sour-web";
+let webChecking = false;
+async function updateWebApp() {
+  if (webChecking) return;
+  webChecking = true;
+  try {
+    const r = await fetch("https://api.github.com/repos/Urmomnumber1/feishin/releases/latest", { headers: { "user-agent": "hermes-music" }, signal: AbortSignal.timeout(15000) });
+    const rel = await r.json();
+    const asset = (rel.assets || []).find((a) => a.name === "sour-web.tar.gz");
+    if (!asset) return;
+    const mark = path.join(WEB_DIR, ".version");
+    if (fs.existsSync(mark) && fs.readFileSync(mark, "utf8") === rel.tag_name) return;
+    const tmp = WEB_DIR + ".new";
+    fs.rmSync(tmp, { recursive: true, force: true });
+    fs.mkdirSync(tmp, { recursive: true });
+    const tgz = path.join(tmp, "web.tgz");
+    const dl = await fetch(asset.browser_download_url, { signal: AbortSignal.timeout(5 * 60 * 1000) });
+    if (!dl.ok) return;
+    fs.writeFileSync(tgz, Buffer.from(await dl.arrayBuffer()));
+    const t = await run("tar", ["-xzf", tgz, "-C", tmp], { timeout: 120000 });
+    fs.rmSync(tgz, { force: true });
+    if (t.code !== 0 || !fs.existsSync(path.join(tmp, "index.html"))) { console.warn("Sour Player web app: unpacking failed", t.err || t.out || ""); return; }
+    fs.writeFileSync(path.join(tmp, ".version"), rel.tag_name);
+    fs.rmSync(WEB_DIR, { recursive: true, force: true });
+    fs.renameSync(tmp, WEB_DIR);
+    console.log("Sour Player web app updated to", rel.tag_name);
+  } catch (e) {
+    console.warn("Sour Player web app update failed:", e.message);
+  } finally {
+    webChecking = false;
+  }
+}
+setTimeout(() => { updateWebApp(); setInterval(updateWebApp, 6 * 3600 * 1000); }, 20000);
+const WEB_TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".webmanifest": "application/manifest+json",
+  ".png": "image/png", ".jpg": "image/jpeg", ".svg": "image/svg+xml", ".ico": "image/x-icon", ".webp": "image/webp", ".woff2": "font/woff2", ".woff": "font/woff",
+  ".ttf": "font/ttf", ".otf": "font/otf", ".wasm": "application/wasm", ".dat": "application/octet-stream", ".gz": "application/octet-stream" };
+// iPhone Home Screen: icon, full screen and the name under the icon
+const APPLE_META = '<link rel="apple-touch-icon" href="assets/512x512.png"><meta name="apple-mobile-web-app-capable" content="yes">'
+  + '<meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sour Player">';
+function serveWebApp(p, res) {
+  if (p === "/app") { res.writeHead(302, { location: "/app/" }); return res.end(); }
+  if (!fs.existsSync(path.join(WEB_DIR, "index.html"))) {
+    updateWebApp();
+    res.writeHead(503, { "content-type": "text/html; charset=utf-8", "retry-after": "60" });
+    return res.end("<meta name=viewport content='width=device-width'><p style='font-family:sans-serif;padding:24px'>Sour Player is being set up on this Hermes Music. Try again in a minute.</p>");
+  }
+  let rel = "";
+  try { rel = decodeURIComponent(p.slice(5)); } catch { rel = ""; }
+  if (!rel || rel.endsWith("/")) rel += "index.html";
+  if (rel === "settings.js") { res.writeHead(200, { "content-type": "text/javascript", "cache-control": "no-cache" }); return res.end("// set by Hermes Music\n"); }
+  const root = path.resolve(WEB_DIR);
+  const file = path.resolve(root, rel);
+  if (!file.startsWith(root + path.sep) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+    // the app's own pages (#/...) all start from index.html
+    if (path.extname(rel)) { res.writeHead(404); return res.end(); }
+    return serveWebApp("/app/", res);
+  }
+  const type = WEB_TYPES[path.extname(file).toLowerCase()] || "application/octet-stream";
+  if (file.endsWith("index.html")) {
+    const html = fs.readFileSync(file, "utf8").replace("</head>", APPLE_META + "</head>");
+    res.writeHead(200, { "content-type": type, "cache-control": "no-cache" });
+    return res.end(html);
+  }
+  res.writeHead(200, { "content-type": type, "cache-control": /assets\//.test(file.replace(/\\/g, "/")) ? "public, max-age=31536000, immutable" : "no-cache" });
+  fs.createReadStream(file).pipe(res);
+}
 let androidApk = null; // newest Android release, looked up at most every 30 minutes
 const ONLINE_MS = 45000;
 const cleanColor = (v) => (typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v) ? v.toLowerCase() : null);
@@ -3192,6 +3260,7 @@ http.createServer(async (req, res) => {
 
   if (get && p === "/") return send(res, 200, PAGE, "text/html");
 
+  if (get && (p === "/app" || p.startsWith("/app/"))) return serveWebApp(p, res);
   if (get && p === "/api/android.apk") { // the newest Sour Player for Android (the mobile-v... releases)
     try {
       if (!androidApk || Date.now() - androidApk.at > 30 * 60 * 1000) {
