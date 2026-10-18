@@ -1398,18 +1398,32 @@ const saveVideos = () => fs.writeFileSync(VIDEOS, JSON.stringify(videos, null, 1
 const ytId = (s) => (String(s).match(/(?:youtu\.be\/|[?&]v=|\/shorts\/|\/embed\/|\/live\/)([\w-]{11})/) || [])[1] || null;
 
 // Finds a song in the music folder from text like "mr brightside the killers" or "The Killers - Mr. Brightside".
+// finds a song in the library from what someone typed (/video, /bump...): "Artist - Title", "title artist",
+// or just the title. Forgiving: apostrophes (Lion's / Lions), a leading "The", extra words in the title tag
+// ("- Remastered", "(Official Audio)") and only part of a long title all still match.
+const loose = (x) => norm(String(x || "").replace(/['\u2018\u2019`]/g, "")).replace(/^the /, "");
+const words = (x) => loose(x).split(" ").filter(Boolean);
 function findInLibrary(query) {
-  const q = norm(query), dash = String(query).match(/^(.+?)\s+-\s+(.+)$/);
+  const q = loose(query), dash = String(query).match(/^(.+?)\s+-\s+(.+)$/);
+  const qw = words(query);
   const seen = new Map();
   for (const [file, c] of Object.entries(libCache)) {
     if (!c.t) continue;
-    const t = norm(c.t), a = norm(c.a || c.aa);
+    const t = loose(c.t), a = loose(c.a || c.aa);
     if (!t) continue;
     let score = 0;
-    if (dash && t === norm(dash[2]) && (a === norm(dash[1]) || a.startsWith(norm(dash[1])))) score = 3;
-    else if (dash && t === norm(dash[1]) && (a === norm(dash[2]) || a.startsWith(norm(dash[2])))) score = 3;
+    if (dash && t === loose(dash[2]) && (a === loose(dash[1]) || a.startsWith(loose(dash[1])))) score = 3;
+    else if (dash && t === loose(dash[1]) && (a === loose(dash[2]) || a.startsWith(loose(dash[2])))) score = 3;
     else if (a && q.includes(t) && q.includes(a)) score = 2 + t.length / 1000; // longer title match wins
-    else if (t === q) score = 1;
+    else if (t === q) score = 1.5;
+    else {
+      // every word typed is in the title (and artist), or the whole title is in what was typed
+      const tw = t.split(" "), aw = a.split(" ");
+      const inSong = qw.filter((w) => tw.includes(w) || aw.includes(w)).length;
+      const titleHits = qw.filter((w) => tw.includes(w)).length;
+      if (qw.length >= 2 && inSong === qw.length && titleHits >= Math.min(2, tw.length)) score = 0.8 + titleHits / (tw.length * 10);
+      else if (tw.length >= 2 && q.includes(t)) score = 0.7 + t.length / 1000;
+    }
     if (!score) continue;
     const key = songKey(c.a || c.aa, c.t);
     if (!seen.has(key) || seen.get(key).score < score) seen.set(key, { score, file, artist: c.a || c.aa, title: c.t });
