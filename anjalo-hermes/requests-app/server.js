@@ -2227,6 +2227,7 @@ const hashKey = (k) => crypto.createHash("sha256").update(String(k)).digest("hex
 // app (no App Store needed). The web build comes from the newest Sour Player release (sour-web.tar.gz).
 const WEB_DIR = "/data/sour-web";
 let webChecking = false;
+let webCheckedAt = 0;
 async function updateWebApp() {
   if (webChecking) return;
   webChecking = true;
@@ -2262,11 +2263,14 @@ setTimeout(() => { updateWebApp(); setInterval(updateWebApp, 6 * 3600 * 1000); }
 const WEB_TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".json": "application/json", ".webmanifest": "application/manifest+json",
   ".png": "image/png", ".jpg": "image/jpeg", ".svg": "image/svg+xml", ".ico": "image/x-icon", ".webp": "image/webp", ".woff2": "font/woff2", ".woff": "font/woff",
   ".ttf": "font/ttf", ".otf": "font/otf", ".wasm": "application/wasm", ".dat": "application/octet-stream", ".gz": "application/octet-stream" };
-// iPhone Home Screen: icon, full screen and the name under the icon
+// iPhone Home Screen: icon, full screen (below the status bar, so nothing hides under the clock) and the
+// name under the icon
 const APPLE_META = '<link rel="apple-touch-icon" href="assets/512x512.png"><meta name="apple-mobile-web-app-capable" content="yes">'
-  + '<meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"><meta name="apple-mobile-web-app-title" content="Sour Player">';
+  + '<meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black"><meta name="apple-mobile-web-app-title" content="Sour Player">';
 function serveWebApp(p, res) {
   if (p === "/app") { res.writeHead(302, { location: "/app/" }); return res.end(); }
+  // a newer Sour Player build is picked up within half an hour of someone opening the app
+  if (Date.now() - webCheckedAt > 30 * 60 * 1000) { webCheckedAt = Date.now(); updateWebApp(); }
   if (!fs.existsSync(path.join(WEB_DIR, "index.html"))) {
     updateWebApp();
     res.writeHead(503, { "content-type": "text/html; charset=utf-8", "retry-after": "60" });
