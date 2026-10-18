@@ -735,7 +735,7 @@ Request: ${JSON.stringify(query)}
   return lastJson(r.out || r.err);
 }
 async function ytSearch(query, n = 8) {
-  const s = await run("yt-dlp", [`ytsearch${n}:${query}`, "--skip-download", "--no-warnings",
+  const s = await run("yt-dlp", [`ytsearch${n}:${query}`, "--skip-download", "--no-warnings", "--ignore-errors", // an unavailable result is skipped, not fatal
     "--print", "%(.{id,title,channel,duration})j"], { timeout: 120000 }); // one JSON object per line
   const rows = [];
   for (const l of s.out.split("\n")) {
@@ -1432,7 +1432,7 @@ function findInLibrary(query) {
 }
 // YouTube search with no length limit (videos are often longer than the song).
 async function ytSearchAny(query, n = 10) {
-  const s = await run("yt-dlp", [`ytsearch${n}:${query}`, "--skip-download", "--no-warnings",
+  const s = await run("yt-dlp", [`ytsearch${n}:${query}`, "--skip-download", "--no-warnings", "--ignore-errors", // an unavailable result is skipped, not fatal
     "--print", "%(.{id,title,channel,duration,view_count,channel_is_verified})j"], { timeout: 120000 });
   const rows = [];
   for (const l of s.out.split("\n")) {
