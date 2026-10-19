@@ -1362,7 +1362,12 @@ async function processItem(item, w) {
     Object.assign(item, result);
   } catch (e) {
     w.lastError = e.message;
-    Object.assign(item, { status: "failed", note: e.message.split("\n")[0].slice(0, 200) });
+    // a folder another app made that Hermes may not write into: say so (restarting Hermes fixes it)
+    const denied = e.code === "EACCES" || /EACCES|permission denied/i.test(e.message);
+    const folder = (e.path ? String(e.path).replace(MUSIC, "music") : "") || "a folder in your music folder";
+    Object.assign(item, { status: "failed", note: denied
+      ? `Hermes Music isn't allowed to write into ${folder} (another app made it). Restart Hermes Music in Umbrel - it fixes the permissions - then request it again.`
+      : e.message.split("\n")[0].slice(0, 200) });
     console.error(`[${w.id}] failed`, item.query, e.message);
   } finally {
     w.current = null;

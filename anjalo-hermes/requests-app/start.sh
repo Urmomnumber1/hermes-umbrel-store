@@ -8,8 +8,12 @@ TOOLS=/data/tools
 [ -n "$HM_VERSION" ] && [ -d /data/app ] && find /data/app -mindepth 1 -maxdepth 1 ! -name "$HM_VERSION" -exec rm -rf {} +
 TV=2 # bump to force a fresh download of the cached tools
 mkdir -p "$TOOLS/bin" /data/home /data/staging /music
-# The music folder must be writable by the app user (uid 1000). Only the top folder is changed.
+# The music folder must be writable by the app user (uid 1000): the top folder right away, and in the
+# background every folder or file inside it that something else created (another app, a copy over the
+# network) - otherwise downloads into e.g. an existing artist folder fail with "permission denied".
 [ "$(stat -c %u /music)" = "1000" ] || chown 1000:1000 /music
+( find /music -mindepth 1 \( ! -user 1000 -o ! -group 1000 \) -exec chown 1000:1000 {} + 2>/dev/null
+  find /music -mindepth 1 -type d ! -perm -u+rwx -exec chmod u+rwx {} + 2>/dev/null ) &
 rm -f "$TOOLS/ready" "$TOOLS/setup.log"
 chown 1000:1000 /data /data/home /data/staging "$TOOLS" "$TOOLS/bin"
 
