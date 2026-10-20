@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black" />
+<meta name="apple-mobile-web-app-title" content="Sour TV" />
+<meta name="theme-color" content="#0b0b0f" />
+<link rel="manifest" href="/tv/manifest.webmanifest" />
+<link rel="apple-touch-icon" href="/app/assets/512x512.png" />
+<title>Sour Player TV</title>
+<style>
+  :root { --accent: #9be15d; --bg: #0b0b0f; --card: rgba(255,255,255,.08); --line: rgba(255,255,255,.12); }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; overflow: hidden; }
+  button { font: inherit; color: inherit; cursor: pointer; border: 0; background: none; }
+  input { font: inherit; font-size: 16px; color: #fff; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; width: 100%; outline: none; }
+  input:focus { border-color: var(--accent); }
+  .hidden { display: none !important; }
+  .pill { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 42px; padding: 0 16px; border-radius: 999px; background: rgba(255,255,255,.12); font-weight: 600; font-size: 14px; white-space: nowrap; }
+  .pill.primary { background: var(--accent); color: #111; }
+  .pill:active { transform: scale(.97); }
+  .muted { opacity: .65; }
+
+  /* ---------- sign in / event ---------- */
+  .center { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; padding: max(24px, env(safe-area-inset-top)) 20px max(24px, env(safe-area-inset-bottom)); }
+  .panel { width: min(420px, 100%); display: flex; flex-direction: column; gap: 14px; }
+  .brand { font-size: 13px; font-weight: 800; letter-spacing: .18em; text-transform: uppercase; color: var(--accent); }
+  .big { font-size: 30px; font-weight: 800; line-height: 1.1; }
+  .err { color: #ff8a8a; font-size: 14px; min-height: 18px; }
+  .tip { font-size: 13px; line-height: 1.45; }
+
+  /* ---------- the TV screen ---------- */
+  #tv { position: fixed; inset: 0; display: flex; flex-direction: column; gap: 2vmin;
+    padding: max(3vmin, env(safe-area-inset-top)) max(4vmin, env(safe-area-inset-right)) max(3vmin, env(safe-area-inset-bottom)) max(4vmin, env(safe-area-inset-left)); }
+  #backdrop { position: absolute; inset: -10%; background-size: cover; background-position: center; opacity: .45; filter: blur(60px) saturate(1.4); animation: drift 30s ease-in-out infinite alternate; z-index: 0; }
+  @keyframes drift { from { transform: scale(1.05) translate(-2%, -1%); } to { transform: scale(1.15) translate(2%, 1%); } }
+  #tv > header, #tv > main, #tv > footer { position: relative; z-index: 1; }
+  #tv > header { display: flex; justify-content: space-between; align-items: flex-start; }
+  .event { font-size: clamp(20px, 4.5vmin, 44px); font-weight: 800; line-height: 1.1; }
+  .clock { font-size: clamp(16px, 3.5vmin, 34px); font-weight: 600; font-variant-numeric: tabular-nums; opacity: .85; }
+  #tv > main { flex: 1; min-height: 0; display: flex; align-items: center; gap: 5vmin; }
+  .cover { flex-shrink: 0; width: min(46vmin, 40vw); aspect-ratio: 1; border-radius: 3vmin; overflow: hidden; background: var(--card) center/cover no-repeat; box-shadow: 0 30px 80px rgba(0,0,0,.55); display: grid; place-items: center; font-size: 12vmin; }
+  .info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1vmin; }
+  .title { font-size: clamp(24px, 7vmin, 72px); font-weight: 800; line-height: 1.05; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .artist { font-size: clamp(16px, 4vmin, 40px); opacity: .8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hint { font-size: clamp(13px, 2.6vmin, 24px); line-height: 1.35; opacity: .75; }
+  .by { font-size: clamp(11px, 2vmin, 18px); font-weight: 600; color: var(--accent); }
+  .bar { height: 6px; margin-top: 2vmin; border-radius: 3px; background: rgba(255,255,255,.18); overflow: hidden; }
+  .bar span { display: block; height: 100%; width: 0; background: #fff; border-radius: 3px; transition: width .4s linear; }
+  .times { display: flex; justify-content: space-between; font-size: clamp(11px, 2vmin, 18px); font-variant-numeric: tabular-nums; opacity: .7; }
+  .lyric-now { margin-top: 2.5vmin; font-size: clamp(18px, 4.6vmin, 46px); font-weight: 800; line-height: 1.15; color: var(--accent); }
+  .lyric-next { font-size: clamp(13px, 2.8vmin, 26px); font-weight: 600; opacity: .55; }
+  .label { margin-top: 2.5vmin; font-size: clamp(10px, 1.8vmin, 15px); font-weight: 700; letter-spacing: .14em; text-transform: uppercase; opacity: .6; }
+  .next-row { font-size: clamp(13px, 2.6vmin, 24px); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #tv > footer { display: flex; align-items: center; justify-content: space-between; gap: 2vmin; }
+  .faces { display: flex; align-items: center; min-width: 0; }
+  .face { width: 34px; height: 34px; margin-right: -8px; border-radius: 50%; border: 2px solid var(--bg); display: grid; place-items: center; font-size: 14px; font-weight: 700; background: #555 center/cover; }
+  .controls, .actions { display: flex; align-items: center; gap: 1.5vmin; }
+  .actions { flex-wrap: wrap; justify-content: flex-end; }
+  .round { width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,.12); display: grid; place-items: center; font-size: 18px; }
+  .round.play { width: 60px; height: 60px; background: #fff; color: #111; font-size: 24px; }
+  .chat { position: absolute; top: 14vmin; right: 4vmin; z-index: 2; max-width: min(60vw, 520px); padding: 1.4vmin 2.2vmin; font-size: clamp(14px, 2.8vmin, 26px); background: rgba(255,255,255,.14); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border-radius: 2.4vmin; animation: pop .3s ease; }
+  @keyframes pop { from { opacity: 0; transform: translateY(10px) scale(.96); } to { opacity: 1; transform: none; } }
+  .float { position: fixed; bottom: 18vh; font-size: 44px; z-index: 5; pointer-events: none; animation: rise 3s ease-out forwards; }
+  @keyframes rise { from { transform: translateY(0); opacity: 1; } to { transform: translateY(-60vh); opacity: 0; } }
+  @media (orientation: portrait) {
+    #tv > main { flex-direction: column; justify-content: center; text-align: center; }
+    .cover { width: min(70vw, 42vh); }
+    #tv > footer { flex-direction: column; }
+    .actions { justify-content: center; }
+  }
+
+  /* ---------- sheets (add songs, queue, who is here) ---------- */
+  .sheet { position: fixed; inset: 0; z-index: 10; background: rgba(0,0,0,.55); display: flex; align-items: flex-end; justify-content: center; }
+  .sheet > div { width: min(640px, 100%); max-height: 88vh; display: flex; flex-direction: column; gap: 12px; padding: 18px 16px max(18px, env(safe-area-inset-bottom)); background: #17171d; border-radius: 22px 22px 0 0; animation: up .25s ease; }
+  @keyframes up { from { transform: translateY(40px); opacity: 0; } to { transform: none; opacity: 1; } }
+  .sheet-head { display: flex; align-items: center; justify-content: space-between; font-size: 18px; font-weight: 800; }
+  .list { overflow-y: auto; display: flex; flex-direction: column; gap: 4px; -webkit-overflow-scrolling: touch; }
+  .row { display: flex; align-items: center; gap: 12px; padding: 8px; border-radius: 12px; text-align: left; width: 100%; }
+  .row:active { background: var(--card); }
+  .thumb { width: 46px; height: 46px; flex-shrink: 0; border-radius: 8px; background: var(--card) center/cover; }
+  .row-text { flex: 1; min-width: 0; }
+  .row-text div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row-text div + div { font-size: 13px; opacity: .65; }
+  .section { margin-top: 6px; font-size: 12px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; opacity: .6; }
+  .people { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; overflow-y: auto; }
+  .person { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 10px 6px; border-radius: 12px; background: rgba(255,255,255,.04); border: 2px solid transparent; }
+  .person.here { border-color: var(--accent); background: rgba(155,225,93,.15); }
+  .person .face { width: 40px; height: 40px; margin: 0; }
+  .person span { font-size: 13px; font-weight: 600; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .person small { opacity: .7; }
+  .toast { position: fixed; left: 50%; bottom: max(24px, env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 20; padding: 12px 18px; border-radius: 999px; background: #2a2a33; font-size: 14px; font-weight: 600; box-shadow: 0 10px 30px rgba(0,0,0,.4); animation: pop .25s ease; }
+</style>
+</head>
+<body>
+
+<!-- sign in: an admin's Navidrome account -->
+<section id="signin" class="center hidden">
+  <form class="panel" id="signin-form">
+    <div class="brand">Sour Player TV</div>
+    <div class="big">Run the party on the TV</div>
+    <div class="tip muted">Sign in with your music server account. Sour Player TV is for admins.</div>
+    <input id="user" autocomplete="username" autocapitalize="none" placeholder="Username" required />
+    <input id="pass" type="password" autocomplete="current-password" placeholder="Password" required />
+    <div class="err" id="signin-err"></div>
+    <button class="pill primary" type="submit">Sign in</button>
+  </form>
+</section>
+
+<!-- name the event -->
+<section id="start" class="center hidden">
+  <form class="panel" id="start-form">
+    <div class="brand">Sour Player TV</div>
+    <div class="big">What's the event?</div>
+    <input id="event" maxlength="60" placeholder="Friday Night Hangout" />
+    <div class="tip muted">Put this phone on the TV first: on iPhone, Control Center &gt; Screen Mirroring; on Android, Quick Settings &gt; Cast and pick the TV or Chromecast. Friends who aren't there see what's playing on your profiles, but can't join or listen along.</div>
+    <div class="err" id="start-err"></div>
+    <button class="pill primary" type="submit">Start the party</button>
+    <button class="pill" type="button" id="signout">Sign out</button>
+  </form>
+</section>
+
+<!-- the TV -->
+<section id="tv" class="hidden">
+  <div id="backdrop"></div>
+  <header>
+    <div><div class="brand">Sour Player TV</div><div class="event" id="ev-name"></div></div>
+    <div class="clock" id="clock"></div>
+  </header>
+  <main>
+    <div class="cover" id="cover">&#9835;</div>
+    <div class="info">
+      <div class="title" id="title">Waiting for the first song</div>
+      <div class="artist" id="artist"></div>
+      <div class="hint" id="hint">Tap Add songs to start. People you add can queue songs from their phones too.</div>
+      <div class="by" id="by"></div>
+      <div id="progress" class="hidden"><div class="bar"><span id="bar"></span></div><div class="times"><span id="t-now">0:00</span><span id="t-len"></span></div></div>
+      <div id="lyrics" class="hidden"><div class="lyric-now" id="ly-now"></div><div class="lyric-next" id="ly-next"></div></div>
+      <div id="next-box" class="hidden"><div class="label">Up next</div><div id="next"></div></div>
+    </div>
+  </main>
+  <div class="chat hidden" id="chat"></div>
+  <footer>
+    <div class="faces" id="faces"></div>
+    <div class="controls">
+      <button class="round" id="prev" aria-label="Previous">&#9198;</button>
+      <button class="round play" id="play" aria-label="Play or pause">&#9654;</button>
+      <button class="round" id="skip" aria-label="Next">&#9197;</button>
+    </div>
+    <div class="actions">
+      <button class="pill" id="b-add">+ Add songs</button>
+      <button class="pill" id="b-queue">Queue</button>
+      <button class="pill" id="b-people">Who's here</button>
+      <button class="pill" id="b-lyrics">Lyrics</button>
+      <button class="pill" id="b-end">End party</button>
+    </div>
+  </footer>
+</section>
+
+<audio id="audio" preload="auto"></audio>
+
+<script>
+// Sour Player TV: an admin's phone on the TV runs Group Play for an in-person event. This page plays the
+// music itself (one audio element, so it keeps going in the background on iPhone), reports the queue to
+// Hermes Music like a Sour Player host does, and shows it big for the room. Everyone at the party who the
+// admin adds can queue songs and react from their own Sour Player.
+const $ = (id) => document.getElementById(id);
+const audio = $("audio");
+const store = {
+  get(k) { try { return JSON.parse(localStorage.getItem(k) || "null"); } catch { return null; } },
+  set(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, JSON.stringify(v)); } catch {} },
+};
+let login = store.get("tv-login");      // { user, pass } for the music server (through Hermes Music)
+let me = store.get("tv-profile");       // { id, key, name } the admin's Sour profile
+let session = store.get("tv-session");  // { code, hostKey } the party
+let state = null, clockOffset = 0;
+let queue = [], index = 0;              // the songs this phone plays (group songs: id, title, artist, album, duration, imageId, by)
+let applied = [], lastReport = { ids: "", index: -1, playing: false, at: 0, pos: 0 };
+let showLyrics = store.get("tv-lyrics") !== false;
+let lyrics = { id: null, lines: [] };
+let profiles = [];
+
+const toast = (msg) => {
+  const t = document.createElement("div"); t.className = "toast"; t.textContent = msg; document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3200);
+};
+const show = (id) => { for (const s of ["signin", "start", "tv"]) $(s).classList.toggle("hidden", s !== id); };
+const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
+const hex = (str) => [...new TextEncoder().encode(str)].map((b) => b.toString(16).padStart(2, "0")).join("");
+const auth = () => `u=${encodeURIComponent(login.user)}&p=enc:${hex(login.pass)}&v=1.16.1&c=sour-tv&f=json`;
+const rest = async (method, params = "") => {
+  const r = await fetch(`/tv/rest/${method}?${auth()}${params ? "&" + params : ""}`);
+  const j = await r.json().catch(() => null);
+  const sr = j && j["subsonic-response"];
+  if (!sr || sr.status !== "ok") throw new Error(sr?.error?.message || "the music server didn't answer");
+  return sr;
+};
+const coverUrl = (id, size = 600) => (id ? `/tv/rest/getCoverArt?${auth()}&id=${encodeURIComponent(id)}&size=${size}` : "");
+const streamUrl = (id) => `/tv/rest/stream?${auth()}&id=${encodeURIComponent(id)}`;
+const api = async (path, body) => {
+  const r = await fetch(path, body ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : undefined);
+  const j = await r.json().catch(() => null);
+  if (!r.ok) throw new Error(j?.error || `Hermes Music answered ${r.status}`);
+  return j;
+};
+const toSong = (s) => ({ id: s.id, title: s.title, artist: s.artist || "", album: s.album || "", duration: (s.duration || 0) * 1000, imageId: s.coverArt || null, year: s.year || null });
+
+// ---------- sign in ----------
+$("signin-form").onsubmit = async (e) => {
+  e.preventDefault();
+  $("signin-err").textContent = "";
+  login = { user: $("user").value.trim(), pass: $("pass").value };
+  try {
+    await rest("ping");
+    const res = await api("/api/profiles/navidrome", { credential: auth(), name: login.user });
+    if (!res.profile?.admin) { login = null; $("signin-err").textContent = "Sour Player TV is for admins of the music server."; return; }
+    me = { id: res.id, key: res.key, name: res.profile.name };
+    store.set("tv-login", login); store.set("tv-profile", me);
+    show("start");
+  } catch (err) { login = null; $("signin-err").textContent = err.message; }
+};
+$("signout").onclick = () => { store.set("tv-login", null); store.set("tv-profile", null); login = me = null; show("signin"); };
+
+// ---------- start the party ----------
+$("start-form").onsubmit = async (e) => {
+  e.preventDefault();
+  $("start-err").textContent = "";
+  const name = $("event").value.trim() || "Party";
+  try {
+    const res = await api("/api/group/create", { name, user: me.name, profile: me.id, key: me.key, tv: { event: name } });
+    session = { code: res.code, hostKey: res.hostKey };
+    store.set("tv-session", session);
+    queue = []; index = 0;
+    enterTv(res.state);
+  } catch (err) { $("start-err").textContent = err.message; }
+};
+
+function enterTv(st) {
+  setState(st);
+  show("tv");
+  listen();
+  keepAwake();
+  loadProfiles();
+}
+
+// ---------- live group state ----------
+let events = null;
+function listen() {
+  if (events) events.close();
+  events = new EventSource(`/api/group/${session.code}/events`);
+  events.addEventListener("state", (e) => setState(JSON.parse(e.data)));
+  events.addEventListener("reaction", (e) => { const r = JSON.parse(e.data); floatEmoji(r.emoji); });
+  events.addEventListener("joined", (e) => { const j = JSON.parse(e.data); toast(`${j.name || "Someone"} joined from their phone`); });
+}
+function setState(st) {
+  if (!st) return;
+  if (st.ended) return partyOver();
+  clockOffset = st.serverNow - Date.now();
+  const firstChat = !state;
+  const lastChat = state?.chat?.[state.chat.length - 1]?.id;
+  state = st;
+  $("ev-name").textContent = st.tv?.event || st.name;
+  // songs people asked for: to the end of the queue (the first one starts the music)
+  for (const r of st.requests || []) {
+    if (applied.includes(r.rid)) continue;
+    applied.push(r.rid);
+    queue.push({ ...r.song, by: r.by });
+    toast(`${r.by} added ${r.song.title}`);
+    if (queue.length === 1) playAt(0);
+  }
+  // guests' controls and the room's skip votes
+  for (const c of st.commands || []) {
+    if (applied.includes(c.cid)) continue;
+    applied.push(c.cid);
+    runCommand(c);
+  }
+  const msg = st.chat?.[st.chat.length - 1];
+  if (msg && !firstChat && msg.id !== lastChat) showChat(msg);
+  renderFaces();
+  render();
+}
+function runCommand(c) {
+  const at = queue.findIndex((x, i) => i === c.index && x.id === c.songId);
+  if (c.cmd === "next") next();
+  else if (c.cmd === "previous") prev();
+  else if (c.cmd === "play") audio.play().catch(() => {});
+  else if (c.cmd === "pause") audio.pause();
+  else if (c.cmd === "seek") audio.currentTime = c.position || 0;
+  else if (c.cmd === "playIndex" && at >= 0) playAt(at);
+  else if (c.cmd === "remove" && at > index) queue.splice(at, 1);
+  else if (c.cmd === "playNext" && at > index + 1) { const [s] = queue.splice(at, 1); queue.splice(index + 1, 0, s); }
+  else if (c.cmd === "encore") audio.currentTime = 0;
+}
+
+// ---------- the music ----------
+function playAt(i) {
+  if (!queue[i]) return;
+  index = i;
+  audio.src = streamUrl(queue[i].id);
+  audio.play().catch(() => toast("Tap play to start the music"));
+  loadLyrics(queue[i]);
+  mediaSession();
+  render();
+}
+function next() { if (index + 1 < queue.length) playAt(index + 1); else { audio.pause(); render(); } }
+function prev() { if (audio.currentTime > 4 || index === 0) audio.currentTime = 0; else playAt(index - 1); }
+audio.addEventListener("ended", next);
+audio.addEventListener("play", render);
+audio.addEventListener("pause", render);
+audio.addEventListener("error", () => { if (queue[index]) { toast(`${queue[index].title} couldn't play - skipping`); setTimeout(next, 800); } });
+$("play").onclick = () => { if (!queue[index]) return openAdd(); audio.src ? (audio.paused ? audio.play().catch(() => {}) : audio.pause()) : playAt(index); };
+$("skip").onclick = next;
+$("prev").onclick = prev;
+
+function mediaSession() {
+  const s = queue[index];
+  if (!("mediaSession" in navigator) || !s) return;
+  navigator.mediaSession.metadata = new MediaMetadata({ title: s.title, artist: s.artist, album: state?.tv?.event || s.album,
+    artwork: s.imageId ? [{ src: coverUrl(s.imageId, 512), sizes: "512x512", type: "image/jpeg" }] : [] });
+  navigator.mediaSession.setActionHandler("play", () => audio.play());
+  navigator.mediaSession.setActionHandler("pause", () => audio.pause());
+  navigator.mediaSession.setActionHandler("nexttrack", next);
+  navigator.mediaSession.setActionHandler("previoustrack", prev);
+}
+
+// report the queue, song, position and play/pause to Hermes Music (everyone in the group follows it)
+setInterval(async () => {
+  if (!session || !state) return;
+  const ids = queue.map((x) => x.id).join(",");
+  const playing = !audio.paused && !!audio.src;
+  const pos = audio.currentTime || 0;
+  const predicted = lastReport.pos + (lastReport.playing ? (Date.now() - lastReport.at) / 1000 : 0);
+  const changed = ids !== lastReport.ids || index !== lastReport.index || playing !== lastReport.playing
+    || Math.abs(pos - predicted) > 1.5 || Date.now() - lastReport.at > 5000 || applied.length;
+  if (!changed) return;
+  const body = { hostKey: session.hostKey, index, playing, position: pos, speed: 1, karaoke: false };
+  if (ids !== lastReport.ids) body.queue = queue.map(({ by, ...s }) => s);
+  if (applied.length) body.applied = applied.slice();
+  lastReport = { ids, index, playing, pos, at: Date.now() };
+  try {
+    await api(`/api/group/${session.code}/report`, body);
+    if (body.applied) applied = applied.filter((x) => !body.applied.includes(x));
+  } catch (err) { if (/not found|ended|doesn't exist/.test(err.message)) partyOver(); }
+}, 1000);
+
+// ---------- what the TV shows ----------
+function render() {
+  const s = queue[index];
+  $("title").textContent = s ? s.title : "Waiting for the first song";
+  $("artist").textContent = s ? s.artist : "";
+  $("hint").classList.toggle("hidden", !!s);
+  const by = s && (s.by || state?.queue?.[state.index]?.by);
+  $("by").textContent = by ? `Added by ${by}` : "";
+  const art = s?.imageId ? `url("${coverUrl(s.imageId)}")` : "";
+  $("cover").style.backgroundImage = art;
+  $("cover").innerHTML = art ? "" : "&#9835;";
+  $("backdrop").style.backgroundImage = art;
+  $("progress").classList.toggle("hidden", !s);
+  $("play").innerHTML = !audio.paused && audio.src ? "&#10074;&#10074;" : "&#9654;";
+  const up = queue.slice(index + 1, index + 4);
+  $("next-box").classList.toggle("hidden", !up.length);
+  $("next").innerHTML = "";
+  for (const x of up) {
+    const d = document.createElement("div"); d.className = "next-row";
+    d.innerHTML = `<span></span> <span class="muted"></span>`;
+    d.children[0].textContent = x.title; d.children[1].textContent = `${x.artist}${x.by ? " - " + x.by : ""}`;
+    $("next").appendChild(d);
+  }
+  $("b-lyrics").textContent = showLyrics ? "Hide lyrics" : "Lyrics";
+}
+function tick() {
+  const s = queue[index];
+  const t = audio.currentTime || 0, len = audio.duration || (s ? s.duration / 1000 : 0);
+  $("bar").style.width = len ? `${Math.min(100, (t / len) * 100)}%` : "0";
+  $("t-now").textContent = fmt(t); $("t-len").textContent = len ? fmt(len) : "";
+  $("clock").textContent = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  // the line being sung
+  const on = showLyrics && lyrics.id === s?.id && lyrics.lines.length;
+  $("lyrics").classList.toggle("hidden", !on);
+  if (on) {
+    const ms = t * 1000 + 150;
+    let cur = -1;
+    for (let i = 0; i < lyrics.lines.length; i++) if (lyrics.lines[i].start <= ms) cur = i;
+    const now = cur >= 0 ? lyrics.lines[cur].value || "..." : "...";
+    if ($("ly-now").textContent !== now) $("ly-now").textContent = now;
+    $("ly-next").textContent = lyrics.lines[cur + 1]?.value || "";
+  }
+}
+setInterval(tick, 250);
+async function loadLyrics(s) {
+  lyrics = { id: null, lines: [] };
+  try {
+    const r = await rest("getLyricsBySongId", `id=${encodeURIComponent(s.id)}`);
+    const synced = (r.lyricsList?.structuredLyrics || []).find((l) => l.synced && l.line?.length);
+    if (synced && queue[index]?.id === s.id) lyrics = { id: s.id, lines: synced.line.map((l) => ({ start: (l.start || 0) - (synced.offset || 0), value: l.value })) };
+  } catch {}
+}
+$("b-lyrics").onclick = () => { showLyrics = !showLyrics; store.set("tv-lyrics", showLyrics); render(); };
+
+function showChat(msg) {
+  const c = $("chat");
+  c.innerHTML = "<b></b> <span></span>";
+  c.children[0].textContent = msg.by; c.children[1].textContent = msg.text;
+  c.classList.remove("hidden");
+  clearTimeout(showChat.t); showChat.t = setTimeout(() => c.classList.add("hidden"), 10000);
+}
+function floatEmoji(emoji) {
+  const f = document.createElement("div"); f.className = "float"; f.textContent = emoji;
+  f.style.left = `${10 + Math.random() * 80}vw`; document.body.appendChild(f);
+  setTimeout(() => f.remove(), 3100);
+}
+const hue = (name) => [...name].reduce((sum, ch) => (sum * 31 + ch.charCodeAt(0)) % 360, 7);
+function face(p, cls = "face") {
+  const d = document.createElement("div"); d.className = cls;
+  d.style.background = p.avatar ? `url("/api/profiles/${p.id}/avatar?v=${p.avatar}") center/cover` : `hsl(${hue(p.name)} 60% 42%)`;
+  if (!p.avatar) d.textContent = (p.name.trim()[0] || "?").toUpperCase();
+  d.title = p.name;
+  return d;
+}
+let profilesAt = 0;
+function renderFaces() {
+  // someone new was added (or made a profile) since the list was loaded: load it again
+  const ids = state?.tv?.members || [];
+  if (ids.some((id) => !profiles.some((p) => p.id === id)) && Date.now() - profilesAt > 5000) { profilesAt = Date.now(); loadProfiles(); }
+  const here = profiles.filter((p) => ids.includes(p.id));
+  $("faces").innerHTML = "";
+  for (const p of here.slice(0, 12)) $("faces").appendChild(face(p));
+}
+async function loadProfiles() {
+  try { profiles = await api("/api/profiles"); } catch { profiles = []; }
+  renderFaces();
+}
+
+// ---------- sheets ----------
+function sheet(title, build) {
+  const wrap = document.createElement("div"); wrap.className = "sheet";
+  wrap.innerHTML = `<div><div class="sheet-head"><span></span><button class="pill">Done</button></div></div>`;
+  wrap.querySelector("span").textContent = title;
+  const close = () => wrap.remove();
+  wrap.querySelector("button").onclick = close;
+  wrap.onclick = (e) => { if (e.target === wrap) close(); };
+  build(wrap.firstElementChild, close);
+  document.body.appendChild(wrap);
+}
+const row = (song, extra) => {
+  const b = document.createElement("button"); b.className = "row";
+  b.innerHTML = `<div class="thumb"></div><div class="row-text"><div></div><div></div></div>`;
+  if (song.imageId) b.querySelector(".thumb").style.backgroundImage = `url("${coverUrl(song.imageId, 100)}")`;
+  b.querySelector(".row-text").children[0].textContent = song.title;
+  b.querySelector(".row-text").children[1].textContent = extra ?? song.artist;
+  return b;
+};
+function addSongs(songs) {
+  const empty = !queue.length || index >= queue.length;
+  queue.push(...songs.map((s) => ({ ...s, by: me?.name })));
+  if (empty) playAt(queue.length - songs.length); else render();
+  toast(songs.length === 1 ? `Added ${songs[0].title}` : `Added ${songs.length} songs`);
+}
+function openAdd() {
+  sheet("Add songs", (box) => {
+    const input = document.createElement("input"); input.placeholder = "Search songs and albums";
+    const mix = document.createElement("button"); mix.className = "pill"; mix.textContent = "Random mix (30 songs)";
+    const list = document.createElement("div"); list.className = "list";
+    box.append(input, mix, list);
+    mix.onclick = async () => { try { const r = await rest("getRandomSongs", "size=30"); addSongs((r.randomSongs?.song || []).map(toSong)); } catch (e) { toast(e.message); } };
+    let timer;
+    input.oninput = () => {
+      clearTimeout(timer);
+      timer = setTimeout(async () => {
+        const q = input.value.trim();
+        list.innerHTML = "";
+        if (q.length < 2) return;
+        try {
+          const r = (await rest("search3", `query=${encodeURIComponent(q)}&songCount=25&albumCount=8&artistCount=0`)).searchResult3 || {};
+          if (r.album?.length) { const h = document.createElement("div"); h.className = "section"; h.textContent = "Albums"; list.appendChild(h); }
+          for (const al of r.album || []) {
+            const b = row({ title: al.name, imageId: al.coverArt }, `${al.artist || ""} - add the whole album`);
+            b.onclick = async () => { try { const a = await rest("getAlbum", `id=${encodeURIComponent(al.id)}`); addSongs((a.album?.song || []).map(toSong)); } catch (e) { toast(e.message); } };
+            list.appendChild(b);
+          }
+          if (r.song?.length) { const h = document.createElement("div"); h.className = "section"; h.textContent = "Songs"; list.appendChild(h); }
+          for (const s of r.song || []) { const song = toSong(s); const b = row(song); b.onclick = () => addSongs([song]); list.appendChild(b); }
+          if (!r.album?.length && !r.song?.length) list.innerHTML = `<div class="muted">Nothing found.</div>`;
+        } catch (e) { toast(e.message); }
+      }, 300);
+    };
+    setTimeout(() => input.focus(), 50);
+  });
+}
+function openQueue() {
+  sheet("Queue", (box) => {
+    const list = document.createElement("div"); list.className = "list"; box.appendChild(list);
+    const draw = () => {
+      list.innerHTML = "";
+      queue.forEach((s, i) => {
+        if (i < index) return;
+        const b = row(s, i === index ? "Playing now" : `${s.artist}${s.by ? " - " + s.by : ""}`);
+        b.onclick = () => { playAt(i); draw(); };
+        if (i > index) {
+          const x = document.createElement("span"); x.className = "pill"; x.textContent = "Remove";
+          x.onclick = (e) => { e.stopPropagation(); queue.splice(i, 1); render(); draw(); };
+          b.appendChild(x);
+        }
+        list.appendChild(b);
+      });
+      if (!list.children.length) list.innerHTML = `<div class="muted">Nothing queued yet.</div>`;
+    };
+    draw();
+  });
+}
+function openPeople() {
+  sheet("Who's here?", (box) => {
+    const input = document.createElement("input"); input.placeholder = "Find someone";
+    const grid = document.createElement("div"); grid.className = "people";
+    box.append(input, grid);
+    const draw = () => {
+      const here = new Set(state?.tv?.members || []);
+      const q = input.value.trim().toLowerCase();
+      grid.innerHTML = "";
+      for (const p of profiles.filter((x) => x.name.toLowerCase().includes(q)).sort((a, b) => here.has(b.id) - here.has(a.id) || a.name.localeCompare(b.name))) {
+        const host = p.id === me.id;
+        const b = document.createElement("button"); b.className = "person" + (here.has(p.id) ? " here" : "");
+        b.append(face(p), Object.assign(document.createElement("span"), { textContent: p.name }), Object.assign(document.createElement("small"), { textContent: host ? "Host" : here.has(p.id) ? "Here" : "Add" }));
+        if (!host) b.onclick = async () => {
+          try {
+            const r = await api(`/api/group/${session.code}/tvmember`, { hostKey: session.hostKey, ...(here.has(p.id) ? { remove: p.id } : { add: p.id }) });
+            state.tv.members = r.members; draw(); renderFaces();
+          } catch (e) { toast(e.message); }
+        };
+        grid.appendChild(b);
+      }
+    };
+    input.oninput = draw;
+    draw();
+  });
+}
+$("b-add").onclick = openAdd;
+$("b-queue").onclick = openQueue;
+$("b-people").onclick = openPeople;
+$("b-end").onclick = async () => {
+  if (!confirm(`End ${state?.tv?.event || "the party"}? The music stops for everyone.`)) return;
+  try { await api(`/api/group/${session.code}/end`, { hostKey: session.hostKey }); } catch {}
+  partyOver();
+};
+function partyOver() {
+  if (events) events.close();
+  events = null; state = null;
+  audio.pause(); audio.removeAttribute("src");
+  queue = []; index = 0;
+  store.set("tv-session", null); session = null;
+  show(me ? "start" : "signin");
+}
+
+// the phone is on the TV: don't let it lock itself
+let wake = null;
+async function keepAwake() {
+  try { if ("wakeLock" in navigator && document.visibilityState === "visible") wake = await navigator.wakeLock.request("screen"); } catch {}
+}
+document.addEventListener("visibilitychange", () => { if (session) keepAwake(); });
+
+// ---------- start ----------
+(async () => {
+  if (!login || !me) return show("signin");
+  if (session) {
+    try { // the app was closed mid-party: carry on (the queue comes back from Hermes Music)
+      const res = await api(`/api/group/${session.code}/resume`, { hostKey: session.hostKey });
+      if (res.state.tv && !res.state.ended) {
+        queue = res.state.queue.map((s) => ({ ...s }));
+        index = Math.min(res.state.index, Math.max(0, queue.length - 1));
+        enterTv(res.state);
+        if (queue[index]) { audio.src = streamUrl(queue[index].id); audio.currentTime = res.state.position || 0; loadLyrics(queue[index]); mediaSession(); render(); }
+        toast(`Back on ${res.state.tv.event} - tap play`);
+        return;
+      }
+    } catch {}
+    store.set("tv-session", null); session = null;
+  }
+  show("start");
+})();
+</script>
+</body>
+</html>

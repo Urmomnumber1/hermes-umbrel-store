@@ -20,6 +20,11 @@ const ctx = new AsyncLocalStorage();
 const ST = () => ctx.getStore()?.stage || STAGING;
 const READY = "/data/tools/ready";
 const PAGE = fs.readFileSync(path.join(__dirname, "index.html"));
+// Sour Player TV: its own app (an admin's phone on the TV runs an event's Group Play), at /tv/
+const TV_PAGE = (() => { try { return fs.readFileSync(path.join(__dirname, "tv.html")); } catch { return Buffer.from("Sour Player TV needs tv.html next to server.js"); } })();
+const TV_MANIFEST = JSON.stringify({ name: "Sour Player TV", short_name: "Sour TV", start_url: "/tv/", scope: "/tv/", display: "standalone",
+  orientation: "any", background_color: "#0b0b0f", theme_color: "#0b0b0f",
+  icons: [{ src: "/app/assets/512x512.png", sizes: "512x512", type: "image/png" }, { src: "/app/assets/256x256.png", sizes: "256x256", type: "image/png" }] });
 
 // ---------- storage ----------
 // Item: { id, type: song|album|artist, query, status, created, parent?, root?, meta?, collectionId?, title?, artist?, note? }
@@ -2544,6 +2549,32 @@ function profileStats(p) {
 }
 // what everyone sees; `self` (the owner, with their key) also gets the private bits
 // the Sour Player TV party someone is at (added by the host, or hosting it)
+// Sour Player TV talks to Navidrome through Hermes Music (one address for the phone, and Navidrome's own
+// address may only work inside the Umbrel). Read-only Subsonic calls and the song stream (with seeking).
+const TV_REST = new Set(["ping", "search3", "getAlbum", "getSong", "getRandomSongs", "getCoverArt", "stream", "getLyricsBySongId"]);
+async function tvRest(req, res, method, url) {
+  const name = method.replace(/\.view$/, "");
+  if (!TV_REST.has(name)) return send(res, 404, { error: "not available in Sour Player TV" });
+  const base = await navidromeBase();
+  if (!base) return send(res, 502, { error: "Hermes Music can't find Navidrome" });
+  try {
+    const headers = {};
+    if (req.headers.range) headers.range = req.headers.range;
+    const r = await fetch(`${base}/rest/${name}?${url.searchParams.toString()}`, { headers, signal: AbortSignal.timeout(name === "stream" ? 60 * 60 * 1000 : 20000) });
+    const out = { "cache-control": name === "getCoverArt" ? "max-age=86400" : "no-store" };
+    for (const h of ["content-type", "content-length", "content-range", "accept-ranges"]) { const v = r.headers.get(h); if (v) out[h] = v; }
+    res.writeHead(r.status, out);
+    if (!r.body) return res.end();
+    const { Readable } = require("stream");
+    const body = Readable.fromWeb(r.body);
+    body.on("error", () => res.end());
+    res.on("close", () => body.destroy());
+    body.pipe(res);
+  } catch (e) {
+    if (!res.headersSent) send(res, 502, { error: "couldn't reach Navidrome: " + e.message });
+    else res.end();
+  }
+}
 function tvPartyOf(id) {
   for (const g of groups.values()) if (g.tv && !g.ended && g.tv.allowed.has(id)) return g;
   return null;
@@ -3465,6 +3496,11 @@ http.createServer(async (req, res) => {
   if (get && p === "/") return send(res, 200, PAGE, "text/html");
 
   if (get && (p === "/app" || p.startsWith("/app/"))) return serveWebApp(p, res);
+  // ---- Sour Player TV ----
+  if (get && p === "/tv") { res.writeHead(302, { location: "/tv/" }); return res.end(); }
+  if (get && p === "/tv/") return send(res, 200, TV_PAGE, "text/html", { "cache-control": "no-cache" });
+  if (get && p === "/tv/manifest.webmanifest") return send(res, 200, TV_MANIFEST, "application/manifest+json");
+  if (get && p.startsWith("/tv/rest/")) return tvRest(req, res, p.slice("/tv/rest/".length), url);
   if (get && p === "/api/android.apk") { // the newest Sour Player for Android (the mobile-v... releases)
     try {
       if (!androidApk || Date.now() - androidApk.at > 30 * 60 * 1000) {

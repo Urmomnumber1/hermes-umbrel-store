@@ -25,7 +25,7 @@ services:
           mkdir -p "$$D" && node -e '
             const [dir, v] = process.argv.slice(1);
             const base = "https://raw.githubusercontent.com/Urmomnumber1/hermes-umbrel-store/hermes-music-" + v + "/anjalo-hermes/requests-app/";
-            Promise.all(["server.js", "index.html", "start.sh"].map(async (f) => {
+            Promise.all(["server.js", "index.html", "tv.html", "start.sh"].map(async (f) => {
               let r;
               for (let i = 0; i < 4; i++) { // GitHub sometimes answers 404/5xx for a moment
                 r = await fetch(base + f).catch(() => null);
