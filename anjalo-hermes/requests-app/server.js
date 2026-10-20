@@ -2252,6 +2252,22 @@ async function groupRoute(req, res, p, get, post, url) {
     broadcast(g);
     return send(res, 200, { ok: true });
   }
+  if (action === "handoff") { // the host passes the group to someone in it (instead of ending it)
+    if (g.tv) return send(res, 403, { error: "a Sour Player TV party stays with its host" });
+    const target = String(b.target || "");
+    const next = g.members.get(target);
+    if (!next || !next.stream || next.spectate) return send(res, 404, { error: "they can't take over (they left, or only watch)" });
+    const oldHost = { name: g.hostName, profile: g.hostProfile, avatar: g.hostAvatar };
+    g.hostKey = crypto.randomUUID();
+    g.hostName = next.name; g.hostProfile = next.profile || null; g.hostAvatar = next.avatar || null; g.avatarVersion++;
+    g.hostSeen = nowMs();
+    g.members.delete(target); // their live connection stays open: it now gets the host's view
+    const memberId = crypto.randomUUID(); // the old host stays in the group as a listener
+    g.members.set(memberId, { name: oldHost.name, avatar: oldHost.avatar, profile: oldHost.profile, seen: nowMs(), pings: 0, spectate: false });
+    sse(next.stream, "host", { hostKey: g.hostKey, from: oldHost.name });
+    broadcast(g);
+    return send(res, 200, { member: memberId });
+  }
   if (action === "tvmember") { // Sour Player TV: the host adds (or removes) someone who's at the event
     if (!isHost || !g.tv) return send(res, 403, { error: "only the TV's host can do that" });
     const who = clean1(b.add || b.remove, 40);
