@@ -92,6 +92,8 @@
   .person .face { width: 40px; height: 40px; margin: 0; }
   .person span { font-size: 13px; font-weight: 600; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .person small { opacity: .7; }
+  body.screen #tv > footer .controls, body.screen #tv > footer .actions, body.screen .toast { display: none !important; }
+  body.screen #tv > footer { justify-content: flex-start; }
   .toast { position: fixed; left: 50%; bottom: max(24px, env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 20; padding: 12px 18px; border-radius: 999px; background: #2a2a33; font-size: 14px; font-weight: 600; box-shadow: 0 10px 30px rgba(0,0,0,.4); animation: pop .25s ease; }
 </style>
 </head>
@@ -168,6 +170,12 @@
 // Hermes Music like a Sour Player host does, and shows it big for the room. Everyone at the party who the
 // admin adds can queue songs and react from their own Sour Player.
 const $ = (id) => document.getElementById(id);
+// ?screen=CODE: the picture for the TV itself (the Sour Player TV iPhone app shows it on the mirrored
+// screen). It only follows the party; the phone plays the music and has the buttons.
+const SCREEN = new URLSearchParams(location.search).get("screen");
+if (SCREEN) document.body.classList.add("screen");
+// tell the iPhone app which party is on, so it can show it on the TV
+const tellApp = (code) => { try { window.webkit?.messageHandlers?.sourtv?.postMessage({ code: code || null }); } catch {} };
 const audio = $("audio");
 const store = {
   get(k) { try { return JSON.parse(localStorage.getItem(k) || "null"); } catch { return null; } },
@@ -233,6 +241,7 @@ $("start-form").onsubmit = async (e) => {
     const res = await api("/api/group/create", { name, user: me.name, profile: me.id, key: me.key, tv: { event: name } });
     session = { code: res.code, hostKey: res.hostKey };
     store.set("tv-session", session);
+    tellApp(session.code);
     queue = []; index = 0;
     enterTv(res.state);
   } catch (err) { $("start-err").textContent = err.message; }
@@ -258,6 +267,7 @@ function listen() {
 function setState(st) {
   if (!st) return;
   if (st.ended) return partyOver();
+  if (SCREEN) return followState(st);
   clockOffset = st.serverNow - Date.now();
   const firstChat = !state;
   const lastChat = state?.chat?.[state.chat.length - 1]?.id;
@@ -282,6 +292,28 @@ function setState(st) {
   renderFaces();
   render();
 }
+// the TV picture: what the group plays, where it is now
+function followState(st) {
+  clockOffset = st.serverNow - Date.now();
+  const lastChat = state?.chat?.[state.chat.length - 1]?.id;
+  const first = !state;
+  const before = queue[index]?.id;
+  state = st;
+  queue = st.queue.map((x) => ({ ...x }));
+  index = st.index;
+  $("ev-name").textContent = st.tv?.event || st.name;
+  if (queue[index] && queue[index].id !== before) loadLyrics(queue[index]);
+  const msg = st.chat?.[st.chat.length - 1];
+  if (msg && !first && msg.id !== lastChat) showChat(msg);
+  renderFaces();
+  render();
+}
+const nowTime = () => {
+  if (!SCREEN) return audio.currentTime || 0;
+  if (!state) return 0;
+  return state.position + (state.playing ? (Date.now() + clockOffset - state.updatedAt) / 1000 : 0);
+};
+const isPlaying = () => (SCREEN ? !!state?.playing : !audio.paused && !!audio.src);
 function runCommand(c) {
   const at = queue.findIndex((x, i) => i === c.index && x.id === c.songId);
   if (c.cmd === "next") next();
@@ -328,7 +360,7 @@ function mediaSession() {
 
 // report the queue, song, position and play/pause to Hermes Music (everyone in the group follows it)
 setInterval(async () => {
-  if (!session || !state) return;
+  if (SCREEN || !session || !state) return;
   const ids = queue.map((x) => x.id).join(",");
   const playing = !audio.paused && !!audio.src;
   const pos = audio.currentTime || 0;
@@ -359,7 +391,7 @@ function render() {
   $("cover").innerHTML = art ? "" : "&#9835;";
   $("backdrop").style.backgroundImage = art;
   $("progress").classList.toggle("hidden", !s);
-  $("play").innerHTML = !audio.paused && audio.src ? "&#10074;&#10074;" : "&#9654;";
+  $("play").innerHTML = isPlaying() ? "&#10074;&#10074;" : "&#9654;";
   const up = queue.slice(index + 1, index + 4);
   $("next-box").classList.toggle("hidden", !up.length);
   $("next").innerHTML = "";
@@ -373,7 +405,7 @@ function render() {
 }
 function tick() {
   const s = queue[index];
-  const t = audio.currentTime || 0, len = audio.duration || (s ? s.duration / 1000 : 0);
+  const t = nowTime(), len = (!SCREEN && audio.duration) || (s ? s.duration / 1000 : 0);
   $("bar").style.width = len ? `${Math.min(100, (t / len) * 100)}%` : "0";
   $("t-now").textContent = fmt(t); $("t-len").textContent = len ? fmt(len) : "";
   $("clock").textContent = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
@@ -396,6 +428,13 @@ async function loadLyrics(s) {
     const r = await rest("getLyricsBySongId", `id=${encodeURIComponent(s.id)}`);
     const synced = (r.lyricsList?.structuredLyrics || []).find((l) => l.synced && l.line?.length);
     if (synced && queue[index]?.id === s.id) lyrics = { id: s.id, lines: synced.line.map((l) => ({ start: (l.start || 0) - (synced.offset || 0), value: l.value })) };
+  } catch {}
+  if (lyrics.id === s.id) return;
+  // Navidrome has none: Hermes Music looks the song up on LRCLIB
+  try {
+    const q = new URLSearchParams({ artist: s.artist, title: s.title, album: s.album || "", seconds: String(Math.round((s.duration || 0) / 1000)) });
+    const r = await fetch(`/tv/lyrics?${q}`).then((x) => x.json());
+    if (r.lines?.length && queue[index]?.id === s.id) lyrics = { id: s.id, lines: r.lines };
   } catch {}
 }
 $("b-lyrics").onclick = () => { showLyrics = !showLyrics; store.set("tv-lyrics", showLyrics); render(); };
@@ -551,6 +590,8 @@ function partyOver() {
   audio.pause(); audio.removeAttribute("src");
   queue = []; index = 0;
   store.set("tv-session", null); session = null;
+  tellApp(null);
+  if (SCREEN) return waitingScreen();
   show(me ? "start" : "signin");
 }
 
@@ -561,8 +602,26 @@ async function keepAwake() {
 }
 document.addEventListener("visibilitychange", () => { if (session) keepAwake(); });
 
+// before a party starts (or after it ends) the TV shows the name and a hint
+function waitingScreen() {
+  show("tv");
+  $("ev-name").textContent = "";
+  $("title").textContent = "Sour Player TV";
+  $("artist").textContent = "";
+  $("hint").textContent = "Start a party on the phone to show it here.";
+  $("hint").classList.remove("hidden");
+}
+
 // ---------- start ----------
 (async () => {
+  if (SCREEN) {
+    if (SCREEN === "none") return waitingScreen();
+    session = { code: SCREEN };
+    show("tv");
+    listen();
+    loadProfiles();
+    return;
+  }
   if (!login || !me) return show("signin");
   if (session) {
     try { // the app was closed mid-party: carry on (the queue comes back from Hermes Music)
@@ -571,6 +630,7 @@ document.addEventListener("visibilitychange", () => { if (session) keepAwake(); 
         queue = res.state.queue.map((s) => ({ ...s }));
         index = Math.min(res.state.index, Math.max(0, queue.length - 1));
         enterTv(res.state);
+        tellApp(session.code);
         if (queue[index]) { audio.src = streamUrl(queue[index].id); audio.currentTime = res.state.position || 0; loadLyrics(queue[index]); mediaSession(); render(); }
         toast(`Back on ${res.state.tv.event} - tap play`);
         return;

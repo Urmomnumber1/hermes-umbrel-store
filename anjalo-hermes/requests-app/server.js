@@ -2581,6 +2581,39 @@ async function tvRest(req, res, method, url) {
     else res.end();
   }
 }
+// Synced lyrics for Sour Player TV from LRCLIB when Navidrome has none for a song (kept for a day)
+const tvLyricsCache = new Map();
+async function tvLyrics(q) {
+  const artist = clean1(q.get("artist"), 150), title = clean1(q.get("title"), 200), album = clean1(q.get("album"), 200);
+  const seconds = Math.round(Number(q.get("seconds")) || 0);
+  if (!artist || !title) return { lines: [] };
+  const key = `${artist}|${title}`.toLowerCase();
+  const hit = tvLyricsCache.get(key);
+  if (hit && Date.now() - hit.at < 24 * 3600 * 1000) return { lines: hit.lines };
+  const ua = { "user-agent": "Hermes Music (Umbrel)" };
+  let lines = [];
+  try {
+    const exact = new URLSearchParams({ artist_name: artist, track_name: title });
+    if (album) exact.set("album_name", album);
+    if (seconds) exact.set("duration", String(seconds));
+    let r = await fetch(`https://lrclib.net/api/get?${exact}`, { headers: ua, signal: AbortSignal.timeout(10000) });
+    let j = r.ok ? await r.json() : null;
+    const real = (x) => !!x && String(x.syncedLyrics || "").split("\n").filter((l) => /\]\s*\S/.test(l)).length >= 3; // not junk like one test line
+    if (!real(j)) { // no (real) exact match: the best synced search result (close to the song's length)
+      r = await fetch(`https://lrclib.net/api/search?${new URLSearchParams({ track_name: title, artist_name: artist })}`, { headers: ua, signal: AbortSignal.timeout(10000) });
+      const list = r.ok ? await r.json() : [];
+      j = (Array.isArray(list) ? list : []).filter(real)
+        .sort((a, b) => Math.abs((a.duration || 0) - seconds) - Math.abs((b.duration || 0) - seconds))[0] || null;
+    }
+    for (const row of String(j?.syncedLyrics || "").split("\n")) {
+      const m = row.match(/^\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$/);
+      if (m) lines.push({ start: Math.round((Number(m[1]) * 60 + Number(m[2])) * 1000), value: m[3] });
+    }
+  } catch { lines = []; }
+  tvLyricsCache.set(key, { at: Date.now(), lines });
+  if (tvLyricsCache.size > 500) tvLyricsCache.delete(tvLyricsCache.keys().next().value);
+  return { lines };
+}
 function tvPartyOf(id) {
   for (const g of groups.values()) if (g.tv && !g.ended && g.tv.allowed.has(id)) return g;
   return null;
@@ -3507,6 +3540,7 @@ http.createServer(async (req, res) => {
   if (get && p === "/tv/") return send(res, 200, TV_PAGE, "text/html", { "cache-control": "no-cache" });
   if (get && p === "/tv/manifest.webmanifest") return send(res, 200, TV_MANIFEST, "application/manifest+json");
   if (get && p.startsWith("/tv/rest/")) return tvRest(req, res, p.slice("/tv/rest/".length), url);
+  if (get && p === "/tv/lyrics") return send(res, 200, await tvLyrics(url.searchParams));
   if (get && p === "/api/android.apk") { // the newest Sour Player for Android (the mobile-v... releases)
     try {
       if (!androidApk || Date.now() - androidApk.at > 30 * 60 * 1000) {
