@@ -1726,6 +1726,7 @@ function groupState(g) {
     marks: g.marks.filter((x) => x.songId === (g.queue[g.index] || {}).id).slice(-60),
     tokens: Object.fromEntries(g.tokens), approval: !!g.approval, pending: g.approval ? g.pending : [],
     blind: !!g.blind, themeNight: g.themeNight || null, roomTheme: g.roomTheme || "none",
+    tv: g.tv ? { event: g.tv.event, members: [...g.tv.allowed] } : null,
     serverNow: nowMs(),
   };
 }
@@ -1885,11 +1886,18 @@ async function groupRoute(req, res, p, get, post, url) {
   }
   if (post && p === "/api/group/create") {
     const b = await readBody(req, 200000);
+    let tv = null;
+    if (b.tv) { // Sour Player TV: an admin's phone on the TV at an in-person event
+      const admin = typeof ownProfile === "function" && ownProfile(String(b.profile || ""), b.key);
+      if (!admin || !isAdmin(admin)) return send(res, 403, { error: "only admins can start Sour Player TV" });
+      tv = { event: clean1(b.tv.event, 60).trim() || "Party", allowed: new Set([admin.id]) };
+    }
     const code = newCode();
     const g = baseGroup({
-      code, name: clean1(b.name, 60) || "Group Play", hostName: clean1(b.user, 40) || "Host",
-      listed: b.listed !== false, hostAvatar: cleanAvatar(b.avatar), hostProfile: clean1(b.profile, 40) || null,
+      code, name: tv ? tv.event : clean1(b.name, 60) || "Group Play", hostName: clean1(b.user, 40) || "Host",
+      listed: tv ? false : b.listed !== false, hostAvatar: cleanAvatar(b.avatar), hostProfile: clean1(b.profile, 40) || null,
     });
+    if (tv) g.tv = tv;
     groups.set(code, g);
     return send(res, 200, { code, hostKey: g.hostKey, state: groupState(g) });
   }
@@ -1958,6 +1966,8 @@ async function groupRoute(req, res, p, get, post, url) {
 
   if (action === "join") {
     const profile = clean1(b.profile, 40) || null;
+    // a Sour Player TV party is for the people there: only those the host added can join
+    if (g.tv && !(profile && g.tv.allowed.has(profile))) return send(res, 403, { error: `${g.tv.event} is a Sour Player TV party - only people there can join` });
     if (profile) for (const [id, mm] of g.members) if (mm.profile === profile) dropMember(g, id); // you, from an older connection
     const id = crypto.randomUUID();
     g.members.set(id, { name: clean1(b.user, 40) || "Guest", avatar: cleanAvatar(b.avatar), profile, seen: nowMs(), pings: 0, spectate: !!b.spectate });
@@ -2226,6 +2236,18 @@ async function groupRoute(req, res, p, get, post, url) {
     broadcast(g);
     return send(res, 200, { ok: true });
   }
+  if (action === "tvmember") { // Sour Player TV: the host adds (or removes) someone who's at the event
+    if (!isHost || !g.tv) return send(res, 403, { error: "only the TV's host can do that" });
+    const who = clean1(b.add || b.remove, 40);
+    if (!who || !profiles[who]) return send(res, 404, { error: "no such profile" });
+    if (b.add) g.tv.allowed.add(who);
+    else if (who !== g.hostProfile) {
+      g.tv.allowed.delete(who);
+      for (const [id, mm] of g.members) if (mm.profile === who) { if (mm.stream) sse(mm.stream, "kicked", {}); dropMember(g, id); }
+    }
+    broadcast(g);
+    return send(res, 200, { members: [...g.tv.allowed] });
+  }
   if (action === "kick") {
     const mm = g.members.get(String(b.target || ""));
     if (!mm) return send(res, 404, { error: "they already left" });
@@ -2483,6 +2505,11 @@ function profileStats(p) {
   };
 }
 // what everyone sees; `self` (the owner, with their key) also gets the private bits
+// the Sour Player TV party someone is at (added by the host, or hosting it)
+function tvPartyOf(id) {
+  for (const g of groups.values()) if (g.tv && !g.ended && g.tv.allowed.has(id)) return g;
+  return null;
+}
 function publicProfile(p, self = false) {
   const online = !isInvisible(p) && Date.now() - (p.lastSeen || 0) < ONLINE_MS;
   const priv = self ? {} : privacy(p);
@@ -2505,6 +2532,12 @@ function publicProfile(p, self = false) {
     admin: isAdmin(p),
     gavin: isGavin(p),
   };
+  const party = tvPartyOf(p.id);
+  if (party) {
+    const now = party.queue[party.index];
+    Object.assign(out, { online: true, tv: { event: party.tv.event, host: party.hostName }, group: null, on: "tv",
+      listening: !hidden && !priv.hideListening && now ? now : null, playing: !!party.playing, position: 0, positionAt: 0 });
+  } else out.tv = null;
   if (!hidden && !priv.hideStats) out.stats = profileStats(p);
   if (self) Object.assign(out, { account: p.navidrome || null, visits: p.custom && p.custom.visits ? p.visits || [] : [], avatarHistory: (p.avatarHistory || []).map((h) => h.v), resume: p.lastPlayback || null, perks: perksOf(p.id) });
   return out;
