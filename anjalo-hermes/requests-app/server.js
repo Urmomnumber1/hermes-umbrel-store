@@ -2563,6 +2563,7 @@ function publicProfile(p, self = false) {
     away: !online ? p.away || "" : "",
     admin: isAdmin(p),
     gavin: isGavin(p),
+    serverNow: Date.now(), // listen along corrects for a computer whose clock is off
   };
   const party = tvPartyOf(p.id);
   if (party) {
