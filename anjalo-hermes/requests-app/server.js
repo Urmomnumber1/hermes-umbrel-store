@@ -2240,7 +2240,7 @@ async function groupRoute(req, res, p, get, post, url) {
   }
   if (action === "settings") {
     if (typeof b.guestControl === "boolean") g.guestControl = b.guestControl;
-    if (typeof b.listed === "boolean") g.listed = b.listed;
+    if (typeof b.listed === "boolean" && !g.tv) g.listed = b.listed; // a TV party never shows in the list
     if (typeof b.djRotation === "boolean") { g.djRotation = b.djRotation; g.djTurn = 0; }
     if (typeof b.watchVideo === "boolean") g.watchVideo = b.watchVideo;
     if (typeof b.syncLook === "boolean") g.syncLook = b.syncLook; // everyone hears the host's speed and karaoke
