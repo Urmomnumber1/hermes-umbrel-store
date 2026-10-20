@@ -1709,8 +1709,8 @@ function groupState(g) {
   return {
     code: g.code, name: g.name, host: g.hostName, ended: !!g.ended, guestControl: g.guestControl, listed: g.listed,
     radio: !!g.radio, station: g.station || null,
-    needSongs: !!g.radio && upcoming(g) < 3, votes: g.votes ? g.votes.size : 0,
-    votesNeeded: g.radio ? Math.max(1, Math.ceil(uniquePeople(g) / 2)) : 0,
+    needSongs: !!g.radio && upcoming(g) < 3, votes: g.radio ? (g.votes ? g.votes.size : 0) : g.skipVotes ? g.skipVotes.size : 0,
+    votesNeeded: g.radio ? Math.max(1, Math.ceil(uniquePeople(g) / 2)) : Math.max(1, Math.ceil((uniquePeople(g) + 1) / 2)),
     hostProfile: g.hostProfile || null, hostAvatar: g.hostAvatar ? g.avatarVersion : 0,
     members: [...g.members.entries()].map(([id, m]) => ({ id, name: m.name, avatar: m.avatar ? g.avatarVersion : 0, profile: m.profile || null,
       spectate: !!m.spectate, position: m.position ?? null, positionAt: m.positionAt ?? null })),
@@ -2190,6 +2190,21 @@ async function groupRoute(req, res, p, get, post, url) {
     const index = Number.isInteger(b.index) ? b.index : -1;
     const target = g.queue[index];
     const own = cmd === "remove" && target && (g.addedBy.get(target.id) || g.hostName) === me.name;
+    // guests without controls vote to skip: half the room (the host counts) skips the song
+    if (cmd === "next" && !isHost && !g.guestControl) {
+      g.skipVotes = g.skipVotes || new Set();
+      g.skipVotes.add(whoKey);
+      const needed = Math.max(1, Math.ceil((uniquePeople(g) + 1) / 2));
+      const skipped = g.skipVotes.size >= needed;
+      if (skipped) {
+        g.skipVotes.clear();
+        g.session.skips++;
+        g.commands.push({ cid: crypto.randomUUID(), cmd: "next", index: -1, songId: null, position: 0, by: "the room's vote" });
+        g.commands = g.commands.slice(-50);
+      }
+      broadcast(g);
+      return send(res, 200, { skipped, votes: skipped ? 0 : g.skipVotes.size, needed });
+    }
     if (!isHost && !g.guestControl && !own) return send(res, 403, { error: "the host hasn't let guests control playback" });
     if ((cmd === "playIndex" || cmd === "remove" || cmd === "playNext") && (!target || target.id !== b.songId))
       return send(res, 409, { error: "the queue changed - try again" });
@@ -2211,6 +2226,7 @@ async function groupRoute(req, res, p, get, post, url) {
     const now = g.queue[g.index];
     if (now && g.session.lastSong !== now.id) { // a new song started: count it for the session summary
       g.session.lastSong = now.id;
+      if (g.skipVotes) g.skipVotes.clear(); // skip votes are for one song
       const pl = g.session.plays.get(now.id) || { song: now, n: 0 }; pl.n++; g.session.plays.set(now.id, pl);
     }
     g.updatedAt = nowMs();
