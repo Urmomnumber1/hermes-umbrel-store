@@ -1930,6 +1930,12 @@ async function groupRoute(req, res, p, get, post, url) {
     const [, type, b64] = data.match(/^data:(image\/\w+);base64,(.*)$/);
     return send(res, 200, Buffer.from(b64, "base64"), type, { "cache-control": "max-age=86400" });
   }
+  if (post && action === "resume") { // the host's app restarted: is this still its group? (Sour Player TV)
+    const b = await readBody(req);
+    if (b.hostKey !== g.hostKey) return send(res, 403, { error: "not the host any more" });
+    g.hostSeen = nowMs();
+    return send(res, 200, { state: groupState(g) });
+  }
   if (get && action === "stats" && g.radio) { // most played on this station and who adds the most
     const top = (map, n) => [...map.entries()].sort((a, b) => (b[1].n ?? b[1]) - (a[1].n ?? a[1])).slice(0, n);
     return send(res, 200, {
