@@ -2266,6 +2266,8 @@ async function groupRoute(req, res, p, get, post, url) {
 // /data/sour. Presence comes from a heartbeat the app sends every 15 seconds with what it's playing; listening time
 // and play counts for stats, the weekly leaderboard and taste matches are counted from those heartbeats.
 const SOUR_DIR = "/data/sour", PROFILES = "/data/profiles.json", THEMES = "/data/playlist-themes.json";
+// a theme picture's framing: the point that stays in view (percent) and the zoom (100 = just fills)
+const themeFrame = (t) => ({ focusX: t.focusX ?? 50, focusY: t.focusY ?? 50, zoom: t.zoom ?? 100 });
 const STATS = "/data/stats.json", MILESTONES = "/data/milestones.json", FRIENDS = "/data/friend-group.json", FOLLOWS = "/data/follows.json";
 fs.mkdirSync(SOUR_DIR, { recursive: true });
 const readJson = (file, fallback) => { try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return fallback; } };
@@ -3226,7 +3228,7 @@ async function sourRoute(req, res, p, get, post, url) {
     return send(res, 200, feedback);
   }
   if (get && p === "/api/playlist-themes") { // every themed playlist (the Sour Stage uses a playlist's picture as its backdrop)
-    return send(res, 200, Object.entries(playlistThemes).map(([id, t]) => ({ id, color: t.color || null, image: t.image ? t.image.v : 0 })));
+    return send(res, 200, Object.entries(playlistThemes).map(([id, t]) => ({ id, color: t.color || null, image: t.image ? t.image.v : 0, ...themeFrame(t) })));
   }
   if (get && p === "/api/karaoke") { // is there an instrumental for this song? (and how loud to play it)
     const artist = url.searchParams.get("artist"), title = url.searchParams.get("title");
@@ -3252,7 +3254,7 @@ async function sourRoute(req, res, p, get, post, url) {
   if ((m = p.match(/^\/api\/playlist-themes\/([\w-]{1,80})(\/image)?$/))) { // a playlist's look, shared by everyone
     const id = m[1], t = playlistThemes[id];
     if (get && m[2]) return sendImage(res, `playlist-${id}`, t && t.image);
-    if (get) return t ? send(res, 200, { color: t.color, opacity: t.opacity ?? 100, image: t.image ? t.image.v : 0, owner: t.owner, ownerName: profiles[t.owner]?.name || null, font: t.font || null })
+    if (get) return t ? send(res, 200, { color: t.color, opacity: t.opacity ?? 100, image: t.image ? t.image.v : 0, owner: t.owner, ownerName: profiles[t.owner]?.name || null, font: t.font || null, locked: !!t.locked, ...themeFrame(t) })
       : send(res, 404, { error: "no theme" });
     if (!post || m[2]) return send(res, 404, { error: "not found" });
     const b = await readBody(req, 9000000);
@@ -3277,10 +3279,15 @@ async function sourRoute(req, res, p, get, post, url) {
       if (b.image && !img) return send(res, 400, { error: "the picture must be PNG, JPEG, WebP or GIF, up to 6 MB" });
       theme.image = storeImage(`playlist-${id}`, img, theme.image);
     }
+    // where the picture sits (the part that stays in view) and how far it's zoomed in
+    const pct = (v, lo, hi) => Math.min(hi, Math.max(lo, Math.round(Number(v))));
+    if (Number.isFinite(Number(b.focusX))) theme.focusX = pct(b.focusX, 0, 100);
+    if (Number.isFinite(Number(b.focusY))) theme.focusY = pct(b.focusY, 0, 100);
+    if (Number.isFinite(Number(b.zoom))) theme.zoom = pct(b.zoom, 100, 300);
     theme.updated = new Date().toISOString();
     playlistThemes[id] = theme;
     saveThemes();
-    return send(res, 200, { color: theme.color, opacity: theme.opacity ?? 100, image: theme.image ? theme.image.v : 0, owner: theme.owner, ownerName: me.name, font: theme.font || null });
+    return send(res, 200, { color: theme.color, opacity: theme.opacity ?? 100, image: theme.image ? theme.image.v : 0, owner: theme.owner, ownerName: me.name, font: theme.font || null, locked: !!theme.locked, ...themeFrame(theme) });
   }
   return send(res, 404, { error: "not found" });
 }
