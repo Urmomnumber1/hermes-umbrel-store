@@ -335,7 +335,7 @@ async function fixSong(rel, action) {
   const c = guessFromPath(file, { a: junkTag(cached.a) ? "" : cached.a, aa: junkTag(cached.aa) ? "" : cached.aa, t: junkTag(cached.t) ? "" : cached.t });
   const artist = c.a || c.aa, title = c.t;
   if (!artist || !title) throw new Error("not enough to go on - rename the file to 'Artist - Title' first");
-  const meta = (await lookupMeta(artist, title).catch(() => null)) || (await dzLookupMeta(artist, title).catch(() => null)) || { artist, title };
+  const meta = (await catalogMeta(artist, title)) || { artist, title };
   const ext = path.extname(file).slice(1).toLowerCase();
   return ctx.run({ stage: path.join(STAGING, "fix-" + newId()) }, async () => {
     fs.mkdirSync(ST(), { recursive: true });
@@ -351,12 +351,12 @@ async function fixSong(rel, action) {
       }
       const outExt = path.extname(src).slice(1).toLowerCase();
       let cover = null;
-      if (meta.cover && await fetchFile(meta.cover, path.join(ST(), "cover.jpg")).catch(() => false)) cover = path.join(ST(), "cover.jpg");
+      if (meta.cover && !meta.ytCover && await fetchFile(meta.cover, path.join(ST(), "cover.jpg")).catch(() => false)) cover = path.join(ST(), "cover.jpg");
       else if (await fallbackCover(meta.artist, meta.title, path.join(ST(), "cover.jpg"))) cover = path.join(ST(), "cover.jpg");
       const out = path.join(ST(), `fixed.${outExt}`);
       const tags = { title: meta.title, artist: meta.artist, album_artist: meta.albumArtist || meta.artist, album: meta.album, date: meta.date, track: meta.track, genre: meta.genre };
-      let t = await run("ffmpeg", tagArgs(src, cover, out, outExt, tags), { timeout: 120000 });
-      if (t.code !== 0 && cover) t = await run("ffmpeg", tagArgs(src, null, out, outExt, tags), { timeout: 120000 });
+      let t = await run("ffmpeg", tagArgs(src, cover, out, outExt, tags, !cover && src === file), { timeout: 120000 });
+      if (t.code !== 0 && cover) t = await run("ffmpeg", tagArgs(src, null, out, outExt, tags, src === file), { timeout: 120000 });
       if (t.code !== 0 || !fs.existsSync(out)) throw new Error("tagging failed");
       const dest = outExt === ext ? file : file.replace(/\.[^.]+$/, "." + outExt);
       fs.copyFileSync(out, dest);
@@ -530,6 +530,38 @@ async function lookupMeta(artist, title) {
   return null;
 }
 
+// ---------- Spotify (with the keys in Config) and YouTube Music: when iTunes and Deezer don't know a song ----------
+async function spotifyMeta(artist, title) {
+  const sp = await spotifyApi(`/v1/search?type=track&limit=5&q=${encodeURIComponent(`track:${title} artist:${artist}`)}`);
+  const hit = (sp?.tracks?.items || []).find((x) => norm(x.name) === norm(title)) || sp?.tracks?.items?.[0];
+  if (!hit) return null;
+  const al = hit.album || {};
+  return { artist: (hit.artists || []).map((x) => x.name).join(", ") || artist, title: hit.name, album: al.name || title,
+    albumArtist: al.artists?.[0]?.name || hit.artists?.[0]?.name || artist, date: String(al.release_date || "").slice(0, 4),
+    track: hit.track_number ? String(hit.track_number) : undefined, cover: al.images?.[0]?.url || "",
+    releaseType: al.album_type === "single" ? "single" : "album", seconds: Math.round((hit.duration_ms || 0) / 1000) };
+}
+async function youtubeMeta(artist, title) {
+  // YouTube Music's "Artist - Topic" uploads carry the track, artist, album and year
+  const s = await run("yt-dlp", [`ytsearch5:${artist} ${title}`, "--skip-download", "--no-warnings", "--ignore-errors",
+    "--print", "%(.{id,title,channel,track,artist,album,release_year,duration})j"], { timeout: 120000 });
+  const rows = [];
+  for (const l of s.out.split("\n")) { try { rows.push(JSON.parse(l)); } catch {} }
+  const hit = rows.find((v) => v.track && norm(v.track) === norm(title)) || rows.find((v) => v.track && v.album);
+  if (!hit) return null;
+  return { artist: hit.artist || String(hit.channel || "").replace(/ - Topic$/, "") || artist, title: hit.track, album: hit.album || hit.track,
+    albumArtist: (hit.artist || artist).split(", ")[0], date: hit.release_year ? String(hit.release_year) : undefined,
+    cover: `https://i.ytimg.com/vi/${hit.id}/maxresdefault.jpg`, ytCover: true, seconds: Number(hit.duration) || 0, releaseType: "single" };
+}
+// every catalogue in turn: iTunes, Deezer, Spotify, YouTube Music
+async function catalogMeta(artist, title) {
+  for (const look of [lookupMeta, dzLookupMeta, spotifyMeta, youtubeMeta]) {
+    const found = await look(artist, title).catch(() => null);
+    if (found) return found;
+  }
+  return null;
+}
+
 // ---------- Deezer (free, no key): second catalogue after iTunes ----------
 // drops "(Remastered 2009)", "- 2011 Remaster" etc. from Deezer names
 const unremaster = (s) => String(s || "").replace(/\s*[([]\s*(\d{4}\s+)?remaster(ed)?(\s+\d{4})?(\s+version)?\s*[)\]]/gi, "")
@@ -600,7 +632,7 @@ const spUrl = (uri) => { const m = String(uri || "").match(/track:([A-Za-z0-9]{2
 // Fills in album tags for a song we only know by name (iTunes, then Deezer); keeps the known length and link.
 async function enrich(base) {
   const first = base.artist.split(", ")[0];
-  const found = await lookupMeta(first, base.title).catch(() => null) || await dzLookupMeta(first, base.title).catch(() => null);
+  const found = await catalogMeta(first, base.title);
   if (found) return { ...found, seconds: base.seconds || found.seconds, spotifyUrl: base.spotifyUrl };
   // in neither catalogue: a single named after the song, so it isn't filed under "Unknown Album"
   return { releaseType: "single", ...base, albumArtist: base.albumArtist || first, album: base.album || base.title };
@@ -841,12 +873,14 @@ async function fetchFile(url, file) {
   return true;
 }
 // ffmpeg: drop YouTube's tags, write clean ones, attach the cover (ogg/opus can't hold a picture with ffmpeg).
-function tagArgs(src, cover, out, fmt, tags) {
+function tagArgs(src, cover, out, fmt, tags, keepArt = false) {
   const withCover = cover && !["opus", "ogg", "oga", "webm"].includes(fmt);
   const a = ["-y", "-v", "error", "-i", src];
   if (withCover) a.push("-i", cover);
   a.push("-map", "0:a");
   if (withCover) a.push("-map", "1:v");
+  // no new cover: keep the one the file already has (it used to be dropped, leaving songs without a cover)
+  else if (keepArt && !["opus", "ogg", "oga", "webm"].includes(fmt)) a.push("-map", "0:v?");
   a.push("-c", "copy", "-map_metadata", "-1");
   for (const [k, v] of Object.entries(tags)) if (v) a.push("-metadata", `${k}=${v}`);
   if (withCover) a.push("-disposition:v:0", "attached_pic", "-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)");
@@ -1682,6 +1716,7 @@ function groupState(g) {
       spectate: !!m.spectate, position: m.position ?? null, positionAt: m.positionAt ?? null })),
     queue: g.queue.map((x, i) => ({ ...x, by: hide && x.requested && i >= g.index ? "?" : g.addedBy.get(x.id) || g.hostName })),
     index: g.index, playing: g.playing, position: g.position, updatedAt: g.updatedAt,
+    syncLook: !!g.syncLook, speed: g.syncLook ? g.hostSpeed || 1 : 1, karaoke: g.syncLook ? !!g.hostKaraoke : false,
     requests: g.requests, commands: g.commands,
     chat: g.chat.slice(-50), upvotes: Object.fromEntries([...g.upvotes].map(([id, s]) => [id, s.size])),
     djRotation: !!g.djRotation, dj: currentDj(g), watchVideo: !!g.watchVideo,
@@ -1975,7 +2010,8 @@ async function groupRoute(req, res, p, get, post, url) {
   if (action === "sound") { // the soundboard: a short sound for everyone (one every few seconds each)
     if (!me) return send(res, 403, { error: "join the group first" });
     const name = String(b.name || "");
-    if (!["airhorn", "rewind", "cheer", "drumroll", "boo", "laugh", "scratch", "applause"].includes(name)) return send(res, 400, { error: "unknown sound" });
+    const custom = name.startsWith("c:") && customSounds.some((x) => x.id === name.slice(2));
+    if (!custom && !["airhorn", "rewind", "cheer", "drumroll", "boo", "laugh", "scratch", "applause"].includes(name)) return send(res, 400, { error: "unknown sound" });
     const last = g.sounds.get(whoKey) || 0;
     if (nowMs() - last < 4000) return send(res, 429, { error: "easy on the soundboard" });
     g.sounds.set(whoKey, nowMs());
@@ -2160,6 +2196,8 @@ async function groupRoute(req, res, p, get, post, url) {
     if (Number.isInteger(b.index)) g.index = Math.max(0, b.index);
     if (typeof b.playing === "boolean") g.playing = b.playing;
     if (Number.isFinite(b.position)) g.position = Math.max(0, b.position);
+    if (Number.isFinite(b.speed)) g.hostSpeed = Math.min(2, Math.max(0.5, b.speed));
+    if (typeof b.karaoke === "boolean") g.hostKaraoke = b.karaoke;
     const now = g.queue[g.index];
     if (now && g.session.lastSong !== now.id) { // a new song started: count it for the session summary
       g.session.lastSong = now.id;
@@ -2179,6 +2217,7 @@ async function groupRoute(req, res, p, get, post, url) {
     if (typeof b.listed === "boolean") g.listed = b.listed;
     if (typeof b.djRotation === "boolean") { g.djRotation = b.djRotation; g.djTurn = 0; }
     if (typeof b.watchVideo === "boolean") g.watchVideo = b.watchVideo;
+    if (typeof b.syncLook === "boolean") g.syncLook = b.syncLook; // everyone hears the host's speed and karaoke
     if (typeof b.approval === "boolean") { g.approval = b.approval; if (!b.approval) { for (const r of g.pending) { g.requests.push(r); g.addedBy.set(r.song.id, r.by); } g.pending = []; } }
     if (typeof b.blind === "boolean") g.blind = b.blind;
     if (b.themeNight !== undefined) g.themeNight = cleanThemeNight(b.themeNight);
@@ -2235,6 +2274,11 @@ let groupStats = readJson(STATS, { weeks: {}, days: {}, totalSeconds: 0, totalRe
 let milestones = readJson(MILESTONES, []), friendGroup = readJson(FRIENDS, { name: "The group", bio: "", picture: null });
 let follows = readJson(FOLLOWS, []);
 const FEEDBACK = "/data/feedback.json";
+// ---- the Group Play soundboard's own sounds: anyone adds one (a short clip), whoever added it or an admin removes it
+const SOUNDS_FILE = "/data/sounds.json";
+let customSounds = (() => { try { return JSON.parse(fs.readFileSync(SOUNDS_FILE, "utf8")); } catch { return []; } })();
+const saveSounds = () => fs.writeFileSync(SOUNDS_FILE, JSON.stringify(customSounds, null, 2));
+const AUDIO_TYPES = { "audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/ogg": "ogg", "audio/wav": "wav", "audio/x-wav": "wav", "audio/webm": "webm", "audio/mp4": "m4a", "audio/x-m4a": "m4a", "audio/aac": "aac" };
 let feedback = readJson(FEEDBACK, []);
 let profilesDirty = false, statsDirty = false;
 const saveProfiles = () => { profilesDirty = false; fs.writeFileSync(PROFILES, JSON.stringify(profiles)); };
@@ -2450,6 +2494,7 @@ function publicProfile(p, self = false) {
     created: p.created,
     listening: online && !priv.hideListening && p.listening ? p.listening : null, playing: online && !!p.playing,
     on: online && !priv.hideListening ? p.on || "computer" : null,
+    speed: online && !priv.hideListening ? p.speed || 1 : 1, karaoke: online && !priv.hideListening ? !!p.karaoke : false,
     position: online && !priv.hideListening ? p.position || 0 : 0, positionAt: p.positionAt || 0,
     group: online && !priv.hideListening ? p.group || null : null,
     custom: hidden ? { privacy: { private: true } } : p.custom || {},
@@ -2914,7 +2959,9 @@ async function sourRoute(req, res, p, get, post, url) {
     me.devices = me.devices && typeof me.devices === "object" ? me.devices : {};
     const before = me.devices[dev];
     if (song && b.playing && (!before || !before.listening || before.listening.id !== song.id)) countPlay(me, song);
-    me.devices[dev] = { listening: song, playing: !!b.playing, position: Number(b.position) || 0, at: now, on: b.on === "phone" ? "phone" : "computer" };
+    const speed = Math.min(2, Math.max(0.5, Number(b.speed) || 1));
+    me.devices[dev] = { listening: song, playing: !!b.playing, position: Number(b.position) || 0, at: now, on: b.on === "phone" ? "phone" : "computer",
+      speed, karaoke: !!b.karaoke };
     for (const [k, d] of Object.entries(me.devices)) if (!d || now - (d.at || 0) > ONLINE_MS) delete me.devices[k];
     const devs = Object.values(me.devices).sort((x, y) => y.at - x.at);
     const best = devs.find((d) => d.playing && d.listening) || devs.find((d) => d.listening) || me.devices[dev];
@@ -2923,6 +2970,8 @@ async function sourRoute(req, res, p, get, post, url) {
     me.listening = best.listening;
     me.playing = best.playing;
     me.on = best.on; // where they listen (shown as "on their phone")
+    me.speed = best.speed || 1; // slowed / normal / nightcore, so listen along matches it
+    me.karaoke = !!best.karaoke;
     me.position = best.position;
     me.positionAt = best.at;
     me.group = b.group && typeof b.group.code === "string" ? { code: clean1(b.group.code, 5), name: clean1(b.group.name, 60) } : null;
@@ -3116,6 +3165,41 @@ async function sourRoute(req, res, p, get, post, url) {
     saveProfiles();
     return send(res, 200, mine());
   }
+  if (p === "/api/sounds" || p.startsWith("/api/sounds/")) {
+    const id = p.slice("/api/sounds/".length);
+    if (get && id) { // the clip itself
+      const snd = customSounds.find((x) => x.id === id);
+      const file = snd && path.join(SOUR_DIR, `sound-${snd.id}.${snd.ext}`);
+      if (!file || !fs.existsSync(file)) return send(res, 404, { error: "no such sound" });
+      res.writeHead(200, { "content-type": Object.keys(AUDIO_TYPES).find((k) => AUDIO_TYPES[k] === snd.ext) || "audio/mpeg", "cache-control": "max-age=86400", "access-control-allow-origin": "*" });
+      return fs.createReadStream(file).pipe(res);
+    }
+    if (get) return send(res, 200, customSounds.map(({ id, name, emoji, by, byName }) => ({ id, name, emoji, by, byName })));
+    if (!post) return send(res, 404, { error: "not found" });
+    const b = await readBody(req, 1500000);
+    const me = ownProfile(String(b.profile || ""), b.key);
+    if (!me) return send(res, 403, { error: "set up your profile first" });
+    if (b.remove) {
+      const snd = customSounds.find((x) => x.id === String(b.remove));
+      if (!snd) return send(res, 404, { error: "no such sound" });
+      if (snd.by !== me.id && !isAdmin(me)) return send(res, 403, { error: "only whoever added it or an admin can remove it" });
+      fs.rmSync(path.join(SOUR_DIR, `sound-${snd.id}.${snd.ext}`), { force: true });
+      customSounds = customSounds.filter((x) => x !== snd);
+      saveSounds();
+      return send(res, 200, { removed: true });
+    }
+    const m = typeof b.audio === "string" && b.audio.match(/^data:(audio\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/);
+    const ext = m && AUDIO_TYPES[m[1]];
+    const buf = m ? Buffer.from(m[2], "base64") : null;
+    if (!ext || !buf || !buf.length || buf.length > 1000000) return send(res, 400, { error: "a sound has to be an audio file (mp3, ogg, wav, m4a) up to 1 MB" });
+    if (customSounds.length >= 60) return send(res, 409, { error: "the soundboard is full (60 sounds) - remove one first" });
+    const snd = { id: newId(), name: clean1(b.name || "sound", 24), emoji: oneEmoji(b.emoji) || "\u{1F50A}", ext, by: me.id, byName: me.name, at: new Date().toISOString() };
+    fs.mkdirSync(SOUR_DIR, { recursive: true });
+    fs.writeFileSync(path.join(SOUR_DIR, `sound-${snd.id}.${ext}`), buf);
+    customSounds.push(snd);
+    saveSounds();
+    return send(res, 201, { id: snd.id, name: snd.name, emoji: snd.emoji, by: snd.by, byName: snd.byName });
+  }
   if (p === "/api/feedback") {
     if (post) { // { kind: bug | idea, text, profile, key, version, platform } or, for admins, { id, done }
       const b = await readBody(req, 20000);
@@ -3174,9 +3258,13 @@ async function sourRoute(req, res, p, get, post, url) {
     const b = await readBody(req, 9000000);
     const me = ownProfile(String(b.profile || ""), b.key);
     if (!me) return send(res, 403, { error: "set up your profile first" });
-    if (t && t.owner !== me.id) return send(res, 403, { error: `only ${profiles[t.owner]?.name || "whoever themed it"} can change this playlist's theme` });
+    // anyone can change a playlist's look (it used to be only whoever themed it first); a theme an
+    // admin locked stays as it is for everyone but admins
+    if (t && t.locked && t.owner !== me.id && !isAdmin(me)) return send(res, 403, { error: "an admin locked this playlist's theme" });
+    if (b.locked !== undefined && isAdmin(me) && t) t.locked = !!b.locked;
     if (b.remove) { if (t) storeImage(`playlist-${id}`, null, t.image); delete playlistThemes[id]; saveThemes(); return send(res, 200, { removed: true }); }
     const theme = t || { owner: me.id, color: null, image: null };
+    theme.editedBy = me.id;
     if (b.color !== undefined) theme.color = cleanColor(b.color);
     if (b.opacity !== undefined) { const o = Math.round(Number(b.opacity)); theme.opacity = o >= 10 && o <= 100 ? o : 100; }
     if (b.font !== undefined) {
@@ -3281,7 +3369,7 @@ http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://x");
   const p = url.pathname, get = req.method === "GET", post = req.method === "POST";
   const SOUR_ROUTES = ["/api/presence", "/api/leaderboard", "/api/song-of-the-day", "/api/group-top", "/api/milestones", "/api/follows"];
-  const SOUR_PREFIXES = ["/api/profiles", "/api/playlist-themes", "/api/friend-group", "/api/activity", "/api/gifts", "/api/capsules", "/api/song-notes",
+  const SOUR_PREFIXES = ["/api/sounds", "/api/profiles", "/api/playlist-themes", "/api/friend-group", "/api/activity", "/api/gifts", "/api/capsules", "/api/song-notes",
     "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke", "/api/feedback"];
   const isSour = SOUR_PREFIXES.some((x) => p.startsWith(x)) || SOUR_ROUTES.includes(p);
   if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/requests") || p.startsWith("/api/library") || p.startsWith("/api/duplicates") || isSour
@@ -3472,27 +3560,44 @@ http.createServer(async (req, res) => {
   }
   if (get && p === "/api/library/covers") { // cover pictures from Deezer and iTunes for an album
     const artist = clean1(url.searchParams.get("artist"), 100), album = clean1(url.searchParams.get("album"), 150);
-    if (!album) return send(res, 400, { error: "which album?" });
+    const q = clean1(url.searchParams.get("q"), 200) || `${artist} ${album}`.trim(); // free search (Sour's cover changer)
+    if (!q) return send(res, 400, { error: "which album?" });
     const out = [];
     try {
-      for (const a of ((await deezer(`search/album?limit=8&q=${encodeURIComponent(`${artist} ${album}`)}`)).data || []))
+      for (const a of ((await deezer(`search/album?limit=8&q=${encodeURIComponent(q)}`)).data || []))
         if (a.cover_xl) out.push({ url: a.cover_xl, title: a.title, artist: a.artist?.name || "", source: "Deezer" });
     } catch {}
     try {
-      for (const a of await itunes("search", { term: `${artist} ${album}`, entity: "album", limit: 8 }))
+      for (const a of await itunes("search", { term: q, entity: "album", limit: 8 }))
         if (a.artworkUrl100) out.push({ url: a.artworkUrl100.replace(/100x100bb/, "1200x1200bb"), title: a.collectionName, artist: a.artistName, source: "iTunes" });
     } catch {}
-    return send(res, 200, out.slice(0, 16));
+    try {
+      const sp = await spotifyApi(`/v1/search?type=album&limit=8&q=${encodeURIComponent(q)}`);
+      for (const a of sp?.albums?.items || [])
+        if (a.images?.[0]?.url) out.push({ url: a.images[0].url, title: a.name, artist: a.artists?.[0]?.name || "", source: "Spotify" });
+    } catch {}
+    return send(res, 200, out.slice(0, 24));
   }
   if (post && p === "/api/library/cover") { // put a new cover on songs (and the album folder)
-    const b = await readBody(req, 200000);
+    const b = await readBody(req, 8500000);
     const files = (Array.isArray(b.files) ? b.files : []).slice(0, 300).map((rel) => { try { return libraryFile(rel); } catch { return null; } }).filter(Boolean);
-    if (!files.length || !/^https:\/\/[\w.-]+\.(dzcdn\.net|deezer\.com|mzstatic\.com|apple\.com)\//.test(String(b.url || ""))) return send(res, 400, { error: "pick songs and one of the suggested covers" });
+    // a suggested cover (from a catalogue) or a picture an admin uploaded (a data: URL, up to 6 MB)
+    const img = typeof b.image === "string" && b.image.match(/^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
+    const fromCatalog = /^https:\/\/[\w.-]+\.(dzcdn\.net|deezer\.com|mzstatic\.com|apple\.com|scdn\.co)\//.test(String(b.url || ""));
+    if (!files.length || (!fromCatalog && !img)) return send(res, 400, { error: "pick songs and one of the suggested covers" });
     return ctx.run({ stage: path.join(STAGING, "cover-" + newId()) }, async () => {
       fs.mkdirSync(ST(), { recursive: true });
       try {
         const cover = path.join(ST(), "cover.jpg");
-        if (!(await fetchFile(String(b.url), cover).catch(() => false))) return send(res, 502, { error: "couldn't download that cover" });
+        if (img) {
+          const buf = Buffer.from(img[2], "base64");
+          if (buf.length > 6000000) return send(res, 400, { error: "pick a picture under 6 MB" });
+          const raw = path.join(ST(), `upload.${img[1]}`);
+          fs.writeFileSync(raw, buf);
+          // always a square-ish, not huge jpg, whatever was uploaded
+          const c = await run("ffmpeg", ["-y", "-v", "error", "-i", raw, "-vf", "scale='min(1400,iw)':-2", "-q:v", "2", cover], { timeout: 60000 });
+          if (c.code !== 0 || !fs.existsSync(cover)) return send(res, 400, { error: "that picture couldn't be read" });
+        } else if (!(await fetchFile(String(b.url), cover).catch(() => false))) return send(res, 502, { error: "couldn't download that cover" });
         let done = 0;
         for (const f of files) { try { await editFile(f, { cover }); done++; } catch {} }
         for (const dir of new Set(files.map((f) => path.dirname(f)))) { try { fs.copyFileSync(cover, path.join(dir, "cover.jpg")); } catch {} }
