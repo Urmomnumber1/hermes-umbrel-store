@@ -2568,7 +2568,7 @@ function publicProfile(p, self = false) {
   const party = tvPartyOf(p.id);
   if (party) {
     const now = party.queue[party.index];
-    Object.assign(out, { online: true, tv: { event: party.tv.event, host: party.hostName }, group: null, on: "tv",
+    Object.assign(out, { online: true, tv: { event: party.tv.event, host: party.hostName, ...(self ? { code: party.code, hosting: party.hostProfile === p.id } : {}) }, group: null, on: "tv",
       listening: !hidden && !priv.hideListening && now ? now : null, playing: !!party.playing, position: 0, positionAt: 0 });
   } else out.tv = null;
   if (!hidden && !priv.hideStats) out.stats = profileStats(p);
