@@ -175,7 +175,7 @@ const $ = (id) => document.getElementById(id);
 const SCREEN = new URLSearchParams(location.search).get("screen");
 if (SCREEN) document.body.classList.add("screen");
 // tell the iPhone app which party is on, so it can show it on the TV
-const tellApp = (code) => { try { window.webkit?.messageHandlers?.sourtv?.postMessage({ code: code || null }); } catch {} };
+const tellApp = (code) => { try { window.webkit?.messageHandlers?.sourtv?.postMessage({ code: code || null, auth: code && login ? auth() : null }); } catch {} };
 const audio = $("audio");
 const store = {
   get(k) { try { return JSON.parse(localStorage.getItem(k) || "null"); } catch { return null; } },
@@ -198,7 +198,9 @@ const toast = (msg) => {
 const show = (id) => { for (const s of ["signin", "start", "tv"]) $(s).classList.toggle("hidden", s !== id); };
 const fmt = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, "0")}`;
 const hex = (str) => [...new TextEncoder().encode(str)].map((b) => b.toString(16).padStart(2, "0")).join("");
-const auth = () => `u=${encodeURIComponent(login.user)}&p=enc:${hex(login.pass)}&v=1.16.1&c=sour-tv&f=json`;
+// the TV picture inside the iPhone app gets the phone's sign-in from the app (?a=) when it can't read it itself
+const SCREEN_AUTH = new URLSearchParams(location.search).get("a");
+const auth = () => (login ? `u=${encodeURIComponent(login.user)}&p=enc:${hex(login.pass)}&v=1.16.1&c=sour-tv&f=json` : SCREEN_AUTH || "");
 const rest = async (method, params = "") => {
   const r = await fetch(`/tv/rest/${method}?${auth()}${params ? "&" + params : ""}`);
   const j = await r.json().catch(() => null);
@@ -206,7 +208,7 @@ const rest = async (method, params = "") => {
   if (!sr || sr.status !== "ok") throw new Error(sr?.error?.message || "the music server didn't answer");
   return sr;
 };
-const coverUrl = (id, size = 600) => (id ? `/tv/rest/getCoverArt?${auth()}&id=${encodeURIComponent(id)}&size=${size}` : "");
+const coverUrl = (id, size = 600) => (id && auth() ? `/tv/rest/getCoverArt?${auth()}&id=${encodeURIComponent(id)}&size=${size}` : "");
 const streamUrl = (id) => `/tv/rest/stream?${auth()}&id=${encodeURIComponent(id)}`;
 const api = async (path, body) => {
   const r = await fetch(path, body ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) } : undefined);
