@@ -2558,11 +2558,17 @@ async function tvRest(req, res, method, url) {
   const base = await navidromeBase();
   if (!base) return send(res, 502, { error: "Hermes Music can't find Navidrome" });
   try {
-    const headers = {};
+    // uncompressed: fetch unpacks gzip by itself, and a forwarded content-length for the packed size made
+    // Node cut the connection when more bytes came out ("Load failed" with a real Navidrome)
+    const headers = { "accept-encoding": "identity" };
     if (req.headers.range) headers.range = req.headers.range;
     const r = await fetch(`${base}/rest/${name}?${url.searchParams.toString()}`, { headers, signal: AbortSignal.timeout(name === "stream" ? 60 * 60 * 1000 : 20000) });
     const out = { "cache-control": name === "getCoverArt" ? "max-age=86400" : "no-store" };
-    for (const h of ["content-type", "content-length", "content-range", "accept-ranges"]) { const v = r.headers.get(h); if (v) out[h] = v; }
+    const packed = !!r.headers.get("content-encoding");
+    for (const h of ["content-type", "content-length", "content-range", "accept-ranges"]) {
+      const v = r.headers.get(h);
+      if (v && !(packed && h === "content-length")) out[h] = v;
+    }
     res.writeHead(r.status, out);
     if (!r.body) return res.end();
     const { Readable } = require("stream");
