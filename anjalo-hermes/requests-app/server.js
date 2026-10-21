@@ -1949,6 +1949,7 @@ async function groupRoute(req, res, p, get, post, url) {
       history: g.queue.slice(Math.max(0, g.index - 30), g.index).reverse().map((x) => ({ ...x, by: g.addedBy.get(x.id) || g.hostName })),
     });
   }
+  if (get && action === "state") return send(res, 200, groupState(g)); // the same as the live updates, once (the Sour Player TV picture checks it in case its live connection stalls)
   if (get && action === "events") { // live updates (Server-Sent Events)
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
     res.on("error", () => {}); // a dropped connection must never take the server down

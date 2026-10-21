@@ -296,6 +296,7 @@ function setState(st) {
 }
 // the TV picture: what the group plays, where it is now
 function followState(st) {
+  lastState = Date.now();
   clockOffset = st.serverNow - Date.now();
   const lastChat = state?.chat?.[state.chat.length - 1]?.id;
   const first = !state;
@@ -604,6 +605,23 @@ async function keepAwake() {
 }
 document.addEventListener("visibilitychange", () => { if (session) keepAwake(); });
 
+// The TV picture keeps itself up to date even when iOS treats it as a background page (timers slowed, the
+// live connection stalled): it checks the party every few seconds, and the iPhone app nudges it every second.
+let lastPoll = 0, lastState = 0;
+async function poll() {
+  if (!SCREEN || !session) return;
+  lastPoll = Date.now();
+  try {
+    const st = await fetch(`/api/group/${session.code}/state`, { cache: "no-store" }).then((r) => (r.ok ? r.json() : null));
+    if (st) setState(st);
+  } catch {}
+}
+window.tvPulse = () => {
+  tick();
+  if (Date.now() - lastPoll > 2500) poll();
+  if (Date.now() - lastState > 15000 && session) { lastState = Date.now(); listen(); } // live connection gone quiet: open it again
+};
+
 // before a party starts (or after it ends) the TV shows the name and a hint
 function waitingScreen() {
   show("tv");
@@ -622,6 +640,8 @@ function waitingScreen() {
     show("tv");
     listen();
     loadProfiles();
+    poll();
+    setInterval(window.tvPulse, 1000);
     return;
   }
   if (!login || !me) return show("signin");
