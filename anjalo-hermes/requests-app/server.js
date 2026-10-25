@@ -2342,6 +2342,13 @@ async function groupRoute(req, res, p, get, post, url) {
     if (!text) return send(res, 400, { error: "say something" });
     g.chat.push({ id: crypto.randomUUID().slice(0, 8), by: me.name, profile: me.profile || null, text, at: nowMs() });
     g.chat = g.chat.slice(-100);
+    for (const m of text.matchAll(/@([\w.-]{2,30})/g)) { // @name: it lands in their inbox
+      const to = Object.values(profiles).find((x) => !x.mergedInto && norm(x.name) === norm(m[1]));
+      if (to && to.id !== me.profile) {
+        to.inbox = [{ id: crypto.randomUUID().slice(0, 8), kind: "mention", from: me.profile || null, fromName: me.name, text: `in ${g.name}: ${text}`, at: Date.now(), read: false, group: g.code }, ...(to.inbox || [])].slice(0, 100);
+        profilesDirty = true;
+      }
+    }
     broadcast(g);
     return send(res, 200, { ok: true });
   }
@@ -3153,6 +3160,9 @@ function publicProfile(p, self = false) {
     alongWith: online && !priv.hideListening ? p.alongWith || null : null,
     riders: online ? Object.values(profiles).filter((o) => o.alongWith === p.id && Date.now() - (o.lastSeen || 0) < ONLINE_MS && !isInvisible(o)).map((o) => ({ id: o.id, name: o.name })) : [],
     recentPlays: hidden || priv.hideListening ? [] : (p.recentPlays || []).slice(0, 30),
+    // currently obsessed: this week's most replayed song (3 plays or more)
+    obsessed: hidden || priv.hideListening || !p.week || p.week.key !== weekKey() ? null : (Object.values(p.week.songs).sort((a, b) => b.n - a.n).find((x) => x.n >= 3) || null),
+    hours: hidden || priv.hideStats ? null : p.hours || null,
     custom: hidden ? { privacy: { private: true } } : p.custom || {},
     wall: hidden ? [] : (p.wall || []).slice(0, 30), nicknames: hidden ? [] : (p.nicknames || []).slice(0, 20),
     away: !online ? p.away || "" : "",
@@ -3609,6 +3619,7 @@ async function sourRoute(req, res, p, get, post, url) {
       const day = dayKey(now);
       me.days = me.days || {};
       me.days[day] = (me.days[day] || 0) + dt;
+      if (!b.private) { me.hours = Array.isArray(me.hours) && me.hours.length === 24 ? me.hours : new Array(24).fill(0); me.hours[new Date(now - (Number(b.tz) || 0) * 60000).getUTCHours()] += dt; }
       const dayKeys = Object.keys(me.days);
       if (dayKeys.length > 400) for (const k of dayKeys.sort().slice(0, dayKeys.length - 400)) delete me.days[k];
       if (me.group) {
@@ -3624,8 +3635,13 @@ async function sourRoute(req, res, p, get, post, url) {
     const dev = clean1(b.device, 40) || "default";
     me.devices = me.devices && typeof me.devices === "object" ? me.devices : {};
     const before = me.devices[dev];
-    if (song && b.playing && (!before || !before.listening || before.listening.id !== song.id)) {
+    if (song && b.playing && !b.private && (!before || !before.listening || before.listening.id !== song.id)) {
       countPlay(me, song);
+      // this week's songs (for "currently obsessed")
+      const wk = weekKey();
+      if (!me.week || me.week.key !== wk) me.week = { key: wk, songs: {} };
+      const ws = (me.week.songs[song.id] ??= { song, n: 0 }); ws.n++;
+      me.week.songs = trimCounts(me.week.songs, 60);
       // the last songs played, for "play what they played earlier" (time-shifted listen along)
       me.recentPlays = [{ song, at: now }, ...(me.recentPlays || []).filter((r) => r.song.id !== song.id)].slice(0, 30);
       // a few songs per day, for "On this day" (the same date in earlier months and years)
@@ -3664,7 +3680,8 @@ async function sourRoute(req, res, p, get, post, url) {
     const best = devs.find((d) => d.playing && d.listening) || devs.find((d) => d.listening) || me.devices[dev];
     if (!isInvisible(me)) me.lastOfflineSeen = now;
     me.lastSeen = now;
-    me.listening = best.listening;
+    me.privateSession = !!b.private; // private session: friends see nothing playing
+    me.listening = me.privateSession ? null : best.listening;
     me.playing = best.playing;
     me.on = best.on; // where they listen (shown as "on their phone")
     me.speed = best.speed || 1; // slowed / normal / nightcore, so listen along matches it
@@ -3687,6 +3704,143 @@ async function sourRoute(req, res, p, get, post, url) {
     const out = Object.entries(prof.dayLog || {}).filter(([k]) => k !== today && (k.slice(5) === md || k.slice(8) === today.slice(8)))
       .sort((a, b) => b[0].localeCompare(a[0])).slice(0, 6).map(([day, songs]) => ({ day, songs: songs.slice(0, 12) }));
     return send(res, 200, out);
+  }
+  // ---- Sour Player 0.10.4: inbox, polls, the daily song guess, album club, hot takes, feed reactions ----
+  if (p === "/api/inbox" || p.startsWith("/api/inbox/")) { // song recs, "ask me for a rec", nudges and @mentions
+    if (!post) return send(res, 404, { error: "not found" });
+    const b = await readBody(req, 20000);
+    const me = ownProfile(String(b.profile || ""), b.key);
+    if (!me) return send(res, 403, { error: "set up your profile first" });
+    me.inbox = Array.isArray(me.inbox) ? me.inbox : [];
+    if (p === "/api/inbox") return send(res, 200, me.inbox.slice(0, 80));
+    if (p === "/api/inbox/read") { for (const m of me.inbox) if (!b.id || m.id === b.id) m.read = true; profilesDirty = true; return send(res, 200, { ok: true }); }
+    if (p === "/api/inbox/send") {
+      const to = profiles[String(b.to || "")];
+      if (!to || to.mergedInto || to.id === me.id) return send(res, 404, { error: "unknown friend" });
+      const kind = ["rec", "ask", "nudge"].includes(b.kind) ? b.kind : null;
+      if (!kind) return send(res, 400, { error: "unknown message" });
+      const song = b.song ? groupSong(b.song) : null;
+      if (kind === "rec" && !song) return send(res, 400, { error: "pick a song" });
+      const recent = (to.inbox || []).filter((m) => m.from === me.id && m.kind === kind && Date.now() - m.at < 60000).length;
+      if (recent >= 3) return send(res, 429, { error: "easy - give them a minute" });
+      to.inbox = [{ id: sid(), kind, from: me.id, fromName: me.name, text: clean1(b.text, 300), song, at: Date.now(), read: false }, ...(to.inbox || [])].slice(0, 100);
+      profilesDirty = true;
+      return send(res, 200, { ok: true });
+    }
+    if (p === "/api/inbox/listened") { const m = me.inbox.find((x) => x.id === b.id); if (m) { m.listened = true; m.read = true; profilesDirty = true; } return send(res, 200, { ok: true }); }
+    return send(res, 404, { error: "not found" });
+  }
+  if (p === "/api/polls" || p.startsWith("/api/polls/")) { // group polls ("what's tonight's party theme?")
+    social.polls = Array.isArray(social.polls) ? social.polls : [];
+    if (get) return send(res, 200, social.polls.filter((x) => Date.now() - x.at < 7 * 86400000).map((x) => ({ ...x, votes: Object.fromEntries(Object.entries(x.votes || {}).map(([k, v]) => [k, v.length])), voters: x.votes })));
+    if (!post) return send(res, 404, { error: "not found" });
+    const b = await readBody(req, 10000);
+    const me = ownProfile(String(b.profile || ""), b.key);
+    if (!me) return send(res, 403, { error: "set up your profile first" });
+    if (p === "/api/polls") {
+      const q = clean1(b.question, 140).trim();
+      const options = (Array.isArray(b.options) ? b.options : []).map((o) => clean1(String(o), 60).trim()).filter(Boolean).slice(0, 6);
+      if (!q || options.length < 2) return send(res, 400, { error: "a question and at least two answers" });
+      social.polls = [{ id: sid(), q, options, by: me.id, byName: me.name, at: Date.now(), votes: {} }, ...social.polls].slice(0, 30);
+      addActivity("poll", me, `asked: ${q}`, null);
+      socialDirty = true;
+      return send(res, 200, { ok: true });
+    }
+    if (p === "/api/polls/vote") {
+      const poll = social.polls.find((x) => x.id === b.id);
+      if (!poll || !poll.options.includes(b.option)) return send(res, 404, { error: "that poll is gone" });
+      for (const k of Object.keys(poll.votes)) poll.votes[k] = poll.votes[k].filter((v) => v !== me.id);
+      (poll.votes[b.option] ??= []).push(me.id);
+      socialDirty = true;
+      return send(res, 200, { ok: true });
+    }
+    return send(res, 404, { error: "not found" });
+  }
+  if (p === "/api/daily-guess" || p.startsWith("/api/daily-guess/")) { // guess today's song from 1, 2, 4, 8, 16 seconds of it
+    const day = String(url.searchParams.get("date") || "").match(/^\d{4}-\d{2}-\d{2}$/) ? url.searchParams.get("date") : dayKey();
+    const pool = [];
+    for (const w of Object.values(groupStats.weeks || {})) for (const s of Object.values(w.songs || {})) if (s.song && s.song.id) pool.push(s.song);
+    const uniq = [...new Map(pool.map((s) => [s.id, s])).values()].sort((a, b) => a.id.localeCompare(b.id));
+    if (!uniq.length) return send(res, 404, { error: "play some songs first - the daily guess picks from what the group plays" });
+    let h = 0; for (const c of day) h = (h * 33 + c.charCodeAt(0)) >>> 0;
+    const song = uniq[h % uniq.length];
+    social.guesses = social.guesses && social.guesses.day === day ? social.guesses : { day, results: {} };
+    if (get) {
+      const results = Object.entries(social.guesses.results).map(([id, r]) => ({ name: profiles[id] ? profiles[id].name : "someone", tries: r.tries, won: r.won }));
+      return send(res, 200, { day, songId: song.id, imageId: null, results });
+    }
+    const b = await readBody(req, 5000);
+    const me = ownProfile(String(b.profile || ""), b.key);
+    if (!me) return send(res, 403, { error: "set up your profile first" });
+    const r = social.guesses.results[me.id] || { tries: 0, won: false, done: false };
+    if (r.done) return send(res, 409, { error: "you already played today's", answer: { title: song.title, artist: song.artist } });
+    r.tries++;
+    const right = b.guess && titleKey(String(b.guess)).length > 1 && (titleKey(String(b.guess)) === titleKey(song.title) || titleKey(song.title).startsWith(titleKey(String(b.guess))) && titleKey(String(b.guess)).length > 4);
+    if (right) { r.won = true; r.done = true; addPoints(me, 10 - Math.min(5, r.tries), "daily song guess"); }
+    else if (r.tries >= 6 || b.giveUp) r.done = true;
+    social.guesses.results[me.id] = r;
+    socialDirty = true;
+    return send(res, 200, { right, tries: r.tries, done: r.done, answer: r.done ? { title: song.title, artist: song.artist, album: song.album, id: song.id } : null });
+  }
+  if (p === "/api/album-club" || p.startsWith("/api/album-club/")) { // one album a week for the whole group, rated together
+    const wk = weekKey();
+    social.albumClub = social.albumClub && typeof social.albumClub === "object" ? social.albumClub : {};
+    const cur = social.albumClub[wk] || null;
+    if (get) return send(res, 200, { week: wk, club: cur, past: Object.entries(social.albumClub).filter(([k]) => k !== wk).sort().reverse().slice(0, 6).map(([k, v]) => ({ week: k, ...v })) });
+    const b = await readBody(req, 10000);
+    const me = ownProfile(String(b.profile || ""), b.key);
+    if (!me) return send(res, 403, { error: "set up your profile first" });
+    if (p === "/api/album-club") { // pick this week's album (first come, or an admin changes it)
+      if (cur && !isAdmin(me)) return send(res, 409, { error: `this week's album is ${cur.album.name}` });
+      const al = b.album || {};
+      if (!al.id || !al.name) return send(res, 400, { error: "pick an album" });
+      social.albumClub[wk] = { album: { id: clean1(al.id, 100), name: clean1(al.name, 200), artist: clean1(al.artist, 200), imageId: al.imageId ? clean1(al.imageId, 200) : null }, by: me.name, ratings: {} };
+      addActivity("club", me, `picked ${al.name} for album club`, null);
+      socialDirty = true;
+      return send(res, 200, { ok: true });
+    }
+    if (p === "/api/album-club/rate") {
+      if (!cur) return send(res, 404, { error: "no album this week yet" });
+      const stars = Math.max(1, Math.min(5, Math.round(Number(b.stars) || 0)));
+      cur.ratings[me.id] = { name: me.name, stars, note: clean1(b.note, 200), at: Date.now() };
+      socialDirty = true;
+      return send(res, 200, { ok: true });
+    }
+    return send(res, 404, { error: "not found" });
+  }
+  if (p === "/api/hot-takes") { // rate a song 1-5 and see if you're the odd one out
+    social.takes = social.takes && typeof social.takes === "object" ? social.takes : {};
+    if (get) {
+      const id = url.searchParams.get("id") || "";
+      const t = social.takes[id] || {};
+      const vals = Object.values(t).map((x) => x.stars);
+      return send(res, 200, { count: vals.length, avg: vals.length ? Math.round((vals.reduce((a, v) => a + v, 0) / vals.length) * 10) / 10 : null, ratings: Object.values(t) });
+    }
+    if (!post) return send(res, 404, { error: "not found" });
+    const b = await readBody(req, 5000);
+    const me = ownProfile(String(b.profile || ""), b.key);
+    if (!me) return send(res, 403, { error: "set up your profile first" });
+    const id = clean1(b.id, 200);
+    if (!id) return send(res, 400, { error: "which song?" });
+    (social.takes[id] ??= {})[me.id] = { name: me.name, stars: Math.max(1, Math.min(5, Math.round(Number(b.stars) || 0))) };
+    const keys = Object.keys(social.takes);
+    if (keys.length > 3000) for (const k of keys.slice(0, keys.length - 3000)) delete social.takes[k];
+    socialDirty = true;
+    return send(res, 200, { ok: true });
+  }
+  if (post && p === "/api/activity/react") { // emoji on a feed post
+    const b = await readBody(req, 2000);
+    const me = ownProfile(String(b.profile || ""), b.key);
+    if (!me) return send(res, 403, { error: "set up your profile first" });
+    const a = social.activity.find((x) => x.id === b.id);
+    const emoji = oneEmoji(b.emoji);
+    if (!a || !emoji) return send(res, 404, { error: "that post is gone" });
+    a.reactions = a.reactions || {};
+    for (const k of Object.keys(a.reactions)) a.reactions[k] = a.reactions[k].filter((x) => x !== me.id);
+    (a.reactions[emoji] ??= []).push(me.id);
+    for (const k of Object.keys(a.reactions)) if (!a.reactions[k].length) delete a.reactions[k];
+    socialDirty = true;
+    return send(res, 200, { reactions: a.reactions });
   }
   if (p === "/api/shop" || p.startsWith("/api/shop/")) { // the Sour Shop
     if (get && p === "/api/shop") {
@@ -4194,7 +4348,7 @@ http.createServer(async (req, res) => {
   const p = url.pathname, get = req.method === "GET", post = req.method === "POST";
   const SOUR_ROUTES = ["/api/presence", "/api/leaderboard", "/api/song-of-the-day", "/api/group-top", "/api/milestones", "/api/follows"];
   const SOUR_PREFIXES = ["/api/sounds", "/api/profiles", "/api/playlist-themes", "/api/friend-group", "/api/activity", "/api/gifts", "/api/capsules", "/api/song-notes",
-    "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke", "/api/feedback", "/api/along/", "/api/shop"];
+    "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke", "/api/feedback", "/api/along/", "/api/shop", "/api/inbox", "/api/polls", "/api/daily-guess", "/api/album-club", "/api/hot-takes"];
   const isSour = SOUR_PREFIXES.some((x) => p.startsWith(x)) || SOUR_ROUTES.includes(p);
   if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/lyrics") || p.startsWith("/api/requests") || p.startsWith("/api/library") || p.startsWith("/api/duplicates") || isSour
     || ["/api/status", "/api/now", "/api/bump", "/api/storage", "/api/song-dna"].includes(p)) { // used by Sour Player (the custom Feishin)
