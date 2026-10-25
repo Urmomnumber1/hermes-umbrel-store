@@ -122,6 +122,8 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
   .btn{padding:10px 18px}
   .help summary{padding:12px}
 }
+  #v-cfg.locked > :not(h3):not(p):not(#cfg-login) { display: none; }
+  #v-cfg:not(.locked) #cfg-login { display: none; }
 </style></head><body>
 <aside class="side">
   <div class="brand">Hermes<br>Music</div>
@@ -388,7 +390,14 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
 
     <div class="term cfg" id="v-cfg" style="display:none">
       <h3>Config</h3>
-      <p>Saved on the Umbrel and applied right away.</p>
+      <p>Saved on the Umbrel and applied right away. <span id="adminwho"></span></p>
+      <div id="cfg-login">
+        <p class="sub2">Config is for admins. Sign in with your Navidrome admin account (the one you use in Navidrome and Sour Player).</p>
+        <div class="row"><label for="a-user">Navidrome username</label><input type="text" id="a-user" autocomplete="username" spellcheck="false"></div>
+        <div class="row"><label for="a-pass">Password</label><input type="password" id="a-pass" autocomplete="current-password"></div>
+        <button class="btn" id="a-login">Sign in</button><span id="loginmsg" class="sub2"></span>
+        <p class="sub2">Remember the old PIN? Type it in the box below instead: <input type="password" id="a-pin" inputmode="numeric" style="width:120px"> <button class="btn" id="a-pinbtn" style="margin:0">Use PIN</button></p>
+      </div>
 
       <div class="grp">&#9662; Model</div>
       <div class="row"><label for="c-engine">Provider<small>who picks the right song</small></label>
@@ -398,7 +407,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
           <select id="c-cmodel"><option value="sonnet">Sonnet</option><option value="opus">Opus</option><option value="haiku">Haiku</option></select></div>
         <div class="row"><label for="c-token">Claude token<small id="tokhint">run: claude setup-token</small></label><input type="password" id="c-token" placeholder="blank = keep, - = remove" autocomplete="off"></div>
       </div>
-      <div class="row"><label for="c-audd">AudD token<small id="auddhint">for humming search in Sour Player (audd.io)</small></label><input type="password" id="c-audd" placeholder="blank = keep, - = remove" autocomplete="off"></div>
+      <div class="row"><label for="c-aik">AI karaoke<small id="aikhint">splits vocals off songs with no instrumental on YouTube (Demucs, free, runs here; downloads about 1-2 GB the first time)</small></label><input type="checkbox" id="c-aik"></div>
       <div id="g-local">
         <div class="row"><label for="c-url">Base URL<small>Ollama, llama.cpp, LM Studio...</small></label><input type="text" id="c-url" placeholder="http://umbrel.local:11434/v1" spellcheck="false"></div>
         <div class="row"><label for="c-lmodel">Model name<small>as your server names it</small></label><input type="text" id="c-lmodel" placeholder="qwen3.8:27b" spellcheck="false"></div>
@@ -466,8 +475,14 @@ let local = [], lastReqs = [], status = null, cfg = null, current = "req", first
 let clearedAt = 0; try { clearedAt = +localStorage.getItem("hm-cleared") || 0; } catch {}
 
 let lastIssues = [];
+// the admin sign-in for Config (kept for this browser tab)
+let ADMIN = sessionStorage.getItem("hermes-admin") || "";
 async function api(path, opt) {
   if (DEMO) return demo(path, opt);
+  opt = opt || {};
+  const pin = sessionStorage.getItem("hermes-pin");
+  if (pin && opt.body && typeof opt.body === "string") { try { const j = JSON.parse(opt.body); if (!j.currentPin) { j.currentPin = pin; opt.body = JSON.stringify(j); } } catch {} }
+  opt.headers = { ...(opt.headers || {}), ...(ADMIN ? { "x-hermes-admin": ADMIN } : {}), ...(opt.body ? { "content-type": "application/json" } : {}) };
   const r = await fetch(path, opt);
   const j = await r.json();
   if (!r.ok) { const e = new Error(j.error || "error"); e.choices = j.choices; throw e; }
@@ -830,7 +845,8 @@ function fillCfg() {
   $("c-singles").checked = cfg.includeSingles; $("c-token").value = "";
   $("c-spid").value = ""; $("c-spsec").value = ""; $("sphint").textContent = cfg.hasSpotify ? "keys are saved" : "not set";
   $("tokhint").textContent = cfg.hasToken ? "a token is saved" : "run: claude setup-token";
-  $("auddhint").textContent = cfg.hasAudd ? "a token is saved" : "for humming search in Sour Player (audd.io)";
+  $("c-aik").checked = cfg.aiKaraoke !== false;
+  $("aikhint").textContent = { ready: "ready", installing: "installing the AI tools...", failed: "couldn't install: " + (cfg.aiKaraokeNote || "") }[cfg.aiKaraokeState] || "splits vocals off songs with no instrumental on YouTube (Demucs, free, runs here; downloads about 1-2 GB the first time)";
   $("r-cur").style.display = cfg.hasPin ? "" : "none"; $("c-cur").value = ""; $("c-pin").value = "";
   showEngine();
 }
@@ -845,7 +861,7 @@ $("c-save").onclick = async () => {
       spotifyClientId: $("c-spid").value.trim(), spotifySecret: $("c-spsec").value.trim(),
       navidromeUrl: $("c-ndurl").value,
       downtifyEnabled: $("c-dten").checked, downtifyUrl: $("c-dturl").value, downtifyUser: $("c-dtuser").value, downtifyPassword: $("c-dtpass").value, downtifyToken: $("c-dtcode").value.trim() === "-" ? "-" : undefined,
-      paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, claudeToken: $("c-token").value, auddToken: $("c-audd").value,
+      paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, claudeToken: $("c-token").value, aiKaraoke: $("c-aik").checked,
       currentPin: $("c-cur").value, newPin: $("c-pin").value }) });
     fillCfg(); m.textContent = "saved"; render();
   } catch (err) { m.style.color = "#f87171"; m.textContent = err.message; }
@@ -917,4 +933,27 @@ document.addEventListener("click", (e) => {
 if (matchMedia("(max-width: 760px)").matches) $("q").placeholder = "song, /album, /artist";
 if (!TOUCH) $("q").focus();
 load(); setInterval(load, 4000);
+
+// ---- Config sign-in ----
+async function checkAdmin() {
+  const box = $("v-cfg");
+  let ok = !!sessionStorage.getItem("hermes-pin");
+  if (ADMIN && !ok) {
+    try { const r = await fetch("api/admin/check", { headers: { "x-hermes-admin": ADMIN } }); const j = await r.json(); ok = j.ok; if (ok) $("adminwho").textContent = "Signed in as " + j.user + "."; } catch {}
+  }
+  if (DEMO) ok = true;
+  box.classList.toggle("locked", !ok);
+}
+$("a-login").onclick = async () => {
+  $("loginmsg").textContent = "checking...";
+  try {
+    const r = await fetch("api/admin/login", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ user: $("a-user").value, password: $("a-pass").value }) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "couldn't sign in");
+    ADMIN = j.token; sessionStorage.setItem("hermes-admin", ADMIN); $("a-pass").value = ""; $("loginmsg").textContent = "";
+    checkAdmin();
+  } catch (e) { $("loginmsg").textContent = e.message; }
+};
+$("a-pinbtn").onclick = () => { if ($("a-pin").value) { sessionStorage.setItem("hermes-pin", $("a-pin").value); $("a-pin").value = ""; checkAdmin(); } };
+checkAdmin();
 </script></body></html>

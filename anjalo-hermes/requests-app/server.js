@@ -70,13 +70,22 @@ const int = (v, lo, hi) => { const n = Number(v); return Number.isInteger(n) && 
 const secret = (v) => (v === "-" ? "" : String(v).trim().slice(0, 500)); // "-" clears a saved secret
 
 // Returns an error string, or null when saved.
-function updateConfig(b) {
-  if (config.pin && String(b.currentPin || "") !== config.pin) return "wrong PIN";
+// Config is for admins: a Navidrome admin signs in on the Config page (a token for 12 hours); the old PIN
+// still works as a backup for whoever remembers it
+const adminTokens = new Map();
+function adminOk(b, req) {
+  const t = req && String(req.headers["x-hermes-admin"] || "");
+  const hit = t && adminTokens.get(t);
+  if (hit && hit.until > Date.now()) return true;
+  return !!(config.pin && String((b && b.currentPin) || "") === config.pin);
+}
+function updateConfig(b, ok) {
+  if (!ok) return "sign in as an admin first";
   const next = { ...config };
   if (["claude", "local", "both"].includes(b.engine)) next.engine = b.engine;
   if (["sonnet", "opus", "haiku"].includes(b.claudeModel)) next.claudeModel = b.claudeModel;
+  if (typeof b.aiKaraoke === "boolean") next.aiKaraoke = b.aiKaraoke;
   if (typeof b.claudeToken === "string" && b.claudeToken) next.claudeToken = secret(b.claudeToken);
-  if (typeof b.auddToken === "string" && b.auddToken) next.auddToken = secret(b.auddToken);
   if (typeof b.localUrl === "string") {
     const u = b.localUrl.trim().replace(/\/+$/, "");
     if (u && !/^https?:\/\/\S{1,200}$/.test(u)) return "base URL must start with http:// or https://";
@@ -128,8 +137,8 @@ function updateConfig(b) {
 }
 // What the page may see: never the PIN or secrets.
 const publicConfig = () => {
-  const { pin, localKey, claudeToken, auddToken, downtifyPassword, downtifyToken, spotifyClientId, spotifySecret, ...rest } = config; // spotify*: left over from 2.2.0 configs
-  return { ...rest, hasPin: !!pin, hasKey: !!localKey, hasToken: !!claudeToken, hasAudd: !!auddToken, hasDowntifyPassword: !!downtifyPassword, downtifyPaired: !!downtifyToken,
+  const { pin, localKey, claudeToken, auddToken: _audd, downtifyPassword, downtifyToken, spotifyClientId, spotifySecret, ...rest } = config; // spotify*: left over from 2.2.0 configs
+  return { ...rest, hasPin: !!pin, hasKey: !!localKey, hasToken: !!claudeToken, aiKaraokeState: DEMUCS.state, aiKaraokeNote: DEMUCS.note, hasDowntifyPassword: !!downtifyPassword, downtifyPaired: !!downtifyToken,
     hasYtCookies: fs.existsSync(YT_COOKIES), hasSpotify: !!(spotifyClientId && spotifySecret) };
 };
 // YouTube sometimes answers "Sign in to confirm you're not a bot". yt-dlp's own answer is to sign in: a
@@ -1001,6 +1010,36 @@ async function finishSong(raw, ext, meta, thumb) {
 // Synced lyrics from LRCLIB (free, no account), saved as an .lrc file next to the song for Navidrome and Sour Player.
 // lyrics doctor: fetch synced lyrics for songs that have none, a few seconds apart (LRCLIB is free)
 const TRANSLATIONS = "/data/lyric-translations.json";
+// the library's synced lyrics as plain text (for lyrics search), rebuilt at most every 30 minutes
+let lyricsIdx = { at: 0, list: [] };
+function lyricsIndex() {
+  if (Date.now() - lyricsIdx.at < 30 * 60000) return lyricsIdx.list;
+  const list = [];
+  for (const f of Object.keys(libCache)) {
+    const lrc = f.replace(/\.[^.\/\\]+$/, ".lrc");
+    try { list.push([f, norm(fs.readFileSync(lrc, "utf8").replace(/\[[^\]]*\]/g, " "))]); } catch {}
+  }
+  lyricsIdx = { at: Date.now(), list };
+  return list;
+}
+// storage overview, worked out a few files at a time so Hermes stays responsive
+const storageCache = { at: 0, data: null, busy: false };
+async function refreshStorage() {
+  if (storageCache.busy) return;
+  storageCache.busy = true;
+  try {
+    const byArtist = new Map(); let total = 0, files = 0, n = 0;
+    for (const file of Object.keys(libCache)) {
+      try { const st = await fs.promises.stat(file); total += st.size; files++; const c = libCache[file]; const a = c.aa || c.a || "Unknown"; byArtist.set(a, (byArtist.get(a) || 0) + st.size); } catch {}
+      if (++n % 200 === 0) await new Promise((r) => setImmediate(r));
+    }
+    let disk = null;
+    try { const st = fs.statfsSync(MUSIC); disk = { free: st.bavail * st.bsize, size: st.blocks * st.bsize }; } catch {}
+    storageCache.data = { total, files, disk, artists: [...byArtist.entries()].sort((x, y) => y[1] - x[1]).slice(0, 20).map(([artist, bytes]) => ({ artist, bytes })) };
+    storageCache.at = Date.now();
+  } finally { storageCache.busy = false; }
+}
+let lyricsMissing = { at: 0, list: [] };
 const lyricsDoctor = { running: false, done: 0, found: 0 };
 async function runLyricsDoctor(files) {
   Object.assign(lyricsDoctor, { running: true, done: 0, found: 0 });
@@ -1305,13 +1344,120 @@ async function processKaraoke(item) {
     }
     if (best && best.s >= 30) break;
   }
-  if (!best || best.s < -10) return { status: "failed", artist: base.artist, title, note: "no instrumental or karaoke version found on YouTube" };
+  if (!best || best.s < -10) return splitSong(base.artist, plainTitle); // nobody uploaded one: split the song itself
   const meta = { ...base, title, karaoke: true, album: base.album ? `${cleanAlbum(base.album)} (Instrumentals)` : "Instrumentals",
     albumArtist: base.albumArtist || first, releaseType: base.album ? base.releaseType || "album" : "single", seconds: best.seconds };
   const skipped = await saveSong(best.id, meta);
   if (skipped) { karaoke[karaokeKey(base.artist, plainTitle)] = path.basename(destFor(meta, config.audioFormat).dest); fs.writeFileSync(KARAOKE_LIST, JSON.stringify(karaoke)); }
   return { status: "done", artist: base.artist, title, note: "ready - pick Karaoke in Sour Player's Stage while the song plays" };
 }
+
+// ---- AI karaoke (Sour Player 0.10.2): Demucs splits a song into vocals, drums, bass and the rest ----
+// Free and open source, runs on the Umbrel. Installed on first use into /data/tools with uv (a single
+// download), which brings Python, PyTorch (CPU) and Demucs - about 1-2 GB. A song takes a few minutes.
+const DEMUCS = { state: "off", note: "", busy: false, queue: [] };
+const DEMUCS_DIR = "/data/tools/demucs", UV = "/data/tools/bin/uv";
+const STEMS_DIR = path.join(KARAOKE_DIR, "stems");
+const stemDir = (artist, title) => path.join(STEMS_DIR, crypto.createHash("sha1").update(karaokeKey(artist, title)).digest("hex").slice(0, 16));
+async function ensureDemucs() {
+  if (fs.existsSync(path.join(DEMUCS_DIR, ".ok"))) { DEMUCS.state = "ready"; return true; }
+  if (DEMUCS.state === "installing") return false;
+  DEMUCS.state = "installing"; DEMUCS.note = "downloading the AI karaoke tools (about 1-2 GB, once)";
+  const env = { HOME: "/data/home", UV_CACHE_DIR: "/data/tools/uv-cache", UV_PYTHON_INSTALL_DIR: "/data/tools/uv-python" };
+  try {
+    if (!fs.existsSync(UV)) {
+      const arch = process.arch === "arm64" ? "aarch64" : "x86_64";
+      const r = await fetch(`https://github.com/astral-sh/uv/releases/latest/download/uv-${arch}-unknown-linux-gnu.tar.gz`);
+      if (!r.ok) throw new Error(`uv download: HTTP ${r.status}`);
+      const tgz = "/data/tools/uv.tar.gz";
+      fs.writeFileSync(tgz, Buffer.from(await r.arrayBuffer()));
+      const x = await run("tar", ["-xzf", tgz, "-C", "/data/tools", "--strip-components=1", "--wildcards", "*/uv"], { timeout: 120000 });
+      fs.rmSync(tgz, { force: true });
+      if (!fs.existsSync("/data/tools/uv")) throw new Error(`couldn't unpack uv: ${x.err || x.out}`);
+      fs.renameSync("/data/tools/uv", UV); fs.chmodSync(UV, 0o755);
+    }
+    const py = path.join(DEMUCS_DIR, "bin", "python");
+    let r = await run(UV, ["venv", "--python", "3.11", DEMUCS_DIR], { env, timeout: 15 * 60000 });
+    if (!fs.existsSync(py)) throw new Error(`python: ${(r.err || r.out).slice(-300)}`);
+    const torchIndex = process.arch === "arm64" ? [] : ["--index-url", "https://download.pytorch.org/whl/cpu"];
+    r = await run(UV, ["pip", "install", "--python", py, ...torchIndex, "torch==2.5.1", "torchaudio==2.5.1"], { env, timeout: 60 * 60000 });
+    if (r.code) throw new Error(`torch: ${(r.err || r.out).slice(-300)}`);
+    r = await run(UV, ["pip", "install", "--python", py, "demucs==4.0.1", "soundfile"], { env, timeout: 30 * 60000 });
+    if (r.code) throw new Error(`demucs: ${(r.err || r.out).slice(-300)}`);
+    fs.writeFileSync(path.join(DEMUCS_DIR, ".ok"), "");
+    DEMUCS.state = "ready"; DEMUCS.note = "";
+    return true;
+  } catch (e) {
+    DEMUCS.state = "failed"; DEMUCS.note = e.message;
+    return false;
+  }
+}
+// the song's own file in the library (by artist and title)
+function libraryFileFor(artist, title) {
+  const want = karaokeKey(artist, title);
+  for (const [f, c] of Object.entries(libCache)) if (c.t && !c.karaoke && karaokeKey(c.a, c.t) === want) return f;
+  return null;
+}
+// rough karaoke, instant: cancel what's in the middle of the stereo mix (usually the voice)
+async function roughKaraoke(file, out) {
+  const r = await run("ffmpeg", ["-y", "-hide_banner", "-i", file, "-af", "pan=stereo|c0=c0-c1|c1=c1-c0", "-q:a", "3", out], { timeout: 5 * 60000 });
+  return !r.code && fs.existsSync(out);
+}
+// split a song; keeps the stems for practice mixes and saves the instrumental as the song's karaoke
+async function splitSong(artist, title) {
+  const file = libraryFileFor(artist, title);
+  if (!file) return { status: "failed", note: "the song isn't in the library, so there's nothing to split" };
+  fs.mkdirSync(KARAOKE_DIR, { recursive: true });
+  const name = `${crypto.createHash("sha1").update(karaokeKey(artist, title)).digest("hex").slice(0, 16)}.mp3`;
+  const outFile = path.join(KARAOKE_DIR, name);
+  const remember = (note) => { karaoke[karaokeKey(artist, title)] = name; fs.writeFileSync(KARAOKE_LIST, JSON.stringify(karaoke)); return { status: "done", artist, title: `${title} (Instrumental)`, note }; };
+  if (config.aiKaraoke === false || !(await ensureDemucs())) {
+    if (await roughKaraoke(file, outFile)) return remember(config.aiKaraoke === false ? "rough karaoke (AI karaoke is off in Config)" : `rough karaoke for now (AI tools: ${DEMUCS.note || DEMUCS.state})`);
+    return { status: "failed", note: "couldn't make an instrumental" };
+  }
+  const tmp = path.join("/data/staging", "demucs-" + newId());
+  fs.mkdirSync(tmp, { recursive: true });
+  try {
+    const r = await run(path.join(DEMUCS_DIR, "bin", "python"), ["-m", "demucs", "-n", "htdemucs", "--mp3", "-o", tmp, file],
+      { env: { HOME: "/data/home", TORCH_HOME: "/data/tools/torch" }, timeout: 45 * 60000 });
+    const base = path.join(tmp, "htdemucs", path.basename(file).replace(/\.[^.]+$/, ""));
+    const stems = ["vocals", "drums", "bass", "other"];
+    if (!stems.every((x) => fs.existsSync(path.join(base, `${x}.mp3`)))) throw new Error((r.err || r.out || "no output").slice(-300));
+    const dir = stemDir(artist, title);
+    fs.mkdirSync(dir, { recursive: true });
+    for (const x of stems) fs.copyFileSync(path.join(base, `${x}.mp3`), path.join(dir, `${x}.mp3`));
+    await practiceMix(artist, title, "novocals", outFile);
+    return remember("AI karaoke - vocals split off on the Umbrel");
+  } catch (e) {
+    if (await roughKaraoke(file, outFile)) return remember(`rough karaoke (the AI split failed: ${e.message.slice(0, 120)})`);
+    return { status: "failed", note: `couldn't split the song: ${e.message.slice(0, 160)}` };
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+}
+// practice mixes from the stems: no vocals, no drums, no bass, vocals only
+const MIXES = { novocals: ["drums", "bass", "other"], nodrums: ["vocals", "bass", "other"], nobass: ["vocals", "drums", "other"], vocals: ["vocals"] };
+async function practiceMix(artist, title, mix, out) {
+  const dir = stemDir(artist, title);
+  const parts = (MIXES[mix] || []).map((x) => path.join(dir, `${x}.mp3`));
+  if (!parts.length || !parts.every((f) => fs.existsSync(f))) return null;
+  const target = out || path.join(dir, `mix-${mix}.mp3`);
+  if (fs.existsSync(target)) return target;
+  const args = ["-y", "-hide_banner"];
+  for (const f of parts) args.push("-i", f);
+  if (parts.length > 1) args.push("-filter_complex", `amix=inputs=${parts.length}:normalize=0`);
+  args.push("-q:a", "3", target);
+  const r = await run("ffmpeg", args, { timeout: 5 * 60000 });
+  return !r.code && fs.existsSync(target) ? target : null;
+}
+// overnight: the group's most played songs this week get split ahead of time (a few a night)
+setInterval(async () => {
+  const h = new Date().getHours();
+  if (h < 2 || h > 5 || DEMUCS.busy || config.aiKaraoke === false) return;
+  const w = groupStats.weeks[weekKey()];
+  if (!w) return;
+  const todo = topEntries(w.songs, 30).map(([, s]) => s.song).filter((s) => !karaokeFile(s.artist, s.title) && libraryFileFor(s.artist, s.title)).slice(0, 4);
+  DEMUCS.busy = true;
+  try { for (const s of todo) await splitSong(s.artist, s.title).catch(() => null); } finally { DEMUCS.busy = false; }
+}, 30 * 60000);
 function insertChildren(parent, kids) {
   const at = items.indexOf(parent) + 1 + items.filter((k) => k.parent === parent.id).length;
   items.splice(at, 0, ...kids.map((k) => ({ id: newId(), parent: parent.id, root: parent.root || parent.id, status: "pending", created: new Date().toISOString(), ...k })));
@@ -1837,7 +1983,7 @@ function groupState(g) {
     tokens: Object.fromEntries(g.tokens), approval: !!g.approval, pending: g.approval ? g.pending : [],
     blind: !!g.blind, themeNight: g.themeNight || null, roomTheme: g.roomTheme || "none",
     tv: g.tv ? { event: g.tv.event, members: [...g.tv.allowed] } : null,
-    mood: (g.moods && g.moods.size) ? { avg: Math.round([...g.moods.values()].reduce((a, v) => a + v, 0) / g.moods.size), count: g.moods.size } : null,
+    mood: moodOf(g),
     game: gameState(g),
     serverNow: nowMs(),
   };
@@ -1854,6 +2000,12 @@ const BINGO_LINES = [[0, 1, 2], [3, 4, 5], [6, 7, 8], [0, 3, 6], [1, 4, 7], [2, 
 function playedArtists(g) {
   return new Set(g.queue.slice(0, g.index + 1).map((x) => String(x.artist || "").toLowerCase()));
 }
+function moodOf(g) {
+  if (!g.moods || !g.moods.size) return null;
+  const here = new Set(["host", ...[...g.members.values()].map((m) => personOf(m))]);
+  const vals = [...g.moods.entries()].filter(([k]) => here.has(k)).map(([, v]) => v);
+  return vals.length ? { avg: Math.round(vals.reduce((a, v) => a + v, 0) / vals.length), count: vals.length } : null;
+}
 function gameState(g) {
   const x = g.game;
   if (!x) return null;
@@ -1866,19 +2018,28 @@ function gameState(g) {
   if (x.kind === "bingo") return { ...base, cards: Object.fromEntries(x.cards), heard: [...playedArtists(g)] };
   return base;
 }
+// a song for "next" in the group: a station's queue is Hermes', a normal group's queue is the host's app
+function groupAddNext(g, song, by, last = false) {
+  g.addedBy.set(song.id, by);
+  if (g.radio) {
+    if (last) g.queue.push({ ...song, requested: true });
+    else g.queue.splice(g.index + 1, 0, { ...song, requested: true });
+  } else {
+    g.requests.push({ rid: crypto.randomUUID(), song, by, next: !last });
+    g.requests = g.requests.slice(-100);
+  }
+}
 function finishGame(g) {
   const x = g.game;
   if (!x || x.result) return;
   if (x.kind === "battle") {
     const win = x.votesB.size > x.votesA.size ? x.b : x.a;
-    g.queue.splice(g.index + 1, 0, { ...win, requested: true });
-    g.addedBy.set(win.id, "Battle winner");
+    groupAddNext(g, win, "Battle winner");
     x.result = `${win.title} won ${Math.max(x.votesA.size, x.votesB.size)}-${Math.min(x.votesA.size, x.votesB.size)} and plays next`;
   } else if (x.kind === "countdown") {
     const top = [...x.picks].sort((a, b) => b.votes.size - a.votes.size)[0];
     if (top) {
-      g.queue.splice(g.index + 1, 0, { ...top.song, requested: true });
-      g.addedBy.set(top.song.id, top.by);
+      groupAddNext(g, top.song, top.by);
       x.result = `${top.song.title} (${top.by}) plays next`;
     } else x.result = "Nobody suggested a song";
   } else if (x.kind === "ranking") {
@@ -2245,9 +2406,8 @@ async function groupRoute(req, res, p, get, post, url) {
       } else if (kind === "bingo") {
         const artists = [...new Set(g.queue.slice(g.index).map((t) => t.artist).filter(Boolean))];
         if (artists.length < 9) return send(res, 409, { error: "bingo needs at least 9 different artists coming up" });
-        const people = [["host", g.hostName], ...[...g.members.values()].map((m) => [personOf(m), m.name])];
-        const cards = new Map();
-        for (const [, who] of people) cards.set(who, [...artists].sort(() => Math.random() - 0.5).slice(0, 9));
+        const cards = new Map(); // by member id ("host" for the host), so two people with the same name get their own
+        for (const key of ["host", ...g.members.keys()]) cards.set(key, [...artists].sort(() => Math.random() - 0.5).slice(0, 9));
         Object.assign(game, { cards });
       }
       g.game = game;
@@ -2274,8 +2434,7 @@ async function groupRoute(req, res, p, get, post, url) {
       if (x.kind === "rounds") {
         if (x.picks.has(whoKey)) return send(res, 409, { error: "you already picked this round" });
         x.picks.set(whoKey, { name, song });
-        g.queue.push({ ...song, requested: true });
-        g.addedBy.set(song.id, name);
+        groupAddNext(g, song, name, true);
         const everyone = 1 + [...g.members.values()].filter((m) => !m.spectate).length;
         if (x.picks.size >= everyone) finishGame(g);
       } else {
@@ -2300,7 +2459,7 @@ async function groupRoute(req, res, p, get, post, url) {
       return send(res, 200, { ok: true });
     }
     if (op === "bingo" && x.kind === "bingo") {
-      const card = x.cards.get(name) || [];
+      const card = x.cards.get(isHost ? "host" : memberId) || [];
       const heard = playedArtists(g);
       const line = BINGO_LINES.some((l) => l.every((i) => card[i] && heard.has(card[i].toLowerCase())));
       if (!line) return send(res, 409, { error: "not yet - no full line heard" });
@@ -2759,6 +2918,79 @@ const keyHashes = (p) => p.keyHashes || (p.keyHash ? [p.keyHash] : []);
 // Determination font (for their name, playlists and the app), the Soul visualizer, fixing friends' profiles
 // from Sour Player, and a royal blue name. Hermes Music tells only those profiles and refuses them for others.
 const PERKS = { determination: true, admin: true };
+
+// ---- the Sour Shop (Sour Player 0.10.2): a point for every song you listen to past halfway, spent on looks ----
+// No real money, no crates, no trading. Gifts are fine. The party hat is never for sale.
+const SHOP_FILE = "/data/shop.json";
+let shopData = { items: [], ...readJsonEarly(SHOP_FILE) }; // admin-added items (with a picture)
+const SHOP_DAILY_CAP = 300;
+const SEASONS = { halloween: [10], winter: [12, 1], valentine: [2], summer: [6, 7, 8], spring: [3, 4, 5] };
+const BUILTIN_ITEMS = [
+  // decorations (on the avatar)
+  ["crown", "decoration", "Crown", 600], ["halo", "decoration", "Halo", 500], ["headphones", "decoration", "Headphones", 400],
+  ["lemon", "decoration", "Lemon", 300], ["cat-ears", "decoration", "Cat ears", 450], ["sunglasses", "decoration", "Sunglasses", 350],
+  ["sparkles", "decoration", "Sparkles", 500], ["raincloud", "decoration", "Little raincloud", 400], ["flame", "decoration", "Flames", 550],
+  ["vinyl-halo", "decoration", "Spinning vinyl", 800], ["notes", "decoration", "Floating notes", 450], ["tiny-cat", "decoration", "Tiny cat", 650],
+  ["pumpkin", "decoration", "Pumpkin head", 400, "halloween"], ["witch-hat", "decoration", "Witch hat", 450, "halloween"],
+  ["santa-hat", "decoration", "Santa hat", 400, "winter"], ["snow-globe", "decoration", "Snow globe", 500, "winter"],
+  ["heart", "decoration", "Heart", 400, "valentine"], ["sunflower", "decoration", "Sunflower", 400, "summer"],
+  // frames (ring around the avatar)
+  ["neon-ring", "frame", "Neon ring", 500], ["vinyl-ring", "frame", "Vinyl ring", 700], ["pulse-ring", "frame", "Beat pulse", 900],
+  ["rainbow-drip", "frame", "Rainbow drip", 800], ["gold-ring", "frame", "Gold ring", 600], ["ice-ring", "frame", "Ice ring", 500, "winter"],
+  ["ember-ring", "frame", "Ember ring", 500, "halloween"],
+  // name styles
+  ["name-gradient", "nameStyle", "Gradient name", 400], ["name-glow", "nameStyle", "Glowing name", 500], ["name-shimmer", "nameStyle", "Shimmer", 700],
+  ["name-wave", "nameStyle", "Wave", 600], ["name-glitch", "nameStyle", "Glitch", 700], ["name-typewriter", "nameStyle", "Typewriter", 500],
+  // banners
+  ["banner-aurora", "banner", "Aurora banner", 600], ["banner-sunset", "banner", "Sunset banner", 500], ["banner-neon-grid", "banner", "Neon grid", 600],
+  ["banner-lemons", "banner", "Lemon pattern", 400], ["banner-stars", "banner", "Starfield", 700], ["banner-spooky", "banner", "Spooky night", 500, "halloween"],
+  // profile entrances (play when someone opens your profile)
+  ["fx-confetti", "effect", "Confetti entrance", 800], ["fx-notes", "effect", "Notes rain", 700], ["fx-leaves", "effect", "Falling leaves", 600],
+  ["fx-snow", "effect", "Snowfall", 600, "winter"], ["fx-bats", "effect", "Bats", 600, "halloween"],
+  // chat bubbles (Group Play and Listen Along chat)
+  ["bubble-lemon", "bubble", "Lemon bubble", 300], ["bubble-neon", "bubble", "Neon bubble", 400], ["bubble-pixel", "bubble", "Pixel bubble", 400],
+].map(([id, slot, name, price, season]) => ({ id, slot, name, price, season: season || null }));
+const SHOP_SLOTS = ["decoration", "frame", "nameStyle", "banner", "effect", "bubble"];
+const inSeason = (it) => !it.season || (SEASONS[it.season] || []).includes(new Date().getMonth() + 1);
+const shopItems = () => [...BUILTIN_ITEMS, ...shopData.items.map((x) => ({ ...x, custom: true }))];
+const shopItem = (id) => shopItems().find((x) => x.id === id);
+const saveShop = () => fs.writeFileSync(SHOP_FILE, JSON.stringify(shopData));
+// today's picks and today's sale (the same for everyone, changes at midnight)
+function shopToday() {
+  const day = dayKey();
+  let h = 0; for (const c of day) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  const pool = shopItems().filter(inSeason);
+  const picks = [];
+  for (let i = 0; i < Math.min(6, pool.length); i++) { h = (h * 1103515245 + 12345) >>> 0; const it = pool[h % pool.length]; if (!picks.includes(it.id)) picks.push(it.id); }
+  return { day, featured: picks, sale: picks[0] || null };
+}
+const priceOf = (it) => (shopToday().sale === it.id ? Math.round(it.price * 0.7) : it.price);
+function wallet(p) {
+  p.points = p.points && typeof p.points === "object" ? p.points : { balance: 0, today: { day: "", n: 0 }, log: [] };
+  p.owned = Array.isArray(p.owned) ? p.owned : [];
+  p.equipped = p.equipped && typeof p.equipped === "object" ? p.equipped : {};
+  return p.points;
+}
+function addPoints(p, n, why) {
+  const w = wallet(p);
+  const day = dayKey();
+  if (w.today.day !== day) w.today = { day, n: 0 };
+  const room = Math.max(0, SHOP_DAILY_CAP - w.today.n);
+  const got = Math.min(room, n);
+  if (got <= 0) return 0;
+  w.today.n += got; w.balance += got;
+  w.log = [{ n: got, why, at: Date.now() }, ...w.log].slice(0, 60);
+  profilesDirty = true;
+  return got;
+}
+function spendPoints(p, n, why) {
+  const w = wallet(p);
+  if (w.balance < n) return false;
+  w.balance -= n;
+  w.log = [{ n: -n, why, at: Date.now() }, ...w.log].slice(0, 60);
+  profilesDirty = true;
+  return true;
+}
 const isAdmin = (p) => !!p && !p.mergedInto && !!(p.admin || p.adminManual);
 // Gavin's own extras: his Navidrome account or profile name is Gavin
 const isGavin = (p) => !!p && !p.mergedInto && [p.navidrome, p.name].some((n) => String(n || "").trim().toLowerCase() === "gavin");
@@ -2908,7 +3140,9 @@ function publicProfile(p, self = false) {
     online, lastSeen: hidden || priv.hideLastOnline ? null : isInvisible(p) && !self ? p.lastOfflineSeen || null : p.lastSeen || null,
     created: p.created,
     // avatar decoration: everyone who had an account before Sour Player 0.10 gets the party hat
-    decoration: p.created && p.created < V10_CUTOFF ? 'party-hat' : null,
+    decoration: (p.equipped && p.equipped.decoration) || (p.created && p.created < V10_CUTOFF && !(p.equipped && p.equipped.decoration === "") ? "party-hat" : null),
+    looks: { ...(p.equipped || {}), decoration: undefined },
+    shopWish: hidden ? [] : (p.shopWish || []).slice(0, 30),
     listening: online && !priv.hideListening && p.listening ? p.listening : null, playing: online && !!p.playing,
     on: online && !priv.hideListening ? p.on || "computer" : null,
     speed: online && !priv.hideListening ? p.speed || 1 : 1, karaoke: online && !priv.hideListening ? !!p.karaoke : false,
@@ -2933,6 +3167,8 @@ function publicProfile(p, self = false) {
       listening: !hidden && !priv.hideListening && now ? now : null, playing: !!party.playing, position: 0, positionAt: 0 });
   } else out.tv = null;
   if (!hidden && !priv.hideStats) out.stats = profileStats(p);
+  if (self) { wallet(p); Object.assign(out, { points: p.points.balance, pointsToday: p.points.today.day === dayKey() ? p.points.today.n : 0, pointsCap: SHOP_DAILY_CAP,
+    pointsLog: p.points.log.slice(0, 30), owned: p.owned, partyHat: !!(p.created && p.created < V10_CUTOFF), gifts: (p.shopGifts || []).slice(0, 20) }); }
   if (self) Object.assign(out, { account: p.navidrome || null, visits: p.custom && p.custom.visits ? p.visits || [] : [], avatarHistory: (p.avatarHistory || []).map((h) => h.v), resume: p.lastPlayback || null, perks: perksOf(p.id) });
   return out;
 }
@@ -3396,15 +3632,33 @@ async function sourRoute(req, res, p, get, post, url) {
       const dk = dayKey(now);
       me.dayLog = me.dayLog || {};
       const today = me.dayLog[dk] || [];
-      if (!today.some((x) => x.id === song.id) && today.length < 25) me.dayLog[dk] = [...today, song];
+      if (!today.some((x) => x.id === song.id) && today.length < 15) me.dayLog[dk] = [...today, { id: song.id, title: song.title, artist: song.artist, album: song.album, imageId: song.imageId, duration: song.duration }];
       const logKeys = Object.keys(me.dayLog);
-      if (logKeys.length > 800) for (const k of logKeys.sort().slice(0, logKeys.length - 800)) delete me.dayLog[k];
+      if (logKeys.length > 400) for (const k of logKeys.sort().slice(0, logKeys.length - 400)) delete me.dayLog[k];
     }
     // who they're listening along with right now (friends see who is riding along)
     me.alongWith = typeof b.alongWith === "string" && profiles[b.alongWith] ? b.alongWith : null;
+    // the Sour Shop: the song before this one earns a point if you got past halfway
+    const pos = Number(b.position) || 0;
+    let pt = before && before.pt ? before.pt : null;
+    if (pt && (!song || pt.id !== song.id)) {
+      if (pt.dur && pt.max * 1000 >= pt.dur / 2) {
+        let n = 1;
+        if (pt.fresh) n++; // a song new to you
+        if (pt.social) n++; // in Group Play or listening along
+        addPoints(me, n, pt.title || "a song");
+      }
+      pt = null;
+    }
+    if (song) {
+      if (!pt) pt = { id: song.id, title: song.title, dur: song.duration || 0, max: 0,
+        fresh: !(me.stats && me.stats.songs && me.stats.songs[song.id] && me.stats.songs[song.id].n > 1),
+        social: !!(b.group || b.alongWith) };
+      if (b.playing) pt.max = Math.max(pt.max, Math.min(pos, (pt.max || 0) + 60)); // no jumping to the end for a point
+    }
     const speed = Math.min(2, Math.max(0.5, Number(b.speed) || 1));
     me.devices[dev] = { listening: song, playing: !!b.playing, position: Number(b.position) || 0, at: now, on: b.on === "phone" ? "phone" : "computer",
-      speed, karaoke: !!b.karaoke, video: !!b.video };
+      speed, karaoke: !!b.karaoke, video: !!b.video, pt };
     for (const [k, d] of Object.entries(me.devices)) if (!d || now - (d.at || 0) > ONLINE_MS) delete me.devices[k];
     const devs = Object.values(me.devices).sort((x, y) => y.at - x.at);
     const best = devs.find((d) => d.playing && d.listening) || devs.find((d) => d.listening) || me.devices[dev];
@@ -3427,11 +3681,90 @@ async function sourRoute(req, res, p, get, post, url) {
     const prof = profiles[m[1]];
     if (!prof) return send(res, 404, { error: "unknown profile" });
     if (privacy(prof).private || privacy(prof).hideListening) return send(res, 200, []);
-    const today = dayKey(Date.now());
+    const asked = String(url.searchParams.get("date") || ""); // the app's own date (the Umbrel may be in another time zone)
+    const today = /^\d{4}-\d{2}-\d{2}$/.test(asked) ? asked : dayKey(Date.now());
     const md = today.slice(5);
     const out = Object.entries(prof.dayLog || {}).filter(([k]) => k !== today && (k.slice(5) === md || k.slice(8) === today.slice(8)))
       .sort((a, b) => b[0].localeCompare(a[0])).slice(0, 6).map(([day, songs]) => ({ day, songs: songs.slice(0, 12) }));
     return send(res, 200, out);
+  }
+  if (p === "/api/shop" || p.startsWith("/api/shop/")) { // the Sour Shop
+    if (get && p === "/api/shop") {
+      const t = shopToday();
+      return send(res, 200, { items: shopItems().map((it) => ({ id: it.id, slot: it.slot, name: it.name, price: it.price, now: priceOf(it), season: it.season, available: inSeason(it), custom: !!it.custom, v: it.v || 0 })),
+        featured: t.featured, sale: t.sale, cap: SHOP_DAILY_CAP });
+    }
+    if (get && (m = p.match(/^\/api\/shop\/items\/([\w-]+)\/image$/))) {
+      const it = shopData.items.find((x) => x.id === m[1]);
+      return it ? sendImage(res, `shop-${it.id}`, it.image) : send(res, 404, { error: "no picture" });
+    }
+    if (!post) return send(res, 404, { error: "not found" });
+    const b = await readBody(req, 2000000);
+    const me = ownProfile(String(b.profile || ""), b.key);
+    if (!me) return send(res, 403, { error: "set up your profile first" });
+    wallet(me);
+    if (p === "/api/shop/buy") { // buy for yourself, or as a gift (with a note) for a friend
+      const it = shopItem(String(b.item || ""));
+      if (!it || !inSeason(it)) return send(res, 404, { error: "that item isn't in the shop right now" });
+      const to = b.to ? profiles[String(b.to)] : me;
+      if (!to || to.mergedInto) return send(res, 404, { error: "unknown friend" });
+      wallet(to);
+      if (to.owned.includes(it.id)) return send(res, 409, { error: to === me ? "you already have it" : `${to.name} already has it` });
+      const price = priceOf(it);
+      if (!spendPoints(me, price, to === me ? it.name : `${it.name} for ${to.name}`)) return send(res, 402, { error: `you need ${price - me.points.balance} more points` });
+      to.owned.push(it.id);
+      if (to === me) me.lastBuy = { item: it.id, price, at: Date.now() };
+      else to.shopGifts = [{ from: me.name, fromId: me.id, item: it.id, note: clean1(b.note, 200), at: Date.now() }, ...(to.shopGifts || [])].slice(0, 30);
+      profilesDirty = true;
+      return send(res, 200, { ok: true, points: me.points.balance });
+    }
+    if (p === "/api/shop/refund") { // changed your mind: within 10 minutes of buying
+      const lb = me.lastBuy;
+      if (!lb || lb.item !== b.item || Date.now() - lb.at > 600000) return send(res, 409, { error: "refunds are only for the last thing you bought, within 10 minutes" });
+      me.owned = me.owned.filter((x) => x !== lb.item);
+      for (const k of SHOP_SLOTS) if (me.equipped[k] === lb.item) delete me.equipped[k];
+      me.points.balance += lb.price; me.points.log = [{ n: lb.price, why: "refund", at: Date.now() }, ...me.points.log].slice(0, 60);
+      me.lastBuy = null; profilesDirty = true;
+      return send(res, 200, { ok: true, points: me.points.balance });
+    }
+    if (p === "/api/shop/equip") { // wear it (or take it off with item: null)
+      const slot = String(b.slot || "");
+      if (!SHOP_SLOTS.includes(slot)) return send(res, 400, { error: "unknown slot" });
+      const id = b.item ? String(b.item) : null;
+      if (id && !(me.owned.includes(id) || (id === "party-hat" && me.created && me.created < V10_CUTOFF))) return send(res, 403, { error: "you don't own that" });
+      if (id) me.equipped[slot] = id; else if (slot === "decoration") me.equipped.decoration = ""; else delete me.equipped[slot];
+      profilesDirty = true;
+      return send(res, 200, { ok: true });
+    }
+    if (p === "/api/shop/wish") { // a wishlist friends can see (birthday gifts made easy)
+      const id = String(b.item || "");
+      if (!shopItem(id)) return send(res, 404, { error: "unknown item" });
+      const list = me.shopWish || [];
+      me.shopWish = list.includes(id) ? list.filter((x) => x !== id) : [...list, id].slice(-30);
+      profilesDirty = true;
+      return send(res, 200, { wish: me.shopWish });
+    }
+    if (p === "/api/shop/gifts/seen") { me.shopGifts = (me.shopGifts || []).map((g) => ({ ...g, seen: true })); profilesDirty = true; return send(res, 200, { ok: true }); }
+    if (p === "/api/shop/items") { // admins: add, price or remove items (custom ones carry a picture)
+      if (!isAdmin(me)) return send(res, 403, { error: "admins only" });
+      if (b.remove) {
+        const it = shopData.items.find((x) => x.id === b.remove);
+        if (it) storeImage(`shop-${it.id}`, null, it.image);
+        shopData.items = shopData.items.filter((x) => x.id !== b.remove);
+        saveShop();
+        return send(res, 200, { ok: true });
+      }
+      const name = clean1(b.name, 40).trim();
+      const slot = SHOP_SLOTS.includes(b.slot) ? b.slot : "decoration";
+      const price = Math.max(10, Math.min(100000, Math.round(Number(b.price) || 0)));
+      const img = decodeImage(b.image, 400000);
+      if (!name || !img) return send(res, 400, { error: "give it a name and a PNG, JPEG, WebP or GIF picture (up to 400 KB)" });
+      const id = "c-" + crypto.randomUUID().slice(0, 8);
+      shopData.items.push({ id, slot, name, price, season: SEASONS[b.season] ? b.season : null, image: storeImage(`shop-${id}`, img, null), v: Date.now() });
+      saveShop();
+      return send(res, 200, { ok: true, id });
+    }
+    return send(res, 404, { error: "not found" });
   }
   if (p.startsWith("/api/along/")) { // listen along extras: chat, reactions, song requests and hand off between a listener and the friends riding along
     const host = profiles[p.slice("/api/along/".length)];
@@ -3715,8 +4048,13 @@ async function sourRoute(req, res, p, get, post, url) {
     if (!file) return send(res, 200, { available: false });
     return send(res, 200, { available: true, gain: await karaokeGain(artist, title, file) });
   }
-  if (get && p === "/api/karaoke/file") { // the instrumental itself (with seeking)
-    const file = karaokeFile(url.searchParams.get("artist"), url.searchParams.get("title"));
+  if (get && p === "/api/karaoke/mixes") { // which practice mixes this song has (AI karaoke songs only)
+    const dir = stemDir(url.searchParams.get("artist"), url.searchParams.get("title"));
+    return send(res, 200, { mixes: fs.existsSync(path.join(dir, "vocals.mp3")) ? Object.keys(MIXES) : [], ai: DEMUCS.state, note: DEMUCS.note });
+  }
+  if (get && p === "/api/karaoke/file") { // the instrumental itself (with seeking); ?mix=nodrums etc. for practice mixes
+    const mix = url.searchParams.get("mix");
+    const file = mix && MIXES[mix] ? await practiceMix(url.searchParams.get("artist"), url.searchParams.get("title"), mix) : karaokeFile(url.searchParams.get("artist"), url.searchParams.get("title"));
     if (!file) return send(res, 404, { error: "no instrumental for that song" });
     const size = fs.statSync(file).size, range = String(req.headers.range || "").match(/bytes=(\d*)-(\d*)/);
     const type = { mp3: "audio/mpeg", m4a: "audio/mp4", opus: "audio/ogg", ogg: "audio/ogg", flac: "audio/flac", wav: "audio/wav", aac: "audio/aac" }[path.extname(file).slice(1).toLowerCase()] || "application/octet-stream";
@@ -3856,7 +4194,7 @@ http.createServer(async (req, res) => {
   const p = url.pathname, get = req.method === "GET", post = req.method === "POST";
   const SOUR_ROUTES = ["/api/presence", "/api/leaderboard", "/api/song-of-the-day", "/api/group-top", "/api/milestones", "/api/follows"];
   const SOUR_PREFIXES = ["/api/sounds", "/api/profiles", "/api/playlist-themes", "/api/friend-group", "/api/activity", "/api/gifts", "/api/capsules", "/api/song-notes",
-    "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke", "/api/feedback", "/api/along/"];
+    "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke", "/api/feedback", "/api/along/", "/api/shop"];
   const isSour = SOUR_PREFIXES.some((x) => p.startsWith(x)) || SOUR_ROUTES.includes(p);
   if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/lyrics") || p.startsWith("/api/requests") || p.startsWith("/api/library") || p.startsWith("/api/duplicates") || isSour
     || ["/api/status", "/api/now", "/api/bump", "/api/storage", "/api/song-dna"].includes(p)) { // used by Sour Player (the custom Feishin)
@@ -4080,6 +4418,23 @@ http.createServer(async (req, res) => {
   }
 
   if (get && p === "/api/config") return send(res, 200, publicConfig());
+  if (post && p === "/api/admin/login") { // Config sign-in with a Navidrome admin account
+    const b = await readBody(req);
+    const user = String(b.user || "").slice(0, 100), pass = String(b.password || "").slice(0, 200);
+    if (!user || !pass) return send(res, 400, { error: "type your Navidrome username and password" });
+    const who = await navidromeUser(`u=${encodeURIComponent(user)}&p=${encodeURIComponent("enc:" + Buffer.from(pass).toString("hex"))}`);
+    if (!who.user) return send(res, 401, { error: who.error || "Navidrome didn't accept that login" });
+    const prof = Object.values(profiles).find((x) => x.navidrome === who.user && !x.mergedInto);
+    if (!who.admin && !(prof && isAdmin(prof))) return send(res, 403, { error: "only admins can open Config" });
+    const token = crypto.randomUUID();
+    adminTokens.set(token, { user: who.user, until: Date.now() + 12 * 3600 * 1000 });
+    return send(res, 200, { token, user: who.user });
+  }
+  if (get && p === "/api/admin/check") {
+    const t = String(req.headers["x-hermes-admin"] || "");
+    const hit = adminTokens.get(t);
+    return send(res, 200, { ok: !!(hit && hit.until > Date.now()), user: hit ? hit.user : null });
+  }
   if (post && p === "/api/bump") { // push a queued request (and its remaining tracks) to the front
     const q = norm(String((await readBody(req)).text || ""));
     if (q.length < 2) return send(res, 400, { error: "type part of the name, e.g. /bump hot fuss" });
@@ -4256,12 +4611,12 @@ http.createServer(async (req, res) => {
   }
   if (post && p === "/api/duplicates/remove") {
     const b = await readBody(req);
-    if (config.pin && String(b.currentPin || "") !== config.pin) return send(res, 403, { error: "wrong PIN - use /duplicate confirm YOURPIN" });
+    if (!adminOk(b, req)) return send(res, 403, { error: "admins only - sign in on the Config page (or /duplicate confirm YOURPIN)" });
     try { return send(res, 200, removeDuplicates()); } catch (e) { return send(res, 400, { error: e.message }); }
   }
   if (post && p === "/api/downtify/pair") {
     const b = await readBody(req);
-    if (config.pin && String(b.currentPin || "") !== config.pin) return send(res, 403, { error: "wrong PIN (enter it in Current PIN first)" });
+    if (!adminOk(b, req)) return send(res, 403, { error: "admins only - sign in on the Config page" });
     if (!/^[A-Za-z0-9]{4}-?[A-Za-z0-9]{4}$/.test(String(b.code || "").trim())) return send(res, 400, { error: "the pairing code looks like ABCD-1234" });
     try {
       config.downtifyToken = await dtPair(String(b.code));
@@ -4293,7 +4648,7 @@ http.createServer(async (req, res) => {
   }
   if (post && p === "/api/config/sour-users/admin") { // make someone a Sour Player admin by hand (or take it back)
     const b = await readBody(req);
-    if (config.pin && String(b.currentPin || "") !== config.pin) return send(res, 403, { error: "wrong PIN (enter it in Current PIN first)" });
+    if (!adminOk(b, req)) return send(res, 403, { error: "admins only - sign in on the Config page" });
     const prof = profiles[String(b.id || "")];
     if (!prof || prof.mergedInto) return send(res, 404, { error: "no such profile" });
     prof.adminManual = !!b.admin;
@@ -4302,7 +4657,7 @@ http.createServer(async (req, res) => {
   }
   if (post && p === "/api/config/sour-users/delete") {
     const b = await readBody(req);
-    if (config.pin && String(b.currentPin || "") !== config.pin) return send(res, 403, { error: "wrong PIN (enter it in Current PIN first)" });
+    if (!adminOk(b, req)) return send(res, 403, { error: "admins only - sign in on the Config page" });
     const prof = profiles[String(b.id || "")];
     if (!prof || prof.mergedInto) return send(res, 404, { error: "that profile is already gone" });
     deleteProfile(prof.id);
@@ -4312,7 +4667,7 @@ http.createServer(async (req, res) => {
   }
   if (post && p === "/api/config/youtube-cookies") { // paste a cookies.txt (or "-" to remove it)
     const b = await readBody(req, 600000);
-    if (config.pin && String(b.currentPin || "") !== config.pin) return send(res, 403, { error: "wrong PIN (enter it in Current PIN first)" });
+    if (!adminOk(b, req)) return send(res, 403, { error: "admins only - sign in on the Config page" });
     const text = String(b.cookies || "").trim();
     if (!text || text === "-") {
       fs.rmSync(YT_COOKIES, { force: true });
@@ -4324,7 +4679,8 @@ http.createServer(async (req, res) => {
     return send(res, 200, publicConfig());
   }
   if (post && p === "/api/config") {
-    const err = updateConfig(await readBody(req));
+    const cb = await readBody(req);
+    const err = updateConfig(cb, adminOk(cb, req));
     return err ? send(res, 400, { error: err }) : send(res, 200, publicConfig());
   }
 
@@ -4425,29 +4781,39 @@ http.createServer(async (req, res) => {
     res.writeHead(200, { "content-type": type, "content-length": st.size, "accept-ranges": "bytes" });
     return fs.createReadStream(file).pipe(res);
   }
-  if (post && p === "/api/requests/hum") { // hum or sing a bit: AudD names the song, then it's requested
-    const b = await readBody(req, 4000000);
-    if (!config.auddToken) return send(res, 400, { error: "humming search needs an AudD token (Hermes Music > Config)" });
-    const m2 = /^data:(audio\/[\w.+-]+)(;[^,]*)?;base64,(.+)$/.exec(String(b.audio || ""));
-    if (!m2) return send(res, 400, { error: "no recording" });
+  if (post && p === "/api/requests/describe") { // "the sad piano one from TikTok": Claude names the song
+    const b = await readBody(req, 5000);
+    const text = clean1(b.text, 400).trim();
+    if (text.length < 3) return send(res, 400, { error: "describe the song a bit more" });
+    if (!config.claudeToken) return send(res, 400, { error: "Describe it needs the Claude token (Hermes Music > Config)" });
     try {
-      const form = new FormData();
-      form.append("api_token", config.auddToken);
-      form.append("file", new Blob([Buffer.from(m2[3], "base64")], { type: m2[1] }), "hum.webm");
-      const r = await fetch("https://api.audd.io/recognizeWithOffset/", { method: "POST", body: form, signal: AbortSignal.timeout(30000) });
-      const j = await r.json();
-      const list = (j.result && j.result.list) || (j.result && j.result.title ? [j.result] : []);
-      const top = list[0];
-      if (!top) return send(res, 404, { error: "couldn't tell which song that is - try humming the chorus" });
-      const guess = { artist: top.artist || "", title: top.title || "", score: top.score || null };
-      if (b.request) {
-        const item = { id: newId(), type: "song", query: `${guess.artist} - ${guess.title}`, status: "pending", created: new Date().toISOString() };
-        if (b.by) item.askedBy = String(b.by).slice(0, 40);
-        if (typeof b.profile === "string" && profiles[b.profile]) { item.profile = b.profile; sourStat(b.profile, "requests", 1); }
-        items.push(item); save(); wake();
-      }
-      return send(res, 200, { ...guess, inLibrary: inLibrary(guess.artist, guess.title), requested: !!b.request });
-    } catch (e) { return send(res, 502, { error: `AudD didn't answer: ${e.message}` }); }
+      const r = await run("claude", ["-p", "--no-session-persistence", "--model", config.claudeModel, "--tools", ""],
+        { input: `Someone is trying to find a song. Their description: ${JSON.stringify(text)}
+Name up to 5 real songs that best match, most likely first. Reply with ONE line of JSON and nothing else:
+{"songs":[{"artist":"...","title":"...","why":"a few words"}]}`, env: { CLAUDE_CODE_OAUTH_TOKEN: config.claudeToken }, timeout: 120000 });
+      const m2 = String(r.out || r.err).match(/\{[\s\S]*"songs"[\s\S]*\}/);
+      const songs = m2 ? (JSON.parse(m2[0]).songs || []).slice(0, 5).map((x) => ({ artist: clean1(x.artist, 120), title: clean1(x.title, 160), why: clean1(x.why, 120) }))
+        .filter((x) => x.artist && x.title).map((x) => ({ ...x, inLibrary: inLibrary(x.artist, x.title) })) : [];
+      if (!songs.length) return send(res, 404, { error: "no idea which song that is - try a lyric or the artist" });
+      return send(res, 200, { songs });
+    } catch (e) { return send(res, 502, { error: `couldn't ask Claude: ${e.message}` }); }
+  }
+  if (get && p === "/api/lyrics/search") { // a line you remember: the library's lyrics first, then LRCLIB
+    const q = norm(url.searchParams.get("q") || "");
+    if (q.length < 4) return send(res, 400, { error: "type a few more words" });
+    const local = [];
+    for (const [file, text] of lyricsIndex()) {
+      if (text.includes(q)) { const c = libCache[file]; local.push({ artist: c.a, title: c.t || path.basename(file), inLibrary: true }); if (local.length >= 10) break; }
+    }
+    let web = [];
+    if (local.length < 5) {
+      try {
+        const r = await fetch(`https://lrclib.net/api/search?q=${encodeURIComponent(url.searchParams.get("q"))}`, { headers: { "user-agent": "Hermes Music (Umbrel)" }, signal: AbortSignal.timeout(10000) });
+        web = ((await r.json()) || []).slice(0, 8).map((x) => ({ artist: x.artistName, title: x.trackName, inLibrary: inLibrary(x.artistName, x.trackName) }));
+      } catch {}
+    }
+    const seen = new Set();
+    return send(res, 200, [...local, ...web].filter((x) => { const k = songKey(x.artist, x.title); if (seen.has(k)) return false; seen.add(k); return true; }).slice(0, 12));
   }
   if (get && p === "/api/requests/wishlist") { // songs Hermes couldn't find yet: tried again every week (4 tries)
     return send(res, 200, items.filter((i) => !i.parent && i.status === "failed" && (i.retries || 0) < 4 && i.type === "song")
@@ -4456,6 +4822,7 @@ http.createServer(async (req, res) => {
   if (post && (m = p.match(/^\/api\/requests\/([\w-]+)\/retry$/))) { // try a failed request again now
     const it = items.find((i) => i.id === m[1] && i.status === "failed");
     if (!it) return send(res, 404, { error: "that request isn't waiting for a retry" });
+    if ((it.retries || 0) >= 4) return send(res, 409, { error: "tried 4 times already - try a different spelling or a link" });
     Object.assign(it, { status: "pending", note: undefined, retries: (it.retries || 0) + 1 });
     save(); wake();
     return send(res, 200, { queued: true });
@@ -4469,6 +4836,10 @@ http.createServer(async (req, res) => {
     const b = await readBody(req, 100000);
     const lines = (Array.isArray(b.lines) ? b.lines : String(b.text || "").split(/\r?\n/)).map((x) => String(x).trim().slice(0, 200)).filter((x) => x.length >= 2).slice(0, 100);
     if (!lines.length) return send(res, 400, { error: "add at least one song" });
+    const ip = req.socket.remoteAddress; // the same limit as single requests, one per song
+    const hits = (rate.get(ip) || []).filter((t) => Date.now() - t < 60000);
+    if (hits.length + lines.length > Math.max(config.ratePerMinute * 10, 30)) return send(res, 429, { error: "that's a lot at once - wait a minute and send the rest" });
+    rate.set(ip, [...hits, ...lines.map(() => Date.now())]);
     const created = new Date().toISOString();
     const type = b.type === "album" ? "album" : "song";
     for (const q of lines) {
@@ -4480,17 +4851,9 @@ http.createServer(async (req, res) => {
     save(); wake();
     return send(res, 201, { queued: lines.length });
   }
-  if (get && p === "/api/storage") { // how much room the library takes and who/what takes the most
-    const byArtist = new Map(); let total = 0, files = 0;
-    for (const file of Object.keys(libCache)) {
-      let size = 0; try { size = fs.statSync(file).size; } catch { continue; }
-      total += size; files++;
-      const c = libCache[file]; const a = c.aa || c.a || "Unknown";
-      byArtist.set(a, (byArtist.get(a) || 0) + size);
-    }
-    let disk = null;
-    try { const st = fs.statfsSync(MUSIC); disk = { free: st.bavail * st.bsize, size: st.blocks * st.bsize }; } catch {}
-    return send(res, 200, { total, files, disk, artists: [...byArtist.entries()].sort((x, y) => y[1] - x[1]).slice(0, 20).map(([artist, bytes]) => ({ artist, bytes })) });
+  if (get && p === "/api/storage") { // how much room the library takes and who/what takes the most (worked out in the background, kept 10 minutes)
+    if (!storageCache.data || Date.now() - storageCache.at > 10 * 60000) refreshStorage();
+    return send(res, 200, storageCache.data || { total: 0, files: 0, disk: null, artists: [], counting: true });
   }
   if (post && p === "/api/lyrics/translate") { // the song's lyrics in another language, line by line
     const b = await readBody(req, 200000);
@@ -4517,9 +4880,14 @@ ${JSON.stringify(lines)}`, timeout: 180000, env: { ...process.env, CLAUDE_CODE_O
     } catch (e) { return send(res, 502, { error: `couldn't translate: ${e.message}` }); }
   }
   if (p === "/api/lyrics/doctor") { // songs without synced lyrics; POST fetches them in the background
-    const missing = () => Object.keys(libCache).filter((f) => !fs.existsSync(f.replace(/\.[^.\/\\]+$/, ".lrc")));
+    const missing = () => {
+      if (Date.now() - lyricsMissing.at > 5 * 60000 || lyricsDoctor.running) {
+        lyricsMissing = { at: Date.now(), list: Object.keys(libCache).filter((f) => !fs.existsSync(f.replace(/\.[^.\/\\]+$/, ".lrc"))) };
+      }
+      return lyricsMissing.list;
+    };
     if (get) {
-      const list = missing();
+      const list = lyricsDoctor.running ? lyricsMissing.list : missing();
       return send(res, 200, { missing: list.length, running: lyricsDoctor.running, done: lyricsDoctor.done, found: lyricsDoctor.found,
         sample: list.slice(0, 50).map((f) => ({ artist: libCache[f].a, title: libCache[f].t || path.basename(f) })) });
     }
