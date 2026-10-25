@@ -376,10 +376,28 @@ async function fixSong(rel, action) {
 // ---------- /duplicate: find copies of the same song, keep the best one ----------
 // ---- library tools (Sour Player 0.4): a song file by its path inside the library, tag/cover edits, the archive ----
 function libraryFile(rel) {
-  const file = path.resolve(MUSIC, String(rel || "").replace(/^[/\\]+/, ""));
-  if (!file.startsWith(MUSIC + path.sep) || /[/\\]\.(duplicates|archive)[/\\]/.test(file)) throw new Error("that isn't a song in the library");
-  if (!fs.existsSync(file) || !fs.statSync(file).isFile()) throw new Error("that file isn't in the library any more");
-  return file;
+  const parts = String(rel || "").replace(/\\/g, "/").split("/").filter((x) => x && x !== "." && x !== "..");
+  // Navidrome may report "Artist/Album/song.mp3", "/music/Artist/...", or its own folder name in front:
+  // try the whole path, then without leading folders, until one is a file in the library
+  for (let i = 0; i < parts.length; i++) {
+    const file = path.resolve(MUSIC, parts.slice(i).join("/"));
+    if (!file.startsWith(MUSIC + path.sep) || /[/\\]\.(duplicates|archive)[/\\]/.test(file)) continue;
+    if (fs.existsSync(file) && fs.statSync(file).isFile()) return file;
+  }
+  throw new Error("that file isn't in the library any more");
+}
+// an album's files from the library index, when the paths Sour Player sends don't match this Umbrel's
+function albumFiles(album, artist) {
+  const al = norm(album || ""), ar = norm(artist || "");
+  if (!al) return [];
+  return Object.entries(libCache).filter(([, c]) => norm(c.al || "") === al && (!ar || norm(c.aa || c.a || "") === ar || norm(c.a || "") === ar))
+    .map(([file]) => file).filter((f) => fs.existsSync(f)).slice(0, 300);
+}
+// the files to change: from the paths sent, or else by album and artist
+function filesFor(b) {
+  const sent = (Array.isArray(b.files) ? b.files : []).slice(0, 300).map((rel) => { try { return libraryFile(rel); } catch { return null; } }).filter(Boolean);
+  if (sent.length) return sent;
+  return albumFiles(b.album, b.artist);
 }
 // rewrites a file with changed tags and/or a new cover; every other tag and stream stays as it was
 async function editFile(file, { tags = {}, cover = null }) {
@@ -982,14 +1000,21 @@ async function finishSong(raw, ext, meta, thumb) {
 // Synced lyrics from LRCLIB (free, no account), saved as an .lrc file next to the song for Navidrome and Sour Player.
 async function saveLyrics(dest, meta) {
   if (config.lyrics === false) return;
+  // the file's own length, not the catalogue's: lyrics are timed to one cut of a song
+  const secs = Math.round((await probeInfo(dest).catch(() => ({}))).d || meta.seconds || 0);
+  const ua = { "user-agent": "Hermes Music (Umbrel)" };
   const q = new URLSearchParams({ artist_name: meta.artist || "", track_name: meta.title || "" });
   if (meta.album) q.set("album_name", meta.album);
-  if (meta.seconds) q.set("duration", String(Math.round(meta.seconds)));
-  let res = await fetch(`https://lrclib.net/api/get?${q}`, { headers: { "user-agent": "Hermes Music (Umbrel)" }, signal: AbortSignal.timeout(15000) });
+  if (secs) q.set("duration", String(secs));
+  let res = await fetch(`https://lrclib.net/api/get?${q}`, { headers: ua, signal: AbortSignal.timeout(15000) });
   let j = res.ok ? await res.json() : null;
-  if (!j) { // no exact match: search instead
-    res = await fetch(`https://lrclib.net/api/search?${new URLSearchParams({ q: `${meta.artist} ${meta.title}` })}`, { headers: { "user-agent": "Hermes Music (Umbrel)" }, signal: AbortSignal.timeout(15000) });
-    j = res.ok ? (await res.json())[0] : null;
+  if (!j || !j.syncedLyrics || (secs && j.duration && Math.abs(j.duration - secs) > 3)) {
+    // no exact match (or one for another cut): the synced result closest to this file's length
+    res = await fetch(`https://lrclib.net/api/search?${new URLSearchParams({ track_name: meta.title || "", artist_name: meta.artist || "" })}`, { headers: ua, signal: AbortSignal.timeout(15000) });
+    const list = res.ok ? await res.json() : [];
+    const synced = (Array.isArray(list) ? list : []).filter((x) => x.syncedLyrics && String(x.syncedLyrics).split("\n").length >= 3)
+      .sort((a, b) => Math.abs((a.duration || 0) - secs) - Math.abs((b.duration || 0) - secs));
+    j = synced[0] || j || (Array.isArray(list) ? list[0] : null);
   }
   const text = j && (j.syncedLyrics || j.plainLyrics);
   if (text) fs.writeFileSync(dest.replace(/\.[^.]+$/, ".lrc"), text);
@@ -1510,6 +1535,49 @@ function scoreVideo(v, artist, title, seconds, maxViews) {
   if (seconds && v.seconds) { const d = Math.abs(v.seconds - seconds); s += d <= 15 ? 15 : d <= 90 ? 5 : d > 240 ? -30 : 0; }
   return s;
 }
+// ---- videos for many songs at once (one at a time in the background), and songs that had none yet ----
+const LYRIC_OFFSETS = "/data/lyric-offsets.json";
+let lyricOffsets = (() => { try { return JSON.parse(fs.readFileSync(LYRIC_OFFSETS, "utf8")); } catch { return {}; } })();
+const VIDEO_MISSES = "/data/video-misses.json";
+let videoMisses = (() => { try { return JSON.parse(fs.readFileSync(VIDEO_MISSES, "utf8")); } catch { return {}; } })();
+const saveMisses = () => { try { fs.writeFileSync(VIDEO_MISSES, JSON.stringify(videoMisses)); } catch {} };
+const videoFind = { running: false, queue: [], done: 0, found: 0, current: null };
+async function findOneVideo(artist, title) {
+  const hit = findInLibrary(`${artist} ${title}`)[0];
+  if (!hit) return false;
+  const key = songKey(hit.artist, hit.title);
+  if (videos[key]) return true;
+  const secs = (await probeInfo(hit.file).catch(() => ({}))).d;
+  const r = await findMusicVideo(hit.artist, hit.title, secs);
+  if (!r.best) { videoMisses[key] = { at: new Date().toISOString(), artist: hit.artist, title: hit.title }; saveMisses(); return false; }
+  videos[key] = { videoId: r.best.id, title: r.best.title, channel: r.best.channel, artist: hit.artist, song: hit.title,
+    offset: 0, timing: "pending", at: new Date().toISOString(), check: 2, candidates: r.candidates.map(({ id, title, channel }) => ({ id, title, channel })) };
+  delete videoMisses[key]; saveMisses();
+  saveVideos();
+  queueAlign(key);
+  return true;
+}
+async function runVideoFind() {
+  if (videoFind.running || !ready()) return;
+  videoFind.running = true;
+  try {
+    while (videoFind.queue.length) {
+      const x = videoFind.queue.shift();
+      videoFind.current = x;
+      try { if (await findOneVideo(x.artist, x.title)) videoFind.found++; } catch {}
+      videoFind.done++;
+      await new Promise((ok) => setTimeout(ok, 1500)); // gentle on YouTube
+    }
+  } finally { videoFind.running = false; videoFind.current = null; }
+}
+// official videos often come out after the song: songs without one are looked at again after a week
+setInterval(() => {
+  const week = 7 * 24 * 3600 * 1000;
+  const due = Object.values(videoMisses).filter((m) => Date.now() - new Date(m.at).getTime() > week).slice(0, 15);
+  for (const m of due) if (!videoFind.queue.some((q) => songKey(q.artist, q.title) === songKey(m.artist, m.title))) videoFind.queue.push({ artist: m.artist, title: m.title });
+  if (due.length) runVideoFind();
+}, 12 * 3600 * 1000);
+
 async function findMusicVideo(artist, title, seconds) {
   const first = String(artist).split(/\s*(?:,|&|\bfeat\.?|\bft\.?)\s*/i)[0];
   // two searches: the "official music video" one, and a plain one (official videos aren't always titled that way)
@@ -3522,7 +3590,7 @@ http.createServer(async (req, res) => {
   const SOUR_PREFIXES = ["/api/sounds", "/api/profiles", "/api/playlist-themes", "/api/friend-group", "/api/activity", "/api/gifts", "/api/capsules", "/api/song-notes",
     "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke", "/api/feedback"];
   const isSour = SOUR_PREFIXES.some((x) => p.startsWith(x)) || SOUR_ROUTES.includes(p);
-  if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/requests") || p.startsWith("/api/library") || p.startsWith("/api/duplicates") || isSour
+  if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/lyrics") || p.startsWith("/api/requests") || p.startsWith("/api/library") || p.startsWith("/api/duplicates") || isSour
     || ["/api/status", "/api/now", "/api/bump"].includes(p)) { // used by Sour Player (the custom Feishin)
     res.setHeader("access-control-allow-origin", "*");
     if (req.method === "OPTIONS") {
@@ -3660,6 +3728,71 @@ http.createServer(async (req, res) => {
     }
     return v.live ? send(res, 200, v.live) : send(res, 404, { error: "no live performance found" });
   }
+  if (p === "/api/lyrics/offset") { // GET ?artist&title -> {ms}; POST {artist, title, ms}
+    if (get) return send(res, 200, { ms: lyricOffsets[songKey(url.searchParams.get("artist") || "", url.searchParams.get("title") || "")] || 0 });
+    if (!post) return send(res, 404, { error: "not found" });
+    const b = await readBody(req);
+    const ms = Math.round(Number(b.ms));
+    if (!b.artist || !b.title || !Number.isFinite(ms) || Math.abs(ms) > 600000) return send(res, 400, { error: "which song, and how many milliseconds?" });
+    const key = songKey(String(b.artist), String(b.title));
+    if (ms) lyricOffsets[key] = ms; else delete lyricOffsets[key];
+    try { fs.writeFileSync(LYRIC_OFFSETS, JSON.stringify(lyricOffsets)); } catch {}
+    return send(res, 200, { ms });
+  }
+  if (get && p === "/api/videos/candidates") { // the other videos that could be this song (the video picker)
+    const key = songKey(url.searchParams.get("artist") || "", url.searchParams.get("title") || ""), v = videos[key];
+    let list = v && v.candidates ? v.candidates : null;
+    if (!list) {
+      if (!ready()) return send(res, 503, { error: "still installing tools - try again in a minute" });
+      const artist = url.searchParams.get("artist") || "", title = url.searchParams.get("title") || "";
+      const hit = findInLibrary(`${artist} ${title}`)[0];
+      const secs = hit ? (await probeInfo(hit.file).catch(() => ({}))).d : 0;
+      try {
+        const r = await findMusicVideo(artist, title, secs);
+        list = [...r.candidates, ...r.others].filter((x, i, a) => a.findIndex((y) => y.id === x.id) === i).slice(0, 6).map(({ id, title, channel }) => ({ id, title, channel }));
+        if (v) { v.candidates = list; saveVideos(); }
+      } catch (e) { return send(res, 502, { error: e.message }); }
+    }
+    return send(res, 200, { current: v ? v.videoId : null, candidates: list, live: v && v.live ? v.live : null });
+  }
+  if (post && p === "/api/videos/pick") { // a person picked the right video from the picker (it's then used for everyone)
+    const b = await readBody(req);
+    const id = ytId(String(b.videoId || "")) || (/^[\w-]{11}$/.test(String(b.videoId || "")) ? String(b.videoId) : null);
+    if (!id) return send(res, 400, { error: "that isn't a video" });
+    const hit = findInLibrary(`${b.artist || ""} ${b.title || ""}`)[0];
+    const artist = hit ? hit.artist : String(b.artist || ""), song = hit ? hit.title : String(b.title || "");
+    if (!artist || !song) return send(res, 404, { error: "that song isn't in the library" });
+    const key = songKey(artist, song), old = videos[key] || {};
+    const c = (old.candidates || []).find((x) => x.id === id) || {};
+    videos[key] = { ...old, videoId: id, title: clean1(b.videoTitle || c.title || "(picked)", 200), channel: clean1(b.channel || c.channel || "", 100),
+      artist, song, pick: "manual", offset: 0, timing: "pending", check: 2, at: new Date().toISOString() };
+    delete videoMisses[key];
+    saveVideos();
+    queueAlign(key);
+    return send(res, 200, { artist, song, videoId: id });
+  }
+  if (get && p === "/api/videos/missing") { // songs in the library without a music video (Sour Library's video manager)
+    const seen = new Set(), out = [];
+    for (const c of Object.values(libCache)) {
+      const artist = c.aa || c.a, title = c.t;
+      if (!artist || !title) continue;
+      const key = songKey(artist, title);
+      if (seen.has(key) || videos[key] || videos[songKey(c.a || artist, title)]) continue;
+      seen.add(key);
+      out.push({ artist, title, album: c.al || "", tried: videoMisses[key] ? videoMisses[key].at : null });
+    }
+    out.sort((x, y) => String(x.artist).localeCompare(String(y.artist)) || String(x.album).localeCompare(String(y.album)));
+    return send(res, 200, { total: out.length, songs: out.slice(0, 2000) });
+  }
+  if (get && p === "/api/videos/find") return send(res, 200, videoFind);
+  if (post && p === "/api/videos/find") { // look for videos for many songs at once (an album, an artist, the missing list)
+    const b = await readBody(req, 400000);
+    const songs = (Array.isArray(b.songs) ? b.songs : []).slice(0, 500).map((x) => ({ artist: clean1(x.artist, 150), title: clean1(x.title, 200) })).filter((x) => x.artist && x.title);
+    if (!songs.length) return send(res, 400, { error: "no songs to look for" });
+    for (const x of songs) if (!videoFind.queue.some((q) => songKey(q.artist, q.title) === songKey(x.artist, x.title))) videoFind.queue.push(x);
+    runVideoFind();
+    return send(res, 200, { queued: videoFind.queue.length });
+  }
   if (post && p === "/api/videos/remove") {
     const hits = findInLibrary(String((await readBody(req)).query || ""));
     const key = hits.map((h) => songKey(h.artist, h.title)).find((k) => videos[k]);
@@ -3706,11 +3839,15 @@ http.createServer(async (req, res) => {
     const files = (Array.isArray(b.files) ? b.files : []).slice(0, 300);
     const tags = {};
     for (const k of ["title", "artist", "album_artist", "album", "date", "track", "genre"]) if (typeof (b.tags || {})[k] === "string" && b.tags[k].trim()) tags[k] = clean1(b.tags[k].trim(), 200);
-    if (!files.length || !Object.keys(tags).length) return send(res, 400, { error: "pick songs and type at least one tag" });
+    if ((!files.length && !b.album) || !Object.keys(tags).length) return send(res, 400, { error: "pick songs and type at least one tag" });
     if (files.length > 1) delete tags.title; // one title for many songs is never right
     const done = [], failed = [];
     for (const rel of files) {
       try { await editFile(libraryFile(rel), { tags }); done.push(rel); } catch (e) { failed.push({ file: rel, error: e.message }); }
+    }
+    if (!done.length && b.album) { // the paths didn't match this Umbrel: the album's files by name instead
+      failed.length = 0;
+      for (const f of albumFiles(b.album, b.artist)) { try { await editFile(f, { tags }); done.push(f); } catch (e) { failed.push({ file: f, error: e.message }); } }
     }
     return send(res, 200, { done: done.length, failed });
   }
@@ -3736,11 +3873,12 @@ http.createServer(async (req, res) => {
   }
   if (post && p === "/api/library/cover") { // put a new cover on songs (and the album folder)
     const b = await readBody(req, 8500000);
-    const files = (Array.isArray(b.files) ? b.files : []).slice(0, 300).map((rel) => { try { return libraryFile(rel); } catch { return null; } }).filter(Boolean);
+    const files = filesFor(b);
     // a suggested cover (from a catalogue) or a picture an admin uploaded (a data: URL, up to 6 MB)
     const img = typeof b.image === "string" && b.image.match(/^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
     const fromCatalog = /^https:\/\/[\w.-]+\.(dzcdn\.net|deezer\.com|mzstatic\.com|apple\.com|scdn\.co)\//.test(String(b.url || ""));
-    if (!files.length || (!fromCatalog && !img)) return send(res, 400, { error: "pick songs and one of the suggested covers" });
+    if (!files.length) return send(res, 404, { error: "Hermes Music couldn't find this album's song files on the Umbrel - try again after the next library scan" });
+    if (!fromCatalog && !img) return send(res, 400, { error: "pick one of the suggested covers, or upload a picture" });
     return ctx.run({ stage: path.join(STAGING, "cover-" + newId()) }, async () => {
       fs.mkdirSync(ST(), { recursive: true });
       try {
