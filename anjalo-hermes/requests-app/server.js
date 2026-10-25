@@ -1800,8 +1800,67 @@ function groupState(g) {
     tokens: Object.fromEntries(g.tokens), approval: !!g.approval, pending: g.approval ? g.pending : [],
     blind: !!g.blind, themeNight: g.themeNight || null, roomTheme: g.roomTheme || "none",
     tv: g.tv ? { event: g.tv.event, members: [...g.tv.allowed] } : null,
+    mood: (g.moods && g.moods.size) ? { avg: Math.round([...g.moods.values()].reduce((a, v) => a + v, 0) / g.moods.size), count: g.moods.size } : null,
+    game: gameState(g),
     serverNow: nowMs(),
   };
+}
+// ---- Sour Player 0.10 party games ----
+// battle: two songs, the room votes, the winner plays next
+// rounds: a theme, everyone adds one song that fits
+// hotseat: one person picks every song for a while
+// ranking: rank the last few songs blind, the result shows when the host ends it
+// countdown: suggest songs and vote; when the timer runs out the top one plays next
+// bingo: everyone gets 9 artists from the queue; first to hear a full line calls it
+const GAME_KINDS = ["battle", "rounds", "hotseat", "ranking", "countdown", "bingo"];
+const BINGO_LINES = [[0, 1, 2], [3, 4, 5], [6, 7, 8], [0, 3, 6], [1, 4, 7], [2, 5, 8], [0, 4, 8], [2, 4, 6]];
+function playedArtists(g) {
+  return new Set(g.queue.slice(0, g.index + 1).map((x) => String(x.artist || "").toLowerCase()));
+}
+function gameState(g) {
+  const x = g.game;
+  if (!x) return null;
+  const base = { kind: x.kind, by: x.by, started: x.started, ends: x.ends || null, result: x.result || null };
+  if (x.kind === "battle") return { ...base, a: x.a, b: x.b, votesA: x.votesA.size, votesB: x.votesB.size };
+  if (x.kind === "rounds") return { ...base, theme: x.theme, picks: [...x.picks.entries()].map(([who, p]) => ({ who: p.name, title: p.song.title, artist: p.song.artist })) };
+  if (x.kind === "hotseat") return { ...base, who: x.who, songsLeft: Math.max(0, x.untilIndex - g.index) };
+  if (x.kind === "ranking") return { ...base, songs: x.songs, ranked: x.ranks.size };
+  if (x.kind === "countdown") return { ...base, picks: x.picks.map((p) => ({ id: p.id, title: p.song.title, artist: p.song.artist, by: p.by, votes: p.votes.size })) };
+  if (x.kind === "bingo") return { ...base, cards: Object.fromEntries(x.cards), heard: [...playedArtists(g)] };
+  return base;
+}
+function finishGame(g) {
+  const x = g.game;
+  if (!x || x.result) return;
+  if (x.kind === "battle") {
+    const win = x.votesB.size > x.votesA.size ? x.b : x.a;
+    g.queue.splice(g.index + 1, 0, { ...win, requested: true });
+    g.addedBy.set(win.id, "Battle winner");
+    x.result = `${win.title} won ${Math.max(x.votesA.size, x.votesB.size)}-${Math.min(x.votesA.size, x.votesB.size)} and plays next`;
+  } else if (x.kind === "countdown") {
+    const top = [...x.picks].sort((a, b) => b.votes.size - a.votes.size)[0];
+    if (top) {
+      g.queue.splice(g.index + 1, 0, { ...top.song, requested: true });
+      g.addedBy.set(top.song.id, top.by);
+      x.result = `${top.song.title} (${top.by}) plays next`;
+    } else x.result = "Nobody suggested a song";
+  } else if (x.kind === "ranking") {
+    const score = new Map();
+    for (const list of x.ranks.values()) list.forEach((id, i) => score.set(id, (score.get(id) || 0) + (list.length - i)));
+    const order = [...x.songs].sort((a, b) => (score.get(b.id) || 0) - (score.get(a.id) || 0));
+    x.result = order.length ? order.map((t, i) => `${i + 1}. ${t.title}`).join("  ") : "No rankings";
+  } else if (x.kind === "rounds") {
+    x.result = `Round over: ${x.picks.size} song${x.picks.size === 1 ? "" : "s"} for "${x.theme}"`;
+  } else x.result = "Game over";
+  x.ends = nowMs();
+  tell(g, "game", { result: x.result });
+  setTimeout(() => { if (g.game === x) { g.game = null; broadcast(g); } }, 15000);
+  broadcast(g);
+}
+function songOf(v) {
+  if (!v || typeof v !== "object" || !v.id) return null;
+  return { id: clean1(v.id, 80), title: clean1(v.title, 200), artist: clean1(v.artist, 200), album: clean1(v.album, 200),
+    imageId: v.imageId ? clean1(v.imageId, 120) : null, duration: Number(v.duration) || 0, year: Number(v.year) || null };
 }
 const sse = (res, event, data) => { if (res.writableEnded) return; try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch {} };
 function broadcast(g) {
@@ -1832,6 +1891,8 @@ function baseGroup(fields) {
     // blind rounds, theme nights, room looks and the session summary
     encore: new Set(), encoreSong: null, marks: [], tokens: new Map(), approval: false, pending: [], blind: false,
     themeNight: null, roomTheme: "none", sounds: new Map(),
+    // Sour Player 0.10: the mood dial and party games
+    moods: new Map(), game: null,
     session: { start: nowMs(), plays: new Map(), adders: new Map(), skips: 0, reactions: 0, people: new Set(), lastSong: null },
     ...fields,
   };
@@ -2108,6 +2169,113 @@ async function groupRoute(req, res, p, get, post, url) {
     tell(g, "sound", { name, by: me.name });
     return send(res, 200, { ok: true });
   }
+  if (action === "mood") { // the mood dial: 0 chill - 100 hype; the room's average steers what to play
+    if (!me && !isHost) return send(res, 403, { error: "join the group first" });
+    const v = Math.max(0, Math.min(100, Math.round(Number(b.value))));
+    if (!Number.isFinite(v)) return send(res, 400, { error: "pick a mood" });
+    g.moods.set(whoKey, v);
+    broadcast(g);
+    return send(res, 200, { ok: true });
+  }
+  if (action === "game") {
+    if (!me && !isHost) return send(res, 403, { error: "join the group first" });
+    const name = isHost ? g.hostName : me.name;
+    const op = String(b.op || "");
+    const x = g.game;
+    if (op === "start") {
+      if (x && !x.result) return send(res, 409, { error: "a game is already on" });
+      const kind = String(b.kind || "");
+      if (!GAME_KINDS.includes(kind)) return send(res, 400, { error: "unknown game" });
+      const game = { kind, by: name, started: nowMs() };
+      if (kind === "battle") {
+        const a = songOf(b.a), c = songOf(b.b);
+        if (!a || !c) return send(res, 400, { error: "pick two songs" });
+        Object.assign(game, { a, b: c, votesA: new Set(), votesB: new Set(), ends: nowMs() + 45000 });
+      } else if (kind === "rounds") {
+        const theme = clean1(b.theme, 80).trim();
+        if (!theme) return send(res, 400, { error: "give the round a theme" });
+        Object.assign(game, { theme, picks: new Map() });
+      } else if (kind === "hotseat") {
+        const people = [g.hostName, ...[...g.members.values()].filter((m) => !m.spectate).map((m) => m.name)].filter(Boolean);
+        const who = clean1(b.who, 60) || people[Math.floor(Math.random() * people.length)];
+        Object.assign(game, { who, untilIndex: g.index + Math.max(1, Math.min(10, Number(b.songs) || 3)) });
+      } else if (kind === "ranking") {
+        const songs = g.queue.slice(Math.max(0, g.index - 5), g.index + 1);
+        if (songs.length < 2) return send(res, 409, { error: "play a few songs first" });
+        Object.assign(game, { songs, ranks: new Map() });
+      } else if (kind === "countdown") {
+        Object.assign(game, { picks: [], ends: nowMs() + Math.max(30, Math.min(300, Number(b.seconds) || 90)) * 1000 });
+      } else if (kind === "bingo") {
+        const artists = [...new Set(g.queue.slice(g.index).map((t) => t.artist).filter(Boolean))];
+        if (artists.length < 9) return send(res, 409, { error: "bingo needs at least 9 different artists coming up" });
+        const people = [["host", g.hostName], ...[...g.members.values()].map((m) => [personOf(m), m.name])];
+        const cards = new Map();
+        for (const [, who] of people) cards.set(who, [...artists].sort(() => Math.random() - 0.5).slice(0, 9));
+        Object.assign(game, { cards });
+      }
+      g.game = game;
+      if (game.ends) setTimeout(() => { if (g.game === game) finishGame(g); }, game.ends - nowMs() + 50);
+      tell(g, "game", { started: kind, by: name });
+      broadcast(g);
+      return send(res, 200, { ok: true });
+    }
+    if (!x || x.result) return send(res, 409, { error: "no game is on" });
+    if (op === "stop") {
+      if (!isHost && name !== x.by) return send(res, 403, { error: "only the host or whoever started it can end it" });
+      finishGame(g);
+      return send(res, 200, { ok: true });
+    }
+    if (op === "vote" && x.kind === "battle") {
+      x.votesA.delete(whoKey); x.votesB.delete(whoKey);
+      (b.side === "b" ? x.votesB : x.votesA).add(whoKey);
+      broadcast(g);
+      return send(res, 200, { ok: true });
+    }
+    if (op === "pick" && (x.kind === "rounds" || x.kind === "countdown")) {
+      const song = songOf(b.song);
+      if (!song) return send(res, 400, { error: "pick a song" });
+      if (x.kind === "rounds") {
+        if (x.picks.has(whoKey)) return send(res, 409, { error: "you already picked this round" });
+        x.picks.set(whoKey, { name, song });
+        g.queue.push({ ...song, requested: true });
+        g.addedBy.set(song.id, name);
+        const everyone = 1 + [...g.members.values()].filter((m) => !m.spectate).length;
+        if (x.picks.size >= everyone) finishGame(g);
+      } else {
+        if (x.picks.some((p) => p.byKey === whoKey)) return send(res, 409, { error: "one suggestion each" });
+        x.picks.push({ id: crypto.randomUUID().slice(0, 8), song, by: name, byKey: whoKey, votes: new Set([whoKey]) });
+      }
+      broadcast(g);
+      return send(res, 200, { ok: true });
+    }
+    if (op === "vote" && x.kind === "countdown") {
+      for (const p of x.picks) p.votes.delete(whoKey);
+      const p = x.picks.find((q) => q.id === b.id);
+      if (p) p.votes.add(whoKey);
+      broadcast(g);
+      return send(res, 200, { ok: true });
+    }
+    if (op === "rank" && x.kind === "ranking") {
+      const ids = (Array.isArray(b.order) ? b.order : []).map(String).filter((id) => x.songs.some((t) => t.id === id));
+      if (ids.length !== x.songs.length) return send(res, 400, { error: "rank every song" });
+      x.ranks.set(whoKey, ids);
+      broadcast(g);
+      return send(res, 200, { ok: true });
+    }
+    if (op === "bingo" && x.kind === "bingo") {
+      const card = x.cards.get(name) || [];
+      const heard = playedArtists(g);
+      const line = BINGO_LINES.some((l) => l.every((i) => card[i] && heard.has(card[i].toLowerCase())));
+      if (!line) return send(res, 409, { error: "not yet - no full line heard" });
+      x.result = `${name} got bingo!`;
+      x.ends = nowMs();
+      tell(g, "game", { result: x.result });
+      setTimeout(() => { if (g.game === x) { g.game = null; broadcast(g); } }, 15000);
+      broadcast(g);
+      return send(res, 200, { ok: true });
+    }
+    return send(res, 400, { error: "that doesn't fit this game" });
+  }
   if (action === "encore") { // most of the room wants the song again: it plays once more
     if (!me) return send(res, 403, { error: "join the group first" });
     const cur = g.queue[g.index];
@@ -2168,6 +2336,9 @@ async function groupRoute(req, res, p, get, post, url) {
     map.set(me.name, clean1(b.name, 40));
     g.guesses.set(songId, map);
     return send(res, 200, { ok: true });
+  }
+  if (action === "add" && g.game && g.game.kind === "hotseat" && !g.game.result && g.index < g.game.untilIndex && !isHost && (!me || me.name !== g.game.who)) {
+    return send(res, 403, { error: `${g.game.who} is in the hot seat - they pick the songs for now` });
   }
   if (action === "add") { // anyone in the group can add songs
     const songs = (Array.isArray(b.songs) ? b.songs : []).map(groupSong).filter(Boolean).slice(0, 200);
