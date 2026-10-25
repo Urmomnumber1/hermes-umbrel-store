@@ -2701,6 +2701,7 @@ function publicProfile(p, self = false) {
     listening: online && !priv.hideListening && p.listening ? p.listening : null, playing: online && !!p.playing,
     on: online && !priv.hideListening ? p.on || "computer" : null,
     speed: online && !priv.hideListening ? p.speed || 1 : 1, karaoke: online && !priv.hideListening ? !!p.karaoke : false,
+    video: online && !priv.hideListening ? !!p.video : false,
     position: online && !priv.hideListening ? p.position || 0 : 0, positionAt: p.positionAt || 0,
     group: online && !priv.hideListening ? p.group || null : null,
     custom: hidden ? { privacy: { private: true } } : p.custom || {},
@@ -3174,7 +3175,7 @@ async function sourRoute(req, res, p, get, post, url) {
     if (song && b.playing && (!before || !before.listening || before.listening.id !== song.id)) countPlay(me, song);
     const speed = Math.min(2, Math.max(0.5, Number(b.speed) || 1));
     me.devices[dev] = { listening: song, playing: !!b.playing, position: Number(b.position) || 0, at: now, on: b.on === "phone" ? "phone" : "computer",
-      speed, karaoke: !!b.karaoke };
+      speed, karaoke: !!b.karaoke, video: !!b.video };
     for (const [k, d] of Object.entries(me.devices)) if (!d || now - (d.at || 0) > ONLINE_MS) delete me.devices[k];
     const devs = Object.values(me.devices).sort((x, y) => y.at - x.at);
     const best = devs.find((d) => d.playing && d.listening) || devs.find((d) => d.listening) || me.devices[dev];
@@ -3185,6 +3186,7 @@ async function sourRoute(req, res, p, get, post, url) {
     me.on = best.on; // where they listen (shown as "on their phone")
     me.speed = best.speed || 1; // slowed / normal / nightcore, so listen along matches it
     me.karaoke = !!best.karaoke;
+    me.video = !!best.video; // watching the music video (listen along opens it too)
     me.position = best.position;
     me.positionAt = best.at;
     me.group = b.group && typeof b.group.code === "string" ? { code: clean1(b.group.code, 5), name: clean1(b.group.name, 60) } : null;

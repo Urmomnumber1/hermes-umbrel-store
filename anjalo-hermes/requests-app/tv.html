@@ -94,6 +94,16 @@
   .person small { opacity: .7; }
   body.screen #tv > footer .controls, body.screen #tv > footer .actions, body.screen .toast { display: none !important; }
   body.screen #tv > footer { justify-content: flex-start; }
+  /* watch party: the song's music video fills the TV picture */
+  #video-layer { position: absolute; inset: 0; z-index: 0; display: none; overflow: hidden; background: #000; }
+  #video-layer iframe { position: absolute; top: 50%; left: 50%; width: 100vw; height: 56.25vw; min-width: 177.78vh; min-height: 100vh;
+    transform: translate(-50%, -50%); border: 0; pointer-events: none; }
+  #video-shade { position: absolute; inset: 0; z-index: 0; display: none; pointer-events: none;
+    background: linear-gradient(180deg, rgba(0,0,0,.45) 0%, transparent 22%, transparent 50%, rgba(0,0,0,.8) 100%); }
+  body.has-video #video-layer, body.has-video #video-shade { display: block; }
+  body.has-video #backdrop, body.has-video .cover, body.has-video #next-box { display: none; }
+  body.has-video #tv > main { align-items: flex-end; }
+  body.has-video .title { font-size: clamp(22px, 5vmin, 54px); }
   .toast { position: fixed; left: 50%; bottom: max(24px, env(safe-area-inset-bottom)); transform: translateX(-50%); z-index: 20; padding: 12px 18px; border-radius: 999px; background: #2a2a33; font-size: 14px; font-weight: 600; box-shadow: 0 10px 30px rgba(0,0,0,.4); animation: pop .25s ease; }
 </style>
 </head>
@@ -128,6 +138,8 @@
 <!-- the TV -->
 <section id="tv" class="hidden">
   <div id="backdrop"></div>
+  <div id="video-layer"></div>
+  <div id="video-shade"></div>
   <header>
     <div><div class="brand">Sour Player TV</div><div class="event" id="ev-name"></div></div>
     <div class="clock" id="clock"></div>
@@ -305,12 +317,67 @@ function followState(st) {
   queue = st.queue.map((x) => ({ ...x }));
   index = st.index;
   $("ev-name").textContent = st.tv?.event || st.name;
-  if (queue[index] && queue[index].id !== before) loadLyrics(queue[index]);
+  if (queue[index] && queue[index].id !== before) { loadLyrics(queue[index]); checkVideo(queue[index]); }
+  if (!queue[index]) checkVideo(null);
   const msg = st.chat?.[st.chat.length - 1];
   if (msg && !first && msg.id !== lastChat) showChat(msg);
   renderFaces();
   render();
 }
+// ---- watch party: the song's music video on the TV, muted and in step with the music ----
+const tvVideo = { songId: null, frame: null, offset: 0, heard: 0, time: 0, at: 0, state: -1, lastCmd: 0 };
+async function checkVideo(s) {
+  if (!SCREEN) return;
+  tvVideo.songId = s ? s.id : null;
+  const layer = $("video-layer");
+  if (!s) { layer.innerHTML = ""; tvVideo.frame = null; document.body.classList.remove("has-video"); return; }
+  let v = null;
+  try {
+    const r = await fetch(`/api/videos/lookup?${new URLSearchParams({ artist: s.artist, title: s.title })}`);
+    if (r.ok) v = await r.json();
+  } catch {}
+  if (tvVideo.songId !== s.id) return; // the song changed meanwhile
+  if (!v || !/^[\w-]{11}$/.test(v.videoId || "")) { layer.innerHTML = ""; tvVideo.frame = null; document.body.classList.remove("has-video"); return; }
+  tvVideo.offset = v.offset || 0;
+  const start = Math.max(0, Math.floor(nowTime() + tvVideo.offset));
+  const f = document.createElement("iframe");
+  f.allow = "autoplay; encrypted-media";
+  f.src = `https://www.youtube-nocookie.com/embed/${v.videoId}?enablejsapi=1&mute=1&autoplay=1&controls=0&rel=0&playsinline=1&disablekb=1&cc_load_policy=0&cc_lang_pref=zxx&iv_load_policy=3&start=${start}`;
+  layer.innerHTML = "";
+  layer.appendChild(f);
+  Object.assign(tvVideo, { frame: f, heard: 0, state: -1, time: start, at: performance.now() });
+  document.body.classList.add("has-video");
+}
+window.addEventListener("message", (e) => {
+  if (!tvVideo.frame || e.source !== tvVideo.frame.contentWindow) return;
+  let d; try { d = typeof e.data === "string" ? JSON.parse(e.data) : e.data; } catch { return; }
+  if (d.event !== "infoDelivery" || !d.info) return;
+  tvVideo.heard = performance.now();
+  if (typeof d.info.currentTime === "number") { tvVideo.time = d.info.currentTime; tvVideo.at = performance.now(); }
+  if (typeof d.info.playerState === "number") tvVideo.state = d.info.playerState;
+});
+function syncVideo() {
+  const f = tvVideo.frame;
+  if (!f || !state) return;
+  const cmd = (func, args = []) => f.contentWindow?.postMessage(JSON.stringify({ event: "command", func, args }), "*");
+  const now = performance.now();
+  if (now - tvVideo.heard > 2000 && now - tvVideo.lastCmd > 1500) { // ask it to report its time, muted, no subtitles
+    f.contentWindow?.postMessage(JSON.stringify({ event: "listening", id: "sour-tv", channel: "widget" }), "*");
+    cmd("mute"); cmd("setOption", ["captions", "track", {}]); cmd("unloadModule", ["captions"]); cmd("unloadModule", ["cc"]);
+    tvVideo.lastCmd = now;
+  }
+  const target = nowTime() + tvVideo.offset;
+  const playing = !!state.playing, videoPlaying = tvVideo.state === 1;
+  if (playing && !videoPlaying && tvVideo.state !== 3 && now - tvVideo.lastCmd > 1000) { cmd("playVideo"); tvVideo.lastCmd = now; }
+  if (!playing && videoPlaying) cmd("pauseVideo");
+  const videoTime = tvVideo.time + (videoPlaying ? (now - tvVideo.at) / 1000 : 0);
+  if (tvVideo.heard && Math.abs(videoTime - target) > 1 && now - tvVideo.lastCmd > 2500) {
+    cmd("seekTo", [target + (playing ? 0.3 : 0), true]);
+    tvVideo.time = target; tvVideo.at = now; tvVideo.lastCmd = now;
+  }
+}
+setInterval(syncVideo, 1000);
+
 const nowTime = () => {
   if (!SCREEN) return audio.currentTime || 0;
   if (!state) return 0;
@@ -414,9 +481,10 @@ function tick() {
   $("clock").textContent = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   // the line being sung
   const on = showLyrics && lyrics.id === s?.id && lyrics.lines.length;
+  // on the TV picture with a video, the line being sung sits over it like subtitles
   $("lyrics").classList.toggle("hidden", !on);
   if (on) {
-    const ms = t * 1000 + 150;
+    const ms = t * 1000 + 150 + (lyrics.shift || 0);
     let cur = -1;
     for (let i = 0; i < lyrics.lines.length; i++) if (lyrics.lines[i].start <= ms) cur = i;
     const now = cur >= 0 ? lyrics.lines[cur].value || "..." : "...";
@@ -427,17 +495,20 @@ function tick() {
 setInterval(tick, 250);
 async function loadLyrics(s) {
   lyrics = { id: null, lines: [] };
+  let shift = 0; // the song's lyrics timing fix (Sour Stage's Early / Late, saved for everyone)
+  fetch(`/api/lyrics/offset?${new URLSearchParams({ artist: s.artist, title: s.title })}`).then((r) => r.json())
+    .then((r) => { shift = Number(r.ms) || 0; if (lyrics.id === s.id) lyrics.shift = shift; }).catch(() => {});
   try {
     const r = await rest("getLyricsBySongId", `id=${encodeURIComponent(s.id)}`);
     const synced = (r.lyricsList?.structuredLyrics || []).find((l) => l.synced && l.line?.length);
-    if (synced && queue[index]?.id === s.id) lyrics = { id: s.id, lines: synced.line.map((l) => ({ start: (l.start || 0) - (synced.offset || 0), value: l.value })) };
+    if (synced && queue[index]?.id === s.id) lyrics = { id: s.id, shift, lines: synced.line.map((l) => ({ start: (l.start || 0) - (synced.offset || 0), value: l.value })) };
   } catch {}
   if (lyrics.id === s.id) return;
   // Navidrome has none: Hermes Music looks the song up on LRCLIB
   try {
     const q = new URLSearchParams({ artist: s.artist, title: s.title, album: s.album || "", seconds: String(Math.round((s.duration || 0) / 1000)) });
     const r = await fetch(`/tv/lyrics?${q}`).then((x) => x.json());
-    if (r.lines?.length && queue[index]?.id === s.id) lyrics = { id: s.id, lines: r.lines };
+    if (r.lines?.length && queue[index]?.id === s.id) lyrics = { id: s.id, shift, lines: r.lines };
   } catch {}
 }
 $("b-lyrics").onclick = () => { showLyrics = !showLyrics; store.set("tv-lyrics", showLyrics); render(); };
@@ -618,6 +689,7 @@ async function poll() {
 }
 window.tvPulse = () => {
   tick();
+  syncVideo();
   if (Date.now() - lastPoll > 2500) poll();
   if (Date.now() - lastState > 15000 && session) { lastState = Date.now(); listen(); } // live connection gone quiet: open it again
 };
