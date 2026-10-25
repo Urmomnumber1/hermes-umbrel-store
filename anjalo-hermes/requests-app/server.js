@@ -2878,6 +2878,10 @@ function publicProfile(p, self = false) {
     video: online && !priv.hideListening ? !!p.video : false,
     position: online && !priv.hideListening ? p.position || 0 : 0, positionAt: p.positionAt || 0,
     group: online && !priv.hideListening ? p.group || null : null,
+    // listen along: who they follow, who follows them, and what they played lately
+    alongWith: online && !priv.hideListening ? p.alongWith || null : null,
+    riders: online ? Object.values(profiles).filter((o) => o.alongWith === p.id && Date.now() - (o.lastSeen || 0) < ONLINE_MS && !isInvisible(o)).map((o) => ({ id: o.id, name: o.name })) : [],
+    recentPlays: hidden || priv.hideListening ? [] : (p.recentPlays || []).slice(0, 30),
     custom: hidden ? { privacy: { private: true } } : p.custom || {},
     wall: hidden ? [] : (p.wall || []).slice(0, 30), nicknames: hidden ? [] : (p.nicknames || []).slice(0, 20),
     away: !online ? p.away || "" : "",
@@ -3346,7 +3350,13 @@ async function sourRoute(req, res, p, get, post, url) {
     const dev = clean1(b.device, 40) || "default";
     me.devices = me.devices && typeof me.devices === "object" ? me.devices : {};
     const before = me.devices[dev];
-    if (song && b.playing && (!before || !before.listening || before.listening.id !== song.id)) countPlay(me, song);
+    if (song && b.playing && (!before || !before.listening || before.listening.id !== song.id)) {
+      countPlay(me, song);
+      // the last songs played, for "play what they played earlier" (time-shifted listen along)
+      me.recentPlays = [{ song, at: now }, ...(me.recentPlays || []).filter((r) => r.song.id !== song.id)].slice(0, 30);
+    }
+    // who they're listening along with right now (friends see who is riding along)
+    me.alongWith = typeof b.alongWith === "string" && profiles[b.alongWith] ? b.alongWith : null;
     const speed = Math.min(2, Math.max(0.5, Number(b.speed) || 1));
     me.devices[dev] = { listening: song, playing: !!b.playing, position: Number(b.position) || 0, at: now, on: b.on === "phone" ? "phone" : "computer",
       speed, karaoke: !!b.karaoke, video: !!b.video };
@@ -3367,6 +3377,33 @@ async function sourRoute(req, res, p, get, post, url) {
     if (song) me.lastPlayback = { song, position: Number(b.position) || 0, at: now, device: clean1(b.device, 40) };
     profilesDirty = true;
     return send(res, 200, { ok: true });
+  }
+  if (p.startsWith("/api/along/")) { // listen along extras: chat, reactions, song requests and hand off between a listener and the friends riding along
+    const host = profiles[p.slice("/api/along/".length)];
+    if (!host) return send(res, 404, { error: "unknown profile" });
+    host.alongLog = host.alongLog || [];
+    if (get) {
+      const since = Number(url.searchParams.get("since")) || 0;
+      return send(res, 200, { messages: host.alongLog.filter((m) => m.at > since), serverNow: Date.now() });
+    }
+    if (!post) return send(res, 404, { error: "not found" });
+    const b = await readBody(req, 20000);
+    const me = ownProfile(String(b.profile || ""), b.key);
+    if (!me) return send(res, 403, { error: "set up your profile first" });
+    if (me.id !== host.id && me.alongWith !== host.id) return send(res, 403, { error: "listen along first" });
+    const kind = String(b.kind || "");
+    const msg = { id: crypto.randomUUID().slice(0, 8), kind, by: me.id, name: me.name, at: Date.now() };
+    if (kind === "chat") { msg.text = clean1(b.text, 300).trim(); if (!msg.text) return send(res, 400, { error: "say something" }); }
+    else if (kind === "react") { msg.emoji = oneEmoji(b.emoji); if (!msg.emoji) return send(res, 400, { error: "pick a reaction" }); }
+    else if (kind === "request") { msg.song = b.song ? groupSong(b.song) : null; if (!msg.song) return send(res, 400, { error: "pick a song" }); }
+    else if (kind === "handoff") {
+      if (me.id !== host.id) return send(res, 403, { error: "only who is being listened to can hand off" });
+      const to = profiles[String(b.target || "")];
+      if (!to || to.alongWith !== host.id) return send(res, 400, { error: "they aren't riding along" });
+      msg.target = to.id; msg.targetName = to.name;
+    } else return send(res, 400, { error: "unknown message" });
+    host.alongLog = [...host.alongLog.filter((m) => Date.now() - m.at < 3600000), msg].slice(-60);
+    return send(res, 200, { ok: true, message: msg });
   }
   if (get && p === "/api/leaderboard") { // this week: listening hours, requests, skip votes
     const w = groupStats.weeks[weekKey()] || { people: {} };
@@ -3764,7 +3801,7 @@ http.createServer(async (req, res) => {
   const p = url.pathname, get = req.method === "GET", post = req.method === "POST";
   const SOUR_ROUTES = ["/api/presence", "/api/leaderboard", "/api/song-of-the-day", "/api/group-top", "/api/milestones", "/api/follows"];
   const SOUR_PREFIXES = ["/api/sounds", "/api/profiles", "/api/playlist-themes", "/api/friend-group", "/api/activity", "/api/gifts", "/api/capsules", "/api/song-notes",
-    "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke", "/api/feedback"];
+    "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke", "/api/feedback", "/api/along/"];
   const isSour = SOUR_PREFIXES.some((x) => p.startsWith(x)) || SOUR_ROUTES.includes(p);
   if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/lyrics") || p.startsWith("/api/requests") || p.startsWith("/api/library") || p.startsWith("/api/duplicates") || isSour
     || ["/api/status", "/api/now", "/api/bump"].includes(p)) { // used by Sour Player (the custom Feishin)
