@@ -999,6 +999,7 @@ async function finishSong(raw, ext, meta, thumb) {
 }
 // Synced lyrics from LRCLIB (free, no account), saved as an .lrc file next to the song for Navidrome and Sour Player.
 // lyrics doctor: fetch synced lyrics for songs that have none, a few seconds apart (LRCLIB is free)
+const TRANSLATIONS = "/data/lyric-translations.json";
 const lyricsDoctor = { running: false, done: 0, found: 0 };
 async function runLyricsDoctor(files) {
   Object.assign(lyricsDoctor, { running: true, done: 0, found: 0 });
@@ -3380,6 +3381,13 @@ async function sourRoute(req, res, p, get, post, url) {
       countPlay(me, song);
       // the last songs played, for "play what they played earlier" (time-shifted listen along)
       me.recentPlays = [{ song, at: now }, ...(me.recentPlays || []).filter((r) => r.song.id !== song.id)].slice(0, 30);
+      // a few songs per day, for "On this day" (the same date in earlier months and years)
+      const dk = dayKey(now);
+      me.dayLog = me.dayLog || {};
+      const today = me.dayLog[dk] || [];
+      if (!today.some((x) => x.id === song.id) && today.length < 25) me.dayLog[dk] = [...today, song];
+      const logKeys = Object.keys(me.dayLog);
+      if (logKeys.length > 800) for (const k of logKeys.sort().slice(0, logKeys.length - 800)) delete me.dayLog[k];
     }
     // who they're listening along with right now (friends see who is riding along)
     me.alongWith = typeof b.alongWith === "string" && profiles[b.alongWith] ? b.alongWith : null;
@@ -3403,6 +3411,16 @@ async function sourRoute(req, res, p, get, post, url) {
     if (song) me.lastPlayback = { song, position: Number(b.position) || 0, at: now, device: clean1(b.device, 40) };
     profilesDirty = true;
     return send(res, 200, { ok: true });
+  }
+  if (get && (m = p.match(/^\/api\/profiles\/([\w-]+)\/on-this-day$/))) { // what they played on this date before
+    const prof = profiles[m[1]];
+    if (!prof) return send(res, 404, { error: "unknown profile" });
+    if (privacy(prof).private || privacy(prof).hideListening) return send(res, 200, []);
+    const today = dayKey(Date.now());
+    const md = today.slice(5);
+    const out = Object.entries(prof.dayLog || {}).filter(([k]) => k !== today && (k.slice(5) === md || k.slice(8) === today.slice(8)))
+      .sort((a, b) => b[0].localeCompare(a[0])).slice(0, 6).map(([day, songs]) => ({ day, songs: songs.slice(0, 12) }));
+    return send(res, 200, out);
   }
   if (p.startsWith("/api/along/")) { // listen along extras: chat, reactions, song requests and hand off between a listener and the friends riding along
     const host = profiles[p.slice("/api/along/".length)];
@@ -4398,6 +4416,30 @@ http.createServer(async (req, res) => {
     let disk = null;
     try { const st = fs.statfsSync(MUSIC); disk = { free: st.bavail * st.bsize, size: st.blocks * st.bsize }; } catch {}
     return send(res, 200, { total, files, disk, artists: [...byArtist.entries()].sort((x, y) => y[1] - x[1]).slice(0, 20).map(([artist, bytes]) => ({ artist, bytes })) });
+  }
+  if (post && p === "/api/lyrics/translate") { // the song's lyrics in another language, line by line
+    const b = await readBody(req, 200000);
+    const lines = (Array.isArray(b.lines) ? b.lines : []).map((x) => clean1(String(x), 300)).slice(0, 200);
+    const lang = clean1(b.lang, 30) || "English";
+    if (!lines.length) return send(res, 400, { error: "no lyrics to translate" });
+    const key = `${norm(b.artist || "")}|${norm(b.title || "")}|${lang.toLowerCase()}`;
+    const cache = readJson(TRANSLATIONS, {});
+    if (cache[key] && cache[key].length === lines.length) return send(res, 200, { lines: cache[key], cached: true });
+    if (!config.claudeToken) return send(res, 400, { error: "translating lyrics needs the Claude token (Hermes Music > Config)" });
+    try {
+      const r = await run("claude", ["-p", "--no-session-persistence", "--model", config.claudeModel, "--tools", ""],
+        { input: `Translate these song lyrics into ${lang}, line by line, keeping the meaning and feel. Keep empty lines empty and keep exactly ${lines.length} lines.
+Reply with ONE line of JSON and nothing else: {"lines":["...", ...]}
+
+${JSON.stringify(lines)}`, timeout: 180000, env: { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: config.claudeToken } });
+      const j = JSON.parse((r.out.match(/\{[\s\S]*\}/) || ["{}"])[0]);
+      const out = Array.isArray(j.lines) ? j.lines.map((x) => String(x)).slice(0, lines.length) : [];
+      if (!out.length) return send(res, 502, { error: "the translation didn't come back - try again" });
+      while (out.length < lines.length) out.push("");
+      cache[key] = out;
+      fs.writeFileSync(TRANSLATIONS, JSON.stringify(cache));
+      return send(res, 200, { lines: out });
+    } catch (e) { return send(res, 502, { error: `couldn't translate: ${e.message}` }); }
   }
   if (p === "/api/lyrics/doctor") { // songs without synced lyrics; POST fetches them in the background
     const missing = () => Object.keys(libCache).filter((f) => !fs.existsSync(f.replace(/\.[^.\/\\]+$/, ".lrc")));
