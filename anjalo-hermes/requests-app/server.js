@@ -2687,6 +2687,7 @@ function tvPartyOf(id) {
   for (const g of groups.values()) if (g.tv && !g.ended && g.tv.allowed.has(id)) return g;
   return null;
 }
+const V10_CUTOFF = '2026-10-26T00:00:00.000Z'; // Sour Player 0.10 release day
 function publicProfile(p, self = false) {
   const online = !isInvisible(p) && Date.now() - (p.lastSeen || 0) < ONLINE_MS;
   const priv = self ? {} : privacy(p);
@@ -2698,6 +2699,8 @@ function publicProfile(p, self = false) {
     favorites: hidden || priv.hideFavorites ? [] : p.favorites || [],
     online, lastSeen: hidden || priv.hideLastOnline ? null : isInvisible(p) && !self ? p.lastOfflineSeen || null : p.lastSeen || null,
     created: p.created,
+    // avatar decoration: everyone who had an account before Sour Player 0.10 gets the party hat
+    decoration: p.created && p.created < V10_CUTOFF ? 'party-hat' : null,
     listening: online && !priv.hideListening && p.listening ? p.listening : null, playing: online && !!p.playing,
     on: online && !priv.hideListening ? p.on || "computer" : null,
     speed: online && !priv.hideListening ? p.speed || 1 : 1, karaoke: online && !priv.hideListening ? !!p.karaoke : false,
