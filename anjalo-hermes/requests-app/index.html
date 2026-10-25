@@ -453,6 +453,11 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
       <div class="row"><label>Connection<small>save first, then test</small></label><button class="btn" id="c-ndtest" style="margin:0">Test</button><span id="ndmsg" class="sub2" style="margin:0"></span></div>
       <div class="row" style="align-items:flex-start"><label>People<small>make someone an admin (Navidrome admins already are) or remove them from Sour Player; needs the Current PIN below if one is set</small></label><div id="sourusers" class="ulist">loading...</div></div>
 
+      <div class="grp">&#9662; For everyone</div>
+      <div class="row" style="align-items:flex-start"><label for="c-ann">Announcement<small>shown once in everyone's Sour Player when you change it (blank = none)</small></label><textarea id="c-ann" rows="2" style="flex:1"></textarea></div>
+      <div class="row" style="align-items:flex-start"><label for="c-ban">Ban list<small>artists or songs that never download, one per line</small></label><textarea id="c-ban" rows="3" style="flex:1"></textarea></div>
+      <div class="row"><label>Backup<small>everything Sour Player keeps, in one file</small></label><button class="btn" id="c-backup" style="margin:0">Download backup</button></div>
+
       <div class="grp">&#9662; Queue</div>
       <div class="row"><label for="c-paused">Pause requests<small>worker skips the queue</small></label><input type="checkbox" id="c-paused"></div>
       <div class="row"><label for="c-rate">Requests per minute<small>per device, stops spam</small></label><input type="number" id="c-rate" min="1" max="30"></div>
@@ -846,6 +851,7 @@ function fillCfg() {
   $("c-spid").value = ""; $("c-spsec").value = ""; $("sphint").textContent = cfg.hasSpotify ? "keys are saved" : "not set";
   $("tokhint").textContent = cfg.hasToken ? "a token is saved" : "run: claude setup-token";
   $("c-aik").checked = cfg.aiKaraoke !== false;
+  $("c-ann").value = cfg.announcement || ""; $("c-ban").value = (cfg.banned || []).join("\n");
   $("aikhint").textContent = { ready: "ready", installing: "installing the AI tools...", failed: "couldn't install: " + (cfg.aiKaraokeNote || "") }[cfg.aiKaraokeState] || "splits vocals off songs with no instrumental on YouTube (Demucs, free, runs here; downloads about 1-2 GB the first time)";
   $("r-cur").style.display = cfg.hasPin ? "" : "none"; $("c-cur").value = ""; $("c-pin").value = "";
   showEngine();
@@ -861,7 +867,7 @@ $("c-save").onclick = async () => {
       spotifyClientId: $("c-spid").value.trim(), spotifySecret: $("c-spsec").value.trim(),
       navidromeUrl: $("c-ndurl").value,
       downtifyEnabled: $("c-dten").checked, downtifyUrl: $("c-dturl").value, downtifyUser: $("c-dtuser").value, downtifyPassword: $("c-dtpass").value, downtifyToken: $("c-dtcode").value.trim() === "-" ? "-" : undefined,
-      paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, claudeToken: $("c-token").value, aiKaraoke: $("c-aik").checked,
+      paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, claudeToken: $("c-token").value, aiKaraoke: $("c-aik").checked, announcement: $("c-ann").value, banned: $("c-ban").value,
       currentPin: $("c-cur").value, newPin: $("c-pin").value }) });
     fillCfg(); m.textContent = "saved"; render();
   } catch (err) { m.style.color = "#f87171"; m.textContent = err.message; }
@@ -956,4 +962,11 @@ $("a-login").onclick = async () => {
 };
 $("a-pinbtn").onclick = () => { if ($("a-pin").value) { sessionStorage.setItem("hermes-pin", $("a-pin").value); $("a-pin").value = ""; checkAdmin(); } };
 checkAdmin();
+
+$("c-backup").onclick = async () => {
+  const r = await fetch("api/admin/backup", { headers: ADMIN ? { "x-hermes-admin": ADMIN } : {} });
+  if (!r.ok) { alert("Sign in as an admin first"); return; }
+  const blob = await r.blob(); const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = "hermes-backup.json"; a.click();
+};
 </script></body></html>

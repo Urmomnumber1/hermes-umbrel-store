@@ -85,6 +85,10 @@ function updateConfig(b, ok) {
   if (["claude", "local", "both"].includes(b.engine)) next.engine = b.engine;
   if (["sonnet", "opus", "haiku"].includes(b.claudeModel)) next.claudeModel = b.claudeModel;
   if (typeof b.aiKaraoke === "boolean") next.aiKaraoke = b.aiKaraoke;
+  // artists or songs that never download (one per line)
+  if (typeof b.banned === "string") next.banned = b.banned.split(/\r?\n/).map((x) => x.trim()).filter(Boolean).slice(0, 200);
+  // a note for everyone in Sour Player (shown once per change)
+  if (typeof b.announcement === "string") { const a = b.announcement.trim().slice(0, 500); if (a !== (config.announcement || "")) { next.announcement = a; next.announcementAt = Date.now(); } }
   if (typeof b.claudeToken === "string" && b.claudeToken) next.claudeToken = secret(b.claudeToken);
   if (typeof b.localUrl === "string") {
     const u = b.localUrl.trim().replace(/\/+$/, "");
@@ -1592,6 +1596,8 @@ const nextItem = () => items.find((i) => i.status === "pending" && i.priority)
 
 async function processItem(item, w) {
   Object.assign(item, { status: "working", note: undefined, by: w.id }); save(); // claimed before any await, so the other worker skips it
+  const banned = (config.banned || []).find((x) => norm(item.query || "").includes(norm(x)));
+  if (banned) { Object.assign(item, { status: "failed", note: `"${banned}" is on the ban list (Config)` }); save(); return; }
   w.current = item.meta ? `${item.meta.artist} - ${item.meta.title}` : item.query;
   try {
     const type = item.type || "song";
@@ -1985,6 +1991,7 @@ function groupState(g) {
     tv: g.tv ? { event: g.tv.event, members: [...g.tv.allowed] } : null,
     mood: moodOf(g),
     game: gameState(g),
+    singers: g.singers || [],
     serverNow: nowMs(),
   };
 }
@@ -2090,7 +2097,7 @@ function baseGroup(fields) {
     encore: new Set(), encoreSong: null, marks: [], tokens: new Map(), approval: false, pending: [], blind: false,
     themeNight: null, roomTheme: "none", sounds: new Map(),
     // Sour Player 0.10: the mood dial and party games
-    moods: new Map(), game: null,
+    moods: new Map(), game: null, singers: [],
     session: { start: nowMs(), plays: new Map(), adders: new Map(), skips: 0, reactions: 0, people: new Set(), lastSong: null },
     ...fields,
   };
@@ -2362,6 +2369,17 @@ async function groupRoute(req, res, p, get, post, url) {
     if (cur && pos !== null) { g.marks.push({ songId: cur.id, position: pos, emoji, by: me.name }); g.marks = g.marks.slice(-200); broadcast(g); }
     g.session.reactions++;
     return send(res, 200, { ok: true });
+  }
+  if (action === "sing") { // karaoke night: sign up to sing next (or drop out, or the host moves on)
+    if (!me && !isHost) return send(res, 403, { error: "join the group first" });
+    const name = isHost ? g.hostName : me.name;
+    g.singers = g.singers || [];
+    if (b.next && isHost) g.singers.shift();
+    else if (g.singers.includes(name)) g.singers = g.singers.filter((x) => x !== name);
+    else g.singers.push(name);
+    g.singers = g.singers.slice(0, 30);
+    broadcast(g);
+    return send(res, 200, { singers: g.singers });
   }
   if (action === "sound") { // the soundboard: a short sound for everyone (one every few seconds each)
     if (!me) return send(res, 403, { error: "join the group first" });
@@ -2956,11 +2974,16 @@ const BUILTIN_ITEMS = [
   ["fx-snow", "effect", "Snowfall", 600, "winter"], ["fx-bats", "effect", "Bats", 600, "halloween"],
   // chat bubbles (Group Play and Listen Along chat)
   ["bubble-lemon", "bubble", "Lemon bubble", 300], ["bubble-neon", "bubble", "Neon bubble", 400], ["bubble-pixel", "bubble", "Pixel bubble", 400],
+  // sidebar skins (how your own sidebar looks)
+  ["sidebar-glass", "sidebar", "Glass sidebar", 500], ["sidebar-wood", "sidebar", "Wood sidebar", 500], ["sidebar-neon", "sidebar", "Neon sidebar", 600],
+  ["sidebar-pixel", "sidebar", "Pixel sidebar", 500],
 ].map(([id, slot, name, price, season]) => ({ id, slot, name, price, season: season || null }));
-const SHOP_SLOTS = ["decoration", "frame", "nameStyle", "banner", "effect", "bubble"];
+const SHOP_SLOTS = ["decoration", "frame", "nameStyle", "banner", "effect", "bubble", "sidebar"];
+// the group fund: a tenth of every purchase; when it's full everyone gets the fund's look
+const FUND_GOAL = 3000, FUND_ITEM = { id: "group-crown", slot: "decoration", name: "Group crown (from the group fund)", price: 0, season: null };
 const inSeason = (it) => !it.season || (SEASONS[it.season] || []).includes(new Date().getMonth() + 1);
 const shopItems = () => [...BUILTIN_ITEMS, ...shopData.items.map((x) => ({ ...x, custom: true }))];
-const shopItem = (id) => shopItems().find((x) => x.id === id);
+const shopItem = (id) => (id === FUND_ITEM.id ? FUND_ITEM : shopItems().find((x) => x.id === id));
 const saveShop = () => fs.writeFileSync(SHOP_FILE, JSON.stringify(shopData));
 // today's picks and today's sale (the same for everyone, changes at midnight)
 function shopToday() {
@@ -3846,7 +3869,7 @@ async function sourRoute(req, res, p, get, post, url) {
     if (get && p === "/api/shop") {
       const t = shopToday();
       return send(res, 200, { items: shopItems().map((it) => ({ id: it.id, slot: it.slot, name: it.name, price: it.price, now: priceOf(it), season: it.season, available: inSeason(it), custom: !!it.custom, v: it.v || 0 })),
-        featured: t.featured, sale: t.sale, cap: SHOP_DAILY_CAP });
+        featured: t.featured, sale: t.sale, cap: SHOP_DAILY_CAP, fund: { have: Math.min(social.fund || 0, FUND_GOAL), goal: FUND_GOAL, done: !!social.fundDone } });
     }
     if (get && (m = p.match(/^\/api\/shop\/items\/([\w-]+)\/image$/))) {
       const it = shopData.items.find((x) => x.id === m[1]);
@@ -3867,6 +3890,13 @@ async function sourRoute(req, res, p, get, post, url) {
       const price = priceOf(it);
       if (!spendPoints(me, price, to === me ? it.name : `${it.name} for ${to.name}`)) return send(res, 402, { error: `you need ${price - me.points.balance} more points` });
       to.owned.push(it.id);
+      social.fund = (social.fund || 0) + Math.round(price / 10);
+      if (social.fund >= FUND_GOAL && !social.fundDone) { // full: everyone gets the group crown
+        social.fundDone = Date.now();
+        for (const x of Object.values(profiles)) { wallet(x); if (!x.owned.includes(FUND_ITEM.id)) x.owned.push(FUND_ITEM.id); }
+        addActivity("fund", me, "filled the group fund - everyone got the Group crown", null);
+      }
+      socialDirty = true;
       if (to === me) me.lastBuy = { item: it.id, price, at: Date.now() };
       else to.shopGifts = [{ from: me.name, fromId: me.id, item: it.id, note: clean1(b.note, 200), at: Date.now() }, ...(to.shopGifts || [])].slice(0, 30);
       profilesDirty = true;
@@ -4351,7 +4381,7 @@ http.createServer(async (req, res) => {
     "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke", "/api/feedback", "/api/along/", "/api/shop", "/api/inbox", "/api/polls", "/api/daily-guess", "/api/album-club", "/api/hot-takes"];
   const isSour = SOUR_PREFIXES.some((x) => p.startsWith(x)) || SOUR_ROUTES.includes(p);
   if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/lyrics") || p.startsWith("/api/requests") || p.startsWith("/api/library") || p.startsWith("/api/duplicates") || isSour
-    || ["/api/status", "/api/now", "/api/bump", "/api/storage", "/api/song-dna"].includes(p)) { // used by Sour Player (the custom Feishin)
+    || ["/api/status", "/api/now", "/api/bump", "/api/storage", "/api/song-dna", "/api/announcement"].includes(p) || p.startsWith("/api/admin/")) { // used by Sour Player (the custom Feishin)
     res.setHeader("access-control-allow-origin", "*");
     if (req.method === "OPTIONS") {
       res.writeHead(204, { "access-control-allow-methods": "GET, POST", "access-control-allow-headers": "content-type", "access-control-max-age": "86400" });
@@ -4397,6 +4427,61 @@ http.createServer(async (req, res) => {
 <div><h2>Listen along with ${name}</h2><p><a style="color:#f4d03f" href="sourplayer://listen/${id}">Open Sour Player</a></p>
 <p style="opacity:.6">No Sour Player yet? <a style="color:#aaa" href="https://github.com/Urmomnumber1/feishin/releases/latest">Get it here</a></p></div>
 <script>location.href="sourplayer://listen/${id}"</script></body>`, "text/html; charset=utf-8");
+  }
+  if (get && /^\/overlay\/[\w-]+$/.test(p)) { // a now-playing card for streamers (OBS: add a Browser source with this address)
+    const id = p.split("/")[2];
+    return send(res, 200, `<!doctype html><meta charset="utf-8"><title>Sour Player overlay</title>
+<style>html,body{margin:0;background:transparent;font-family:system-ui,sans-serif;color:#fff}
+#c{display:none;align-items:center;gap:14px;padding:12px 16px;margin:10px;background:rgba(15,15,20,.78);border-radius:18px;width:max-content;max-width:560px;backdrop-filter:blur(8px)}
+#i{width:64px;height:64px;border-radius:10px;display:grid;place-items:center;font-size:36px;background:#f4d03f22}#t{font-weight:800;font-size:20px}#a{opacity:.75;font-size:15px}#by{font-size:11px;opacity:.5;margin-top:2px}</style>
+<div id="c"><div id="i">🍋</div><div><div id="t"></div><div id="a"></div><div id="by">Sour Player</div></div></div>
+<script>
+async function tick(){try{const r=await fetch("/api/profiles/${id}");const p=await r.json();const s=p.listening;const c=document.getElementById("c");
+if(!s||!p.playing){c.style.display="none";return}c.style.display="flex";document.getElementById("t").textContent=s.title;document.getElementById("a").textContent=s.artist;}catch{}}
+tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
+  }
+  if (get && p === "/invite") { // send this to a new friend: what Sour Player is and where to get it
+    const host = String(req.headers.host || "").replace(/[^\w.:-]/g, "");
+    return send(res, 200, `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Join us on Sour Player</title>
+<body style="font-family:system-ui;background:#151515;color:#eee;max-width:560px;margin:40px auto;padding:0 16px;line-height:1.5">
+<h1>🍋 Join us on Sour Player</h1><p>Sour Player is the music player our group uses: the same music library, Group Play, listening along with friends, and a lot more.</p>
+<ol><li>Ask an admin for a Navidrome account (your username and password).</li>
+<li>Download Sour Player: <a style="color:#f4d03f" href="https://github.com/Urmomnumber1/feishin/releases/latest">Windows, Mac or Linux</a>.</li>
+<li>Open it, add the music server with the address an admin gives you, and sign in.</li>
+<li>In Settings, set Hermes Music to <code>http://${host}</code>.</li></ol><p>See you in Group Play!</p></body>`, "text/html; charset=utf-8");
+  }
+  if (get && p === "/api/announcement") return send(res, 200, { text: config.announcement || "", at: config.announcementAt || 0 });
+  if (p.startsWith("/api/admin/") && p !== "/api/admin/login" && p !== "/api/admin/check") { // admins: overview, backup, restore
+    const b = post ? await readBody(req, 60000000) : {};
+    const prof = b.profile ? ownProfile(String(b.profile), b.key) : null;
+    if (!adminOk(b, req) && !(prof && isAdmin(prof))) return send(res, 403, { error: "admins only" });
+    if (p === "/api/admin/overview") {
+      const now = Date.now();
+      return send(res, 200, {
+        online: visibleProfiles().filter((x) => now - (x.lastSeen || 0) < ONLINE_MS).map((x) => ({ name: x.name, listening: x.listening ? `${x.listening.title} - ${x.listening.artist}` : null })),
+        people: visibleProfiles().length,
+        queue: items.filter((i) => i.status === "pending" || i.status === "working").length,
+        failedToday: items.filter((i) => i.status === "failed" && now - new Date(i.created).getTime() < 86400000).length,
+        workers: WORKERS.filter(workerEnabled).map((w) => ({ label: w.label, state: workerState(w), current: w.current, lastError: w.lastError })),
+        library: library.files, groups: groups.size, aiKaraoke: DEMUCS.state, version: process.env.HM_VERSION || null,
+      });
+    }
+    if (p === "/api/admin/backup") { // everything Sour Player keeps, as one file
+      const pack = {};
+      for (const f of [PROFILES, SOCIAL, SHOP_FILE, ROOMS, CFG, "/data/karaoke.json", "/data/lyric-offsets.json", "/data/video-misses.json"]) { try { pack[f] = fs.readFileSync(f, "utf8"); } catch {} }
+      return send(res, 200, { made: new Date().toISOString(), version: process.env.HM_VERSION || null, files: pack }, "application/json", { "content-disposition": `attachment; filename="hermes-backup-${dayKey()}.json"` });
+    }
+    if (p === "/api/admin/restore") { // put a backup back (Hermes restarts to load it)
+      const files = b.backup && b.backup.files;
+      const allowed = [PROFILES, SOCIAL, SHOP_FILE, ROOMS, CFG, "/data/karaoke.json", "/data/lyric-offsets.json", "/data/video-misses.json"];
+      if (!files || typeof files !== "object") return send(res, 400, { error: "that isn't a Hermes Music backup" });
+      let n = 0;
+      for (const [f, text] of Object.entries(files)) { if (!allowed.includes(f) || typeof text !== "string") continue; try { JSON.parse(text); fs.writeFileSync(f, text); n++; } catch {} }
+      send(res, 200, { restored: n, note: "Hermes Music restarts now to load it" });
+      setTimeout(() => process.exit(0), 800);
+      return;
+    }
+    return send(res, 404, { error: "not found" });
   }
   if (get && p === "/api/status") {
     const tops = items.filter((i) => !i.parent);
