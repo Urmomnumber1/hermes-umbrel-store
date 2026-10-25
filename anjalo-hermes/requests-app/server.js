@@ -998,6 +998,32 @@ async function finishSong(raw, ext, meta, thumb) {
   return null;
 }
 // Synced lyrics from LRCLIB (free, no account), saved as an .lrc file next to the song for Navidrome and Sour Player.
+// lyrics doctor: fetch synced lyrics for songs that have none, a few seconds apart (LRCLIB is free)
+const lyricsDoctor = { running: false, done: 0, found: 0 };
+async function runLyricsDoctor(files) {
+  Object.assign(lyricsDoctor, { running: true, done: 0, found: 0 });
+  for (const f of files) {
+    const c = libCache[f];
+    if (c && c.t) {
+      try { await saveLyrics(f, { artist: c.a, title: c.t, album: c.al }); } catch {}
+      if (fs.existsSync(f.replace(/\.[^.\/\\]+$/, ".lrc"))) lyricsDoctor.found++;
+    }
+    lyricsDoctor.done++;
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  lyricsDoctor.running = false;
+}
+// smart retries: a song that couldn't be found is tried again a week later (up to 4 times)
+setInterval(() => {
+  let changed = false;
+  const week = 7 * 86400000;
+  for (const it of items) {
+    if (it.parent || it.type !== "song" || it.status !== "failed" || (it.retries || 0) >= 4) continue;
+    if (!it.retryAt) { it.retryAt = Date.now() + week; changed = true; continue; }
+    if (Date.now() >= it.retryAt) { Object.assign(it, { status: "pending", note: undefined, retries: (it.retries || 0) + 1, retryAt: Date.now() + week }); changed = true; }
+  }
+  if (changed) { save(); wake(); }
+}, 6 * 3600 * 1000);
 async function saveLyrics(dest, meta) {
   if (config.lyrics === false) return;
   // the file's own length, not the catalogue's: lyrics are timed to one cut of a song
@@ -3804,7 +3830,7 @@ http.createServer(async (req, res) => {
     "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke", "/api/feedback", "/api/along/"];
   const isSour = SOUR_PREFIXES.some((x) => p.startsWith(x)) || SOUR_ROUTES.includes(p);
   if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/lyrics") || p.startsWith("/api/requests") || p.startsWith("/api/library") || p.startsWith("/api/duplicates") || isSour
-    || ["/api/status", "/api/now", "/api/bump"].includes(p)) { // used by Sour Player (the custom Feishin)
+    || ["/api/status", "/api/now", "/api/bump", "/api/storage"].includes(p)) { // used by Sour Player (the custom Feishin)
     res.setHeader("access-control-allow-origin", "*");
     if (req.method === "OPTIONS") {
       res.writeHead(204, { "access-control-allow-methods": "GET, POST", "access-control-allow-headers": "content-type", "access-control-max-age": "86400" });
@@ -4328,6 +4354,61 @@ http.createServer(async (req, res) => {
     it.votes = (it.votes || []).includes(me.id) ? it.votes.filter((x) => x !== me.id) : [...(it.votes || []), me.id];
     save();
     return send(res, 200, { votes: it.votes.length });
+  }
+  // ---- Sour Player 0.10 request extras ----
+  if (get && p === "/api/requests/wishlist") { // songs Hermes couldn't find yet: tried again every week (4 tries)
+    return send(res, 200, items.filter((i) => !i.parent && i.status === "failed" && (i.retries || 0) < 4 && i.type === "song")
+      .slice(-100).reverse().map(({ id, query, note, created, retries, retryAt, askedBy }) => ({ id, query, note, created, retries: retries || 0, retryAt: retryAt || null, by: askedBy })));
+  }
+  if (post && (m = p.match(/^\/api\/requests\/([\w-]+)\/retry$/))) { // try a failed request again now
+    const it = items.find((i) => i.id === m[1] && i.status === "failed");
+    if (!it) return send(res, 404, { error: "that request isn't waiting for a retry" });
+    Object.assign(it, { status: "pending", note: undefined, retries: (it.retries || 0) + 1 });
+    save(); wake();
+    return send(res, 200, { queued: true });
+  }
+  if (get && p === "/api/requests/history") { // everything one person asked for
+    const who = url.searchParams.get("profile") || "";
+    return send(res, 200, items.filter((i) => !i.parent && i.profile === who).slice(-300).reverse()
+      .map(({ id, type, query, status, title, artist, created, note }) => ({ id, type: type || "song", query, status, title, artist, created, note })));
+  }
+  if (post && p === "/api/requests/bundle") { // a list of songs (one per line), or an album to complete, in one go
+    const b = await readBody(req, 100000);
+    const lines = (Array.isArray(b.lines) ? b.lines : String(b.text || "").split(/\r?\n/)).map((x) => String(x).trim().slice(0, 200)).filter((x) => x.length >= 2).slice(0, 100);
+    if (!lines.length) return send(res, 400, { error: "add at least one song" });
+    const created = new Date().toISOString();
+    const type = b.type === "album" ? "album" : "song";
+    for (const q of lines) {
+      const item = { id: newId(), type, query: q, status: "pending", created };
+      if (b.by) item.askedBy = String(b.by).slice(0, 40);
+      if (typeof b.profile === "string" && profiles[b.profile]) { item.profile = b.profile; sourStat(b.profile, "requests", 1); }
+      items.push(item);
+    }
+    save(); wake();
+    return send(res, 201, { queued: lines.length });
+  }
+  if (get && p === "/api/storage") { // how much room the library takes and who/what takes the most
+    const byArtist = new Map(); let total = 0, files = 0;
+    for (const file of Object.keys(libCache)) {
+      let size = 0; try { size = fs.statSync(file).size; } catch { continue; }
+      total += size; files++;
+      const c = libCache[file]; const a = c.aa || c.a || "Unknown";
+      byArtist.set(a, (byArtist.get(a) || 0) + size);
+    }
+    let disk = null;
+    try { const st = fs.statfsSync(MUSIC); disk = { free: st.bavail * st.bsize, size: st.blocks * st.bsize }; } catch {}
+    return send(res, 200, { total, files, disk, artists: [...byArtist.entries()].sort((x, y) => y[1] - x[1]).slice(0, 20).map(([artist, bytes]) => ({ artist, bytes })) });
+  }
+  if (p === "/api/lyrics/doctor") { // songs without synced lyrics; POST fetches them in the background
+    const missing = () => Object.keys(libCache).filter((f) => !fs.existsSync(f.replace(/\.[^.\/\\]+$/, ".lrc")));
+    if (get) {
+      const list = missing();
+      return send(res, 200, { missing: list.length, running: lyricsDoctor.running, done: lyricsDoctor.done, found: lyricsDoctor.found,
+        sample: list.slice(0, 50).map((f) => ({ artist: libCache[f].a, title: libCache[f].t || path.basename(f) })) });
+    }
+    if (!post) return send(res, 404, { error: "not found" });
+    if (!lyricsDoctor.running) runLyricsDoctor(missing().slice(0, 2000));
+    return send(res, 200, { started: true });
   }
   if (post && p === "/api/requests/screenshot") { // a screenshot of a playlist: Claude reads the songs, they're all queued
     const b = await readBody(req, 12000000);
