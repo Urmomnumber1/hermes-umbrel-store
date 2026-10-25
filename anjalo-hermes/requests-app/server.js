@@ -76,6 +76,7 @@ function updateConfig(b) {
   if (["claude", "local", "both"].includes(b.engine)) next.engine = b.engine;
   if (["sonnet", "opus", "haiku"].includes(b.claudeModel)) next.claudeModel = b.claudeModel;
   if (typeof b.claudeToken === "string" && b.claudeToken) next.claudeToken = secret(b.claudeToken);
+  if (typeof b.auddToken === "string" && b.auddToken) next.auddToken = secret(b.auddToken);
   if (typeof b.localUrl === "string") {
     const u = b.localUrl.trim().replace(/\/+$/, "");
     if (u && !/^https?:\/\/\S{1,200}$/.test(u)) return "base URL must start with http:// or https://";
@@ -127,8 +128,8 @@ function updateConfig(b) {
 }
 // What the page may see: never the PIN or secrets.
 const publicConfig = () => {
-  const { pin, localKey, claudeToken, downtifyPassword, downtifyToken, spotifyClientId, spotifySecret, ...rest } = config; // spotify*: left over from 2.2.0 configs
-  return { ...rest, hasPin: !!pin, hasKey: !!localKey, hasToken: !!claudeToken, hasDowntifyPassword: !!downtifyPassword, downtifyPaired: !!downtifyToken,
+  const { pin, localKey, claudeToken, auddToken, downtifyPassword, downtifyToken, spotifyClientId, spotifySecret, ...rest } = config; // spotify*: left over from 2.2.0 configs
+  return { ...rest, hasPin: !!pin, hasKey: !!localKey, hasToken: !!claudeToken, hasAudd: !!auddToken, hasDowntifyPassword: !!downtifyPassword, downtifyPaired: !!downtifyToken,
     hasYtCookies: fs.existsSync(YT_COOKIES), hasSpotify: !!(spotifyClientId && spotifySecret) };
 };
 // YouTube sometimes answers "Sign in to confirm you're not a bot". yt-dlp's own answer is to sign in: a
@@ -1451,6 +1452,15 @@ async function processItem(item, w) {
     const result = type === "album" ? await expandAlbum(item) : type === "artist" ? await expandArtist(item)
       : type === "playlist" ? await expandPlaylist(item) : type === "karaoke" ? await processKaraoke(item) : await processSong(item);
     Object.assign(item, result);
+    if (item.group && (item.status === "done" || item.status === "failed")) {
+      const g = groups.get(item.group);
+      if (g && !g.ended) {
+        g.chat.push({ id: crypto.randomUUID().slice(0, 8), by: "Hermes Music", profile: null, at: nowMs(),
+          text: item.status === "done" ? `${item.title || item.query} is in the library now${item.askedBy ? ` (asked by ${item.askedBy})` : ""}` : `Couldn't find ${item.query}`});
+        g.chat = g.chat.slice(-100);
+        broadcast(g);
+      }
+    }
   } catch (e) {
     w.lastError = e.message;
     // a folder another app made that Hermes may not write into: say so (restarting Hermes fixes it)
@@ -3063,7 +3073,8 @@ async function socialRoute(req, res, p, get, post, url) {
     else {
       const text = clean1(b.text, 200).trim();
       if (!text) return send(res, 400, { error: "write something" }), true;
-      social.notes[songId] = [{ id: sid(), from: me.id, fromName: me.name, text, at: Date.now() }, ...list].slice(0, 20);
+      const position = Number.isFinite(b.position) && b.position >= 0 ? Math.round(b.position * 10) / 10 : undefined;
+      social.notes[songId] = [{ id: sid(), from: me.id, fromName: me.name, text, at: Date.now(), position }, ...list].slice(0, 20);
     }
     if (!social.notes[songId].length) delete social.notes[songId];
     socialDirty = true;
@@ -3848,7 +3859,7 @@ http.createServer(async (req, res) => {
     "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke", "/api/feedback", "/api/along/"];
   const isSour = SOUR_PREFIXES.some((x) => p.startsWith(x)) || SOUR_ROUTES.includes(p);
   if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/lyrics") || p.startsWith("/api/requests") || p.startsWith("/api/library") || p.startsWith("/api/duplicates") || isSour
-    || ["/api/status", "/api/now", "/api/bump", "/api/storage"].includes(p)) { // used by Sour Player (the custom Feishin)
+    || ["/api/status", "/api/now", "/api/bump", "/api/storage", "/api/song-dna"].includes(p)) { // used by Sour Player (the custom Feishin)
     res.setHeader("access-control-allow-origin", "*");
     if (req.method === "OPTIONS") {
       res.writeHead(204, { "access-control-allow-methods": "GET, POST", "access-control-allow-headers": "content-type", "access-control-max-age": "86400" });
@@ -3884,6 +3895,16 @@ http.createServer(async (req, res) => {
     } catch {
       return send(res, 502, { error: "GitHub didn't answer, try again in a minute" });
     }
+  }
+  if (get && /^\/listen\/[\w-]+$/.test(p)) { // Discord's "Listen along" button: opens Sour Player on this computer
+    const id = p.split("/")[2];
+    const prof = profiles[id];
+    const name = prof ? String(prof.name).replace(/[<>&"]/g, "") : "a friend";
+    return send(res, 200, `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Listen along with ${name}</title>
+<body style="font-family:system-ui;background:#151515;color:#eee;display:grid;place-items:center;height:100vh;margin:0;text-align:center">
+<div><h2>Listen along with ${name}</h2><p><a style="color:#f4d03f" href="sourplayer://listen/${id}">Open Sour Player</a></p>
+<p style="opacity:.6">No Sour Player yet? <a style="color:#aaa" href="https://github.com/Urmomnumber1/feishin/releases/latest">Get it here</a></p></div>
+<script>location.href="sourplayer://listen/${id}"</script></body>`, "text/html; charset=utf-8");
   }
   if (get && p === "/api/status") {
     const tops = items.filter((i) => !i.parent);
@@ -4374,6 +4395,60 @@ http.createServer(async (req, res) => {
     return send(res, 200, { votes: it.votes.length });
   }
   // ---- Sour Player 0.10 request extras ----
+  if (get && p === "/api/song-dna") { // everything Sour Player knows about one song: who plays it, since when, who loves it, notes
+    const id = url.searchParams.get("id") || "", artist = url.searchParams.get("artist") || "", title = url.searchParams.get("title") || "";
+    const out = { plays: 0, listeners: [], lovedBy: [], firstHeard: null, notes: (social.notes && social.notes[id]) ? social.notes[id].length : 0, weekPlays: 0, inLibrary: inLibrary(artist, title) };
+    for (const prof of visibleProfiles()) {
+      if (privacy(prof).private || privacy(prof).hideStats) continue;
+      const s = prof.stats && prof.stats.songs && prof.stats.songs[id];
+      if (s) { out.plays += s.n || 0; out.listeners.push({ name: prof.name, plays: s.n || 0 }); }
+      if ((prof.favorites || []).some((f) => f.id === id)) out.lovedBy.push(prof.name);
+      for (const [day, songs] of Object.entries(prof.dayLog || {})) if (songs.some((x) => x.id === id) && (!out.firstHeard || day < out.firstHeard)) out.firstHeard = day;
+    }
+    const w = groupStats.weeks[weekKey()];
+    if (w && w.songs && w.songs[id]) out.weekPlays = w.songs[id].n || 0;
+    out.listeners.sort((a, b) => b.plays - a.plays);
+    return send(res, 200, out);
+  }
+  if (get && p === "/api/duplicates/preview") { // listen to a duplicate before removing it
+    const rel = url.searchParams.get("path") || "";
+    const file = path.resolve(MUSIC, rel);
+    if (!file.startsWith(path.resolve(MUSIC) + path.sep) || !AUDIO.test(file) || !fs.existsSync(file)) return send(res, 404, { error: "not found" });
+    const st = fs.statSync(file);
+    const type = /\.flac$/i.test(file) ? "audio/flac" : /\.(m4a|aac|alac)$/i.test(file) ? "audio/mp4" : /\.(ogg|oga|opus)$/i.test(file) ? "audio/ogg" : "audio/mpeg";
+    const range = /bytes=(\d*)-(\d*)/.exec(req.headers.range || "");
+    if (range) {
+      const start = Number(range[1]) || 0, end = range[2] ? Math.min(Number(range[2]), st.size - 1) : st.size - 1;
+      res.writeHead(206, { "content-type": type, "content-range": `bytes ${start}-${end}/${st.size}`, "accept-ranges": "bytes", "content-length": end - start + 1 });
+      return fs.createReadStream(file, { start, end }).pipe(res);
+    }
+    res.writeHead(200, { "content-type": type, "content-length": st.size, "accept-ranges": "bytes" });
+    return fs.createReadStream(file).pipe(res);
+  }
+  if (post && p === "/api/requests/hum") { // hum or sing a bit: AudD names the song, then it's requested
+    const b = await readBody(req, 4000000);
+    if (!config.auddToken) return send(res, 400, { error: "humming search needs an AudD token (Hermes Music > Config)" });
+    const m2 = /^data:(audio\/[\w.+-]+)(;[^,]*)?;base64,(.+)$/.exec(String(b.audio || ""));
+    if (!m2) return send(res, 400, { error: "no recording" });
+    try {
+      const form = new FormData();
+      form.append("api_token", config.auddToken);
+      form.append("file", new Blob([Buffer.from(m2[3], "base64")], { type: m2[1] }), "hum.webm");
+      const r = await fetch("https://api.audd.io/recognizeWithOffset/", { method: "POST", body: form, signal: AbortSignal.timeout(30000) });
+      const j = await r.json();
+      const list = (j.result && j.result.list) || (j.result && j.result.title ? [j.result] : []);
+      const top = list[0];
+      if (!top) return send(res, 404, { error: "couldn't tell which song that is - try humming the chorus" });
+      const guess = { artist: top.artist || "", title: top.title || "", score: top.score || null };
+      if (b.request) {
+        const item = { id: newId(), type: "song", query: `${guess.artist} - ${guess.title}`, status: "pending", created: new Date().toISOString() };
+        if (b.by) item.askedBy = String(b.by).slice(0, 40);
+        if (typeof b.profile === "string" && profiles[b.profile]) { item.profile = b.profile; sourStat(b.profile, "requests", 1); }
+        items.push(item); save(); wake();
+      }
+      return send(res, 200, { ...guess, inLibrary: inLibrary(guess.artist, guess.title), requested: !!b.request });
+    } catch (e) { return send(res, 502, { error: `AudD didn't answer: ${e.message}` }); }
+  }
   if (get && p === "/api/requests/wishlist") { // songs Hermes couldn't find yet: tried again every week (4 tries)
     return send(res, 200, items.filter((i) => !i.parent && i.status === "failed" && (i.retries || 0) < 4 && i.type === "song")
       .slice(-100).reverse().map(({ id, query, note, created, retries, retryAt, askedBy }) => ({ id, query, note, created, retries: retries || 0, retryAt: retryAt || null, by: askedBy })));
@@ -4489,6 +4564,7 @@ Reply with ONE line of JSON and nothing else: {"songs":["Artist - Title", ...]} 
     if (q.length < 2) return send(res, 400, { error: `Enter ${type === "song" || type === "karaoke" ? "a song" : type === "album" ? "an album" : "an artist"} name` });
     const item = { id: newId(), type, query: q, status: "pending", created: new Date().toISOString() };
     if (b.by) item.askedBy = String(b.by).slice(0, 40); // name of who asked (from Sour Player)
+    if (typeof b.group === "string" && groups.has(b.group)) item.group = b.group; // asked from inside Group Play
     if (typeof b.profile === "string" && profiles[b.profile]) { item.profile = b.profile; sourStat(b.profile, "requests", 1); }
     if (SPOTIFY_USER.test(q) || (YT_CHANNEL.test(q) && !YT_PLAYLIST.test(q) && !/watch\?/.test(q))) { // a whole profile
       try {

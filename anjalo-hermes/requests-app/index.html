@@ -152,7 +152,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             <div id="sess">Session: -</div>
           </div>
           <div class="rt">
-            <h2>Hermes Music v3.10.0</h2>
+            <h2>Hermes Music v3.10.1</h2>
             <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
             <div class="sec"><span class="k">&#9662; Workers</span><br><span id="w-worker" class="d">-</span></div>
             <div class="sec"><span class="k">&#9662; Library</span><br><span class="d" id="w-lib">-</span></div>
@@ -398,6 +398,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
           <select id="c-cmodel"><option value="sonnet">Sonnet</option><option value="opus">Opus</option><option value="haiku">Haiku</option></select></div>
         <div class="row"><label for="c-token">Claude token<small id="tokhint">run: claude setup-token</small></label><input type="password" id="c-token" placeholder="blank = keep, - = remove" autocomplete="off"></div>
       </div>
+      <div class="row"><label for="c-audd">AudD token<small id="auddhint">for humming search in Sour Player (audd.io)</small></label><input type="password" id="c-audd" placeholder="blank = keep, - = remove" autocomplete="off"></div>
       <div id="g-local">
         <div class="row"><label for="c-url">Base URL<small>Ollama, llama.cpp, LM Studio...</small></label><input type="text" id="c-url" placeholder="http://umbrel.local:11434/v1" spellcheck="false"></div>
         <div class="row"><label for="c-lmodel">Model name<small>as your server names it</small></label><input type="text" id="c-lmodel" placeholder="qwen3.8:27b" spellcheck="false"></div>
@@ -829,6 +830,7 @@ function fillCfg() {
   $("c-singles").checked = cfg.includeSingles; $("c-token").value = "";
   $("c-spid").value = ""; $("c-spsec").value = ""; $("sphint").textContent = cfg.hasSpotify ? "keys are saved" : "not set";
   $("tokhint").textContent = cfg.hasToken ? "a token is saved" : "run: claude setup-token";
+  $("auddhint").textContent = cfg.hasAudd ? "a token is saved" : "for humming search in Sour Player (audd.io)";
   $("r-cur").style.display = cfg.hasPin ? "" : "none"; $("c-cur").value = ""; $("c-pin").value = "";
   showEngine();
 }
@@ -843,7 +845,7 @@ $("c-save").onclick = async () => {
       spotifyClientId: $("c-spid").value.trim(), spotifySecret: $("c-spsec").value.trim(),
       navidromeUrl: $("c-ndurl").value,
       downtifyEnabled: $("c-dten").checked, downtifyUrl: $("c-dturl").value, downtifyUser: $("c-dtuser").value, downtifyPassword: $("c-dtpass").value, downtifyToken: $("c-dtcode").value.trim() === "-" ? "-" : undefined,
-      paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, claudeToken: $("c-token").value,
+      paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, claudeToken: $("c-token").value, auddToken: $("c-audd").value,
       currentPin: $("c-cur").value, newPin: $("c-pin").value }) });
     fillCfg(); m.textContent = "saved"; render();
   } catch (err) { m.style.color = "#f87171"; m.textContent = err.message; }
