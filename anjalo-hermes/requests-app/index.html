@@ -456,6 +456,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
       <div class="grp">&#9662; For everyone</div>
       <div class="row" style="align-items:flex-start"><label for="c-ann">Announcement<small>shown once in everyone's Sour Player when you change it (blank = none)</small></label><textarea id="c-ann" rows="2" style="flex:1"></textarea></div>
       <div class="row" style="align-items:flex-start"><label for="c-ban">Ban list<small>artists or songs that never download, one per line</small></label><textarea id="c-ban" rows="3" style="flex:1"></textarea></div>
+      <div class="row"><label for="c-appr">Approve big requests<small>whole artists and playlists wait for an admin's yes (Sour Library &gt; Tools &gt; Admin)</small></label><input type="checkbox" id="c-appr"></div>
       <div class="row"><label>Backup<small>everything Sour Player keeps, in one file</small></label><button class="btn" id="c-backup" style="margin:0">Download backup</button></div>
 
       <div class="grp">&#9662; Queue</div>
@@ -851,7 +852,7 @@ function fillCfg() {
   $("c-spid").value = ""; $("c-spsec").value = ""; $("sphint").textContent = cfg.hasSpotify ? "keys are saved" : "not set";
   $("tokhint").textContent = cfg.hasToken ? "a token is saved" : "run: claude setup-token";
   $("c-aik").checked = cfg.aiKaraoke !== false;
-  $("c-ann").value = cfg.announcement || ""; $("c-ban").value = (cfg.banned || []).join("\n");
+  $("c-appr").checked = !!cfg.approveBig; $("c-ann").value = cfg.announcement || ""; $("c-ban").value = (cfg.banned || []).join("\n");
   $("aikhint").textContent = { ready: "ready", installing: "installing the AI tools...", failed: "couldn't install: " + (cfg.aiKaraokeNote || "") }[cfg.aiKaraokeState] || "splits vocals off songs with no instrumental on YouTube (Demucs, free, runs here; downloads about 1-2 GB the first time)";
   $("r-cur").style.display = cfg.hasPin ? "" : "none"; $("c-cur").value = ""; $("c-pin").value = "";
   showEngine();
@@ -867,7 +868,7 @@ $("c-save").onclick = async () => {
       spotifyClientId: $("c-spid").value.trim(), spotifySecret: $("c-spsec").value.trim(),
       navidromeUrl: $("c-ndurl").value,
       downtifyEnabled: $("c-dten").checked, downtifyUrl: $("c-dturl").value, downtifyUser: $("c-dtuser").value, downtifyPassword: $("c-dtpass").value, downtifyToken: $("c-dtcode").value.trim() === "-" ? "-" : undefined,
-      paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, claudeToken: $("c-token").value, aiKaraoke: $("c-aik").checked, announcement: $("c-ann").value, banned: $("c-ban").value,
+      paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, claudeToken: $("c-token").value, aiKaraoke: $("c-aik").checked, announcement: $("c-ann").value, banned: $("c-ban").value, approveBig: $("c-appr").checked,
       currentPin: $("c-cur").value, newPin: $("c-pin").value }) });
     fillCfg(); m.textContent = "saved"; render();
   } catch (err) { m.style.color = "#f87171"; m.textContent = err.message; }

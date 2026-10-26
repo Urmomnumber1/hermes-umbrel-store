@@ -85,6 +85,7 @@ function updateConfig(b, ok) {
   if (["claude", "local", "both"].includes(b.engine)) next.engine = b.engine;
   if (["sonnet", "opus", "haiku"].includes(b.claudeModel)) next.claudeModel = b.claudeModel;
   if (typeof b.aiKaraoke === "boolean") next.aiKaraoke = b.aiKaraoke;
+  if (typeof b.approveBig === "boolean") next.approveBig = b.approveBig;
   // artists or songs that never download (one per line)
   if (typeof b.banned === "string") next.banned = b.banned.split(/\r?\n/).map((x) => x.trim()).filter(Boolean).slice(0, 200);
   // a note for everyone in Sour Player (shown once per change)
@@ -2994,7 +2995,8 @@ function shopToday() {
   for (let i = 0; i < Math.min(6, pool.length); i++) { h = (h * 1103515245 + 12345) >>> 0; const it = pool[h % pool.length]; if (!picks.includes(it.id)) picks.push(it.id); }
   return { day, featured: picks, sale: picks[0] || null };
 }
-const priceOf = (it) => (shopToday().sale === it.id ? Math.round(it.price * 0.7) : it.price);
+const priceDropped = (it) => { const last = (social.lastBought || {})[it.id] || social.shopSince || 0; return !!last && Date.now() - last > 14 * 86400000; };
+const priceOf = (it) => (shopToday().sale === it.id ? Math.round(it.price * 0.7) : priceDropped(it) ? Math.round(it.price * 0.8) : it.price);
 function wallet(p) {
   p.points = p.points && typeof p.points === "object" ? p.points : { balance: 0, today: { day: "", n: 0 }, log: [] };
   p.owned = Array.isArray(p.owned) ? p.owned : [];
@@ -3020,6 +3022,47 @@ function spendPoints(p, n, why) {
   w.log = [{ n: -n, why, at: Date.now() }, ...w.log].slice(0, 60);
   profilesDirty = true;
   return true;
+}
+
+// ---- Sour Player 0.10.5 ----
+// admin activity log: covers, tags, video picks, lyrics timing, config, shop items, restores, approvals
+const ADMIN_LOG = "/data/admin-log.json";
+let adminLogList = readJsonEarly(ADMIN_LOG);
+if (!Array.isArray(adminLogList)) adminLogList = [];
+function adminLog(kind, text, by) {
+  adminLogList = [{ kind, text: String(text).slice(0, 200), by: by ? String(by).slice(0, 40) : null, at: Date.now() }, ...adminLogList].slice(0, 400);
+  fs.promises.writeFile(ADMIN_LOG, JSON.stringify(adminLogList)).catch(() => {});
+}
+// album liner notes from MusicBrainz (free, one request a second at most), kept a week
+const linerCache = new Map();
+let mbLast = 0;
+async function mb(pathq) {
+  const wait = Math.max(0, mbLast + 1100 - Date.now());
+  if (wait) await new Promise((r) => setTimeout(r, wait));
+  mbLast = Date.now();
+  const r = await fetch(`https://musicbrainz.org/ws/2/${pathq}`, { headers: { "user-agent": "HermesMusic/3.10 (Umbrel; github.com/Urmomnumber1/hermes-umbrel-store)" }, signal: AbortSignal.timeout(15000) });
+  if (!r.ok) throw new Error(`MusicBrainz ${r.status}`);
+  return r.json();
+}
+async function linerNotes(artist, album) {
+  const key = `${norm(artist)}|${norm(album)}`;
+  const hit = linerCache.get(key);
+  if (hit && Date.now() - hit.at < 7 * 86400000) return hit.data;
+  const q = `release:"${album.replace(/"/g, "")}" AND artist:"${artist.replace(/"/g, "")}"`;
+  const found = await mb(`release/?query=${encodeURIComponent(q)}&fmt=json&limit=1`);
+  const rel = found.releases && found.releases[0];
+  if (!rel) { linerCache.set(key, { at: Date.now(), data: null }); return null; }
+  const d = await mb(`release/${rel.id}?inc=recordings+artist-credits+labels+recording-level-rels+artist-rels&fmt=json`);
+  const credits = (rels) => (rels || []).filter((x) => x.artist).map((x) => ({ role: x.type + (x.attributes && x.attributes.length ? ` (${x.attributes.join(", ")})` : ""), name: x.artist.name }));
+  const data = {
+    title: d.title, date: d.date || null, country: d.country || null,
+    label: (d["label-info"] || []).map((l) => l.label && l.label.name).filter(Boolean).join(", ") || null,
+    credits: credits(d.relations),
+    tracks: (d.media || []).flatMap((m) => (m.tracks || []).map((t) => ({ n: t.position, title: t.title, credits: credits(t.recording && t.recording.relations) }))),
+    link: `https://musicbrainz.org/release/${rel.id}`,
+  };
+  linerCache.set(key, { at: Date.now(), data });
+  return data;
 }
 const isAdmin = (p) => !!p && !p.mergedInto && !!(p.admin || p.adminManual);
 // Gavin's own extras: his Navidrome account or profile name is Gavin
@@ -3665,6 +3708,15 @@ async function sourRoute(req, res, p, get, post, url) {
       if (!me.week || me.week.key !== wk) me.week = { key: wk, songs: {} };
       const ws = (me.week.songs[song.id] ??= { song, n: 0 }); ws.n++;
       me.week.songs = trimCounts(me.week.songs, 60);
+      // predictions about this person's next artist
+      if (Array.isArray(social.predictions)) for (const pr of social.predictions) {
+        if (pr.friend !== me.id || pr.result || pr.after === song.id) continue;
+        const right = primaryArtist(song.artist) === primaryArtist(pr.artist) || norm(song.artist).includes(norm(pr.artist));
+        pr.result = right ? "right" : "wrong"; pr.actual = song.artist;
+        const by = profiles[pr.by];
+        if (right && by) { addPoints(by, 15, `guessed ${me.name} would play ${song.artist}`); addActivity("predict", by, `called it: ${me.name} played ${song.artist} next`, song); }
+        socialDirty = true;
+      }
       // the last songs played, for "play what they played earlier" (time-shifted listen along)
       me.recentPlays = [{ song, at: now }, ...(me.recentPlays || []).filter((r) => r.song.id !== song.id)].slice(0, 30);
       // a few songs per day, for "On this day" (the same date in earlier months and years)
@@ -3865,11 +3917,30 @@ async function sourRoute(req, res, p, get, post, url) {
     socialDirty = true;
     return send(res, 200, { reactions: a.reactions });
   }
+  if (p === "/api/predict") { // guess the artist a friend plays next; right guesses earn points
+    social.predictions = Array.isArray(social.predictions) ? social.predictions : [];
+    if (get) {
+      const who = url.searchParams.get("profile") || "";
+      return send(res, 200, social.predictions.filter((x) => x.by === who).slice(0, 20));
+    }
+    if (!post) return send(res, 404, { error: "not found" });
+    const b = await readBody(req, 3000);
+    const me = ownProfile(String(b.profile || ""), b.key);
+    if (!me) return send(res, 403, { error: "set up your profile first" });
+    const friend = profiles[String(b.friend || "")];
+    const artist = clean1(b.artist, 100).trim();
+    if (!friend || friend.id === me.id || !artist) return send(res, 400, { error: "pick a friend and an artist" });
+    if (social.predictions.some((x) => x.by === me.id && x.friend === friend.id && !x.result)) return send(res, 409, { error: `you already have a guess for ${friend.name}` });
+    social.predictions = [{ id: sid(), by: me.id, byName: me.name, friend: friend.id, friendName: friend.name, artist, at: Date.now(), after: friend.listening ? friend.listening.id : null, result: null }, ...social.predictions].slice(0, 300);
+    socialDirty = true;
+    return send(res, 200, { ok: true });
+  }
   if (p === "/api/shop" || p.startsWith("/api/shop/")) { // the Sour Shop
     if (get && p === "/api/shop") {
+      if (!social.shopSince) { social.shopSince = Date.now(); socialDirty = true; } // price drops count from here
       const t = shopToday();
       return send(res, 200, { items: shopItems().map((it) => ({ id: it.id, slot: it.slot, name: it.name, price: it.price, now: priceOf(it), season: it.season, available: inSeason(it), custom: !!it.custom, v: it.v || 0 })),
-        featured: t.featured, sale: t.sale, cap: SHOP_DAILY_CAP, fund: { have: Math.min(social.fund || 0, FUND_GOAL), goal: FUND_GOAL, done: !!social.fundDone } });
+        featured: t.featured, sale: t.sale, cap: SHOP_DAILY_CAP, dropped: shopItems().filter((x) => priceDropped(x)).map((x) => x.id), fund: { have: Math.min(social.fund || 0, FUND_GOAL), goal: FUND_GOAL, done: !!social.fundDone } });
     }
     if (get && (m = p.match(/^\/api\/shop\/items\/([\w-]+)\/image$/))) {
       const it = shopData.items.find((x) => x.id === m[1]);
@@ -3891,6 +3962,7 @@ async function sourRoute(req, res, p, get, post, url) {
       if (!spendPoints(me, price, to === me ? it.name : `${it.name} for ${to.name}`)) return send(res, 402, { error: `you need ${price - me.points.balance} more points` });
       to.owned.push(it.id);
       social.fund = (social.fund || 0) + Math.round(price / 10);
+      (social.lastBought ??= {})[it.id] = Date.now();
       if (social.fund >= FUND_GOAL && !social.fundDone) { // full: everyone gets the group crown
         social.fundDone = Date.now();
         for (const x of Object.values(profiles)) { wallet(x); if (!x.owned.includes(FUND_ITEM.id)) x.owned.push(FUND_ITEM.id); }
@@ -3944,6 +4016,7 @@ async function sourRoute(req, res, p, get, post, url) {
       const img = decodeImage(b.image, 400000);
       if (!name || !img) return send(res, 400, { error: "give it a name and a PNG, JPEG, WebP or GIF picture (up to 400 KB)" });
       const id = "c-" + crypto.randomUUID().slice(0, 8);
+      adminLog("shop", `added "${name}" to the shop (${price} points)`, me.name);
       shopData.items.push({ id, slot, name, price, season: SEASONS[b.season] ? b.season : null, image: storeImage(`shop-${id}`, img, null), v: Date.now() });
       saveShop();
       return send(res, 200, { ok: true, id });
@@ -4378,10 +4451,10 @@ http.createServer(async (req, res) => {
   const p = url.pathname, get = req.method === "GET", post = req.method === "POST";
   const SOUR_ROUTES = ["/api/presence", "/api/leaderboard", "/api/song-of-the-day", "/api/group-top", "/api/milestones", "/api/follows"];
   const SOUR_PREFIXES = ["/api/sounds", "/api/profiles", "/api/playlist-themes", "/api/friend-group", "/api/activity", "/api/gifts", "/api/capsules", "/api/song-notes",
-    "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke", "/api/feedback", "/api/along/", "/api/shop", "/api/inbox", "/api/polls", "/api/daily-guess", "/api/album-club", "/api/hot-takes"];
+    "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke", "/api/feedback", "/api/along/", "/api/shop", "/api/inbox", "/api/polls", "/api/daily-guess", "/api/album-club", "/api/hot-takes", "/api/predict"];
   const isSour = SOUR_PREFIXES.some((x) => p.startsWith(x)) || SOUR_ROUTES.includes(p);
   if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/lyrics") || p.startsWith("/api/requests") || p.startsWith("/api/library") || p.startsWith("/api/duplicates") || isSour
-    || ["/api/status", "/api/now", "/api/bump", "/api/storage", "/api/song-dna", "/api/announcement"].includes(p) || p.startsWith("/api/admin/")) { // used by Sour Player (the custom Feishin)
+    || ["/api/status", "/api/now", "/api/bump", "/api/storage", "/api/song-dna", "/api/announcement", "/api/liner-notes"].includes(p) || p.startsWith("/api/admin/")) { // used by Sour Player (the custom Feishin)
     res.setHeader("access-control-allow-origin", "*");
     if (req.method === "OPTIONS") {
       res.writeHead(204, { "access-control-allow-methods": "GET, POST", "access-control-allow-headers": "content-type", "access-control-max-age": "86400" });
@@ -4428,6 +4501,27 @@ http.createServer(async (req, res) => {
 <p style="opacity:.6">No Sour Player yet? <a style="color:#aaa" href="https://github.com/Urmomnumber1/feishin/releases/latest">Get it here</a></p></div>
 <script>location.href="sourplayer://listen/${id}"</script></body>`, "text/html; charset=utf-8");
   }
+  if (get && p === "/api/liner-notes") { // credits, label, date for an album (MusicBrainz)
+    const artist = String(url.searchParams.get("artist") || ""), album = String(url.searchParams.get("album") || "");
+    if (!artist || !album) return send(res, 400, { error: "which album?" });
+    try {
+      const d = await linerNotes(artist, album);
+      return d ? send(res, 200, d) : send(res, 404, { error: "MusicBrainz doesn't know this album" });
+    } catch (e) { return send(res, 502, { error: `couldn't reach MusicBrainz: ${e.message}` }); }
+  }
+  if (p === "/api/requests/approval" || p.startsWith("/api/requests/approval/")) { // admins say yes or no to big requests
+    if (get) return send(res, 200, items.filter((i) => i.status === "approval").map(({ id, type, query, askedBy, created }) => ({ id, type, query, by: askedBy, created })));
+    if (!post) return send(res, 404, { error: "not found" });
+    const b = await readBody(req, 3000);
+    const prof = b.profile ? ownProfile(String(b.profile), b.key) : null;
+    if (!adminOk(b, req) && !(prof && isAdmin(prof))) return send(res, 403, { error: "admins only" });
+    const it = items.find((i) => i.id === b.id && i.status === "approval");
+    if (!it) return send(res, 404, { error: "that request is gone" });
+    if (b.yes) Object.assign(it, { status: "pending", note: undefined }); else Object.assign(it, { status: "failed", note: "an admin said no" });
+    adminLog("approval", `${b.yes ? "approved" : "declined"} ${it.type} "${it.query}"`, prof ? prof.name : "admin");
+    save(); wake();
+    return send(res, 200, { ok: true });
+  }
   if (get && /^\/overlay\/[\w-]+$/.test(p)) { // a now-playing card for streamers (OBS: add a Browser source with this address)
     const id = p.split("/")[2];
     return send(res, 200, `<!doctype html><meta charset="utf-8"><title>Sour Player overlay</title>
@@ -4466,6 +4560,7 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
         library: library.files, groups: groups.size, aiKaraoke: DEMUCS.state, version: process.env.HM_VERSION || null,
       });
     }
+    if (p === "/api/admin/log") return send(res, 200, adminLogList.slice(0, 200));
     if (p === "/api/admin/backup") { // everything Sour Player keeps, as one file
       const pack = {};
       for (const f of [PROFILES, SOCIAL, SHOP_FILE, ROOMS, CFG, "/data/karaoke.json", "/data/lyric-offsets.json", "/data/video-misses.json"]) { try { pack[f] = fs.readFileSync(f, "utf8"); } catch {} }
@@ -4477,6 +4572,7 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
       if (!files || typeof files !== "object") return send(res, 400, { error: "that isn't a Hermes Music backup" });
       let n = 0;
       for (const [f, text] of Object.entries(files)) { if (!allowed.includes(f) || typeof text !== "string") continue; try { JSON.parse(text); fs.writeFileSync(f, text); n++; } catch {} }
+      adminLog("restore", `restored a backup (${n} files)`, prof ? prof.name : "admin");
       send(res, 200, { restored: n, note: "Hermes Music restarts now to load it" });
       setTimeout(() => process.exit(0), 800);
       return;
@@ -4612,6 +4708,7 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
   }
   if (post && p === "/api/videos/pick") { // a person picked the right video from the picker (it's then used for everyone)
     const b = await readBody(req);
+    adminLog("video", `picked a video for ${b.artist || "?"} - ${b.title || "?"}`, b.by || null);
     const id = ytId(String(b.videoId || "")) || (/^[\w-]{11}$/.test(String(b.videoId || "")) ? String(b.videoId) : null);
     if (!id) return send(res, 400, { error: "that isn't a video" });
     const hit = findInLibrary(`${b.artist || ""} ${b.title || ""}`)[0];
@@ -4708,6 +4805,7 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
   // ---- library tools for Sour Player (3.1.0) ----
   if (post && p === "/api/library/tags") { // change tags on one or more files, keeping everything else
     const b = await readBody(req, 200000);
+    adminLog("tags", `changed tags on ${(b.files || []).length} file(s)${b.tags && b.tags.album ? ` (${b.tags.album})` : ""}`, b.by || null);
     const files = (Array.isArray(b.files) ? b.files : []).slice(0, 300);
     const tags = {};
     for (const k of ["title", "artist", "album_artist", "album", "date", "track", "genre"]) if (typeof (b.tags || {})[k] === "string" && b.tags[k].trim()) tags[k] = clean1(b.tags[k].trim(), 200);
@@ -4745,6 +4843,7 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
   }
   if (post && p === "/api/library/cover") { // put a new cover on songs (and the album folder)
     const b = await readBody(req, 8500000);
+    adminLog("cover", `changed the cover of ${b.album || "an album"}${b.artist ? ` by ${b.artist}` : ""}`, b.by || null);
     const files = filesFor(b);
     // a suggested cover (from a catalogue) or a picture an admin uploaded (a data: URL, up to 6 MB)
     const img = typeof b.image === "string" && b.image.match(/^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/);
@@ -4920,6 +5019,7 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
   if (post && p === "/api/config") {
     const cb = await readBody(req);
     const err = updateConfig(cb, adminOk(cb, req));
+    if (!err) adminLog("config", "saved Config", (adminTokens.get(String(req.headers["x-hermes-admin"] || "")) || {}).user || null);
     return err ? send(res, 400, { error: err }) : send(res, 200, publicConfig());
   }
 
@@ -5177,7 +5277,7 @@ Reply with ONE line of JSON and nothing else: {"songs":["Artist - Title", ...]} 
       try {
         const lists = await profilePlaylists(q);
         if (!lists || !lists.length) return send(res, 404, { error: "no public playlists found on that profile" });
-        for (const l of lists) items.push({ id: newId(), type: "playlist", query: l.name, status: "pending", created: item.created, ...(l.spotifyId ? { spotifyId: l.spotifyId } : { ytList: l.ytList }),
+        for (const l of lists) items.push({ id: newId(), type: "playlist", query: l.name, status: config.approveBig ? "approval" : "pending", created: item.created, ...(l.spotifyId ? { spotifyId: l.spotifyId } : { ytList: l.ytList }),
           askedBy: item.askedBy, profile: item.profile });
         save(); wake();
         return send(res, 201, { ...item, type: "profile", status: "done", title: `${lists.length} playlists`, imported: lists.length });
@@ -5190,6 +5290,7 @@ Reply with ONE line of JSON and nothing else: {"songs":["Artist - Title", ...]} 
       item.type = link[1].toLowerCase() === "track" ? "song" : link[1].toLowerCase();
       item.spotifyId = link[2];
     }
+    if (config.approveBig && ["artist", "playlist"].includes(item.type)) { item.status = "approval"; item.note = "waiting for an admin to say yes (it's a big one)"; }
     items.push(item); save(); wake();
     return send(res, 201, item);
   }
