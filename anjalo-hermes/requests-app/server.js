@@ -388,6 +388,74 @@ async function fixSong(rel, action) {
   });
 }
 
+// ---------- "Not the right song" (Sour Player 0.10.6) ----------
+// A song in the library by its path (from Navidrome), or by artist and title when the path doesn't match here
+function songFile(b) {
+  try { return libraryFile(String(b.file || "")); } catch (e) {
+    const f = b.artist && b.title ? libraryFileFor(String(b.artist), String(b.title)) : null;
+    if (f && fs.existsSync(f)) return f;
+    throw e;
+  }
+}
+// The song played the music video's audio (an intro, a skit, a different mix): download another upload of it and
+// swap the audio in, keeping the file's own tags and cover (and its path, so plays and favourites stay). The old
+// audio is kept in Hermes Music's data folder (one copy per song) in case the new one is worse.
+async function replaceAudio(b, videoId) {
+  const file = songFile(b);
+  const ext = path.extname(file).slice(1).toLowerCase();
+  const c = libCache[file] || {};
+  return ctx.run({ stage: path.join(STAGING, "swap-" + newId()) }, async () => {
+    fs.mkdirSync(ST(), { recursive: true });
+    try {
+      const fmt = { m4a: "m4a", mp3: "mp3", opus: "opus", flac: "flac", ogg: "vorbis", wav: "wav", aac: "aac" }[ext] || config.audioFormat;
+      const d = await run("yt-dlp", ["--no-playlist", "--no-warnings", "-x", "--audio-format", fmt, "--audio-quality", "0",
+        "-o", path.join(ST(), "song.%(ext)s"), `https://www.youtube.com/watch?v=${videoId}`]);
+      const src = fs.readdirSync(ST()).map((f) => path.join(ST(), f)).find((f) => /^song\./.test(path.basename(f)));
+      if (!src) throw new Error(botNote(d.err) || "the download failed");
+      const outExt = path.extname(src).slice(1).toLowerCase();
+      // the tags the file has now (ffprobe), else what the library index knows
+      const probe = await run("ffprobe", ["-v", "quiet", "-print_format", "json", "-show_format", file], { timeout: 20000 });
+      const t = {};
+      try { for (const [k, v] of Object.entries(JSON.parse(probe.out).format?.tags || {})) t[k.toLowerCase()] = String(v); } catch {}
+      const keep = {
+        title: t.title || c.t, artist: t.artist || c.a, album_artist: t.album_artist || t["album artist"] || c.aa, album: t.album || c.al,
+        date: t.date || t.year, track: t.track, disc: t.disc, genre: t.genre,
+      };
+      const cover = path.join(ST(), "cover.jpg");
+      const got = await run("ffmpeg", ["-y", "-v", "error", "-i", file, "-an", "-map", "0:v:0?", "-frames:v", "1", cover], { timeout: 60000 });
+      const hasCover = got.code === 0 && fs.existsSync(cover) && fs.statSync(cover).size > 0;
+      const out = path.join(ST(), `swapped.${outExt}`);
+      let r = await run("ffmpeg", tagArgs(src, hasCover ? cover : null, out, outExt, keep), { timeout: 120000 });
+      if (r.code !== 0 && hasCover) r = await run("ffmpeg", tagArgs(src, null, out, outExt, keep), { timeout: 120000 });
+      if (r.code !== 0 || !fs.existsSync(out)) throw new Error("tagging failed");
+      const backup = path.join("/data/replaced", path.relative(MUSIC, file));
+      fs.mkdirSync(path.dirname(backup), { recursive: true });
+      fs.copyFileSync(file, backup);
+      const dest = outExt === ext ? file : file.replace(/\.[^.]+$/, "." + outExt);
+      fs.copyFileSync(out, dest);
+      if (dest !== file) fs.rmSync(file, { force: true });
+      delete libCache[file];
+      return { artist: keep.artist || "", title: keep.title || "", file: path.relative(MUSIC, dest) };
+    } finally { fs.rmSync(ST(), { recursive: true, force: true }); }
+  });
+}
+// other uploads of a song, the likely right ones first: "Artist - Topic" (the album audio), "official audio",
+// close to the song's length; music videos (intros, skits) last
+async function songAlternatives(artist, title, seconds) {
+  const [a, b] = await Promise.all([
+    ytSearch(`${artist} ${title} official audio`, 8),
+    ytSearch(`${artist} - Topic ${title}`, 5).catch(() => []),
+  ]);
+  const seen = new Set();
+  const VIDEOISH = /\b(music video|official video|official mv|mv|video oficial|live|concert|performance)\b/i;
+  const kind = (v) => (/ - Topic$/.test(v.channel) ? "album audio" : VIDEOISH.test(v.title) ? "music video" : /\baudio\b/i.test(v.title) ? "audio" : "");
+  const score = (v) => (/ - Topic$/.test(v.channel) ? 3 : 0) + (/\baudio\b/i.test(v.title) ? 2 : 0) - (VIDEOISH.test(v.title) ? 2 : 0)
+    - (seconds ? Math.min(2, Math.abs(v.seconds - seconds) / 30) : 0);
+  return [...a, ...b].filter((v) => !seen.has(v.id) && seen.add(v.id))
+    .map((v) => ({ ...v, kind: kind(v), score: score(v) }))
+    .sort((x, y) => y.score - x.score).slice(0, 8);
+}
+
 // ---------- /duplicate: find copies of the same song, keep the best one ----------
 // ---- library tools (Sour Player 0.4): a song file by its path inside the library, tag/cover edits, the archive ----
 function libraryFile(rel) {
@@ -729,6 +797,15 @@ async function expandYouTubePlaylist(item) {
   if (!j) throw new Error(botNote(r.err) || "couldn't read that YouTube playlist: " + (r.err.trim().split("\n").pop() || "unknown").slice(0, 150));
   const entries = (j.entries || []).filter((e) => /^[\w-]{11}$/.test(e.id || "") && e.title && !/^\[(private|deleted)/i.test(e.title));
   if (!entries.length) return { status: "failed", note: "playlist is empty or private" };
+  const album = soundtrackOf(entries, j.title);
+  if (album) {
+    insertChildren(item, entries.map((e, i) => {
+      const t = album.parse(i);
+      return { type: "song", query: `${album.artist} - ${t.title}`, meta: { title: t.title, artist: album.artist, albumArtist: album.artist, album: album.name,
+        track: String(t.track || i + 1), releaseType: "album", seconds: Number(e.duration) || 0, videoId: e.id } };
+    }));
+    return { status: "working", title: album.name, artist: album.artist, note: `${entries.length} tracks, one album` };
+  }
   insertChildren(item, entries.map((e) => {
     const channel = String(e.channel || e.uploader || "");
     const topic = channel.match(/^(.+?) - Topic$/); // YouTube Music: "Artist - Topic" uploads are the official audio
@@ -738,6 +815,51 @@ async function expandYouTubePlaylist(item) {
     return { type: "song", query: e.title }; // not sure what song it is: the normal search (and "Is this the song?")
   }));
   return { status: "working", title: j.title || "YouTube playlist", artist: j.uploader || j.channel || "", note: `${entries.length} videos` };
+}
+// A YouTube playlist that is really one album, like a game soundtrack uploaded as "Undertale Yellow OST 006 -
+// Title" or "Some Game OST - 12 - Title": every song used to become its own artist ("Undertale Yellow OST 006",
+// "... 007") with its own one-song album. When most titles share the same name in front with a track number,
+// they're one album: that name is the album (and, without "OST", the artist), the number is the track.
+const OST_WORDS = /\s*[(\[]?\b(original\s+)?(game\s+)?(soundtrack|ost|o\.s\.t\.?|score)\b[)\]]?\s*$/i;
+const OST_ANY = /\b(ost|o\.s\.t|soundtrack|score)\b/i;
+function soundtrackOf(entries, playlistTitle) {
+  const rows = entries.map((e) => {
+    const t = String(e.title || "").trim();
+    // "006 - Title" (the playlist's name says which album)
+    let m = t.match(/^(\d{1,3})\s*[-–:.)]\s+(.+)$/);
+    if (m) return { prefix: "", track: Number(m[1]), title: m[2].trim() };
+    // "Prefix 006 - Title", "Prefix #6 - Title", "Prefix: 006 - Title", "Prefix - 006 - Title"
+    m = t.match(/^(.+?)[\s:#-]*?(?:#|no\.?\s*|track\s*)?(\d{1,3})\s*[-–:.)]\s+(.+)$/i);
+    if (m && !/\d$/.test(m[1].trim())) return { prefix: m[1].replace(/[\s:#–-]+$/, "").trim(), track: Number(m[2]), title: m[3].trim() };
+    // "Prefix - Title"
+    m = t.match(/^(.+?)\s+[-–]\s+(.+)$/);
+    return m ? { prefix: m[1].trim(), track: 0, title: m[2].trim() } : null;
+  });
+  const counts = new Map();
+  for (const r of rows) if (r) counts.set(norm(r.prefix), (counts.get(norm(r.prefix)) || 0) + 1);
+  const [best, n] = [...counts.entries()].sort((a, b) => b[1] - a[1])[0] || [null, 0];
+  if (best === null || n < 3 || n < entries.length * 0.6) return null;
+  const sample = rows.find((r) => r && norm(r.prefix) === best);
+  const numbered = rows.filter((r) => r && norm(r.prefix) === best && r.track).length;
+  const listTitle = String(playlistTitle || "").trim().replace(/\s*[([](full|complete|all tracks|full album|playlist)[^)\]]*[)\]]\s*$/i, "").trim();
+  let name = sample.prefix.replace(/\s+/g, " ");
+  if (!name) { // only numbers in front: the playlist's own name is the album, when it says it's a soundtrack
+    if (!OST_ANY.test(listTitle) || numbered < n * 0.6) return null;
+    name = listTitle;
+  }
+  // the same name in front of every title is an album only when it says so (OST, soundtrack) or the tracks are
+  // numbered; otherwise it's one artist's songs ("Queen - ..."), which the normal lookup handles better
+  else if (!OST_WORDS.test(name) && !OST_ANY.test(listTitle) && numbered < n * 0.6) return null;
+  const artist = name.replace(OST_WORDS, "").trim() || name;
+  return {
+    name, artist,
+    // entry i: its title and track number (a title that didn't fit the pattern keeps its own name)
+    parse: (i) => {
+      const r = rows[i];
+      if (r && norm(r.prefix) === best) return r;
+      return { title: String(entries[i].title || "").trim(), track: 0 };
+    },
+  };
 }
 async function expandPlaylist(item) {
   if (item.ytList) return expandYouTubePlaylist(item);
@@ -3212,8 +3334,9 @@ function publicProfile(p, self = false) {
     favorites: hidden || priv.hideFavorites ? [] : p.favorites || [],
     online, lastSeen: hidden || priv.hideLastOnline ? null : isInvisible(p) && !self ? p.lastOfflineSeen || null : p.lastSeen || null,
     created: p.created,
-    // avatar decoration: everyone who had an account before Sour Player 0.10 gets the party hat
-    decoration: (p.equipped && p.equipped.decoration) || (p.created && p.created < V10_CUTOFF && !(p.equipped && p.equipped.decoration === "") ? "party-hat" : null),
+    // avatar decoration: only what they chose to wear (3.10.6: the party hat was on everyone from before
+    // Sour Player 0.10 long after the launch; it stays theirs to wear from the shop)
+    decoration: (p.equipped && p.equipped.decoration) || null,
     looks: { ...(p.equipped || {}), decoration: undefined },
     shopWish: hidden ? [] : (p.shopWish || []).slice(0, 30),
     listening: online && !priv.hideListening && p.listening ? p.listening : null, playing: online && !!p.playing,
@@ -4796,6 +4919,44 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
   if (p === "/api/library/fix-all") { // POST starts it, GET shows how far it got
     if (post) { runFixAll(); return send(res, 200, { started: true }); }
     return send(res, 200, fixAll);
+  }
+  // ---- Sour Player 0.10.6: "Not the right song" (anyone) and taking a song out of the library (admins) ----
+  if (get && p === "/api/library/alternatives") { // ?artist=&title=&seconds=
+    const artist = clean1(url.searchParams.get("artist"), 100), title = clean1(url.searchParams.get("title"), 150);
+    if (!artist || !title) return send(res, 400, { error: "which song?" });
+    try { return send(res, 200, await songAlternatives(artist, title, Number(url.searchParams.get("seconds")) || 0)); }
+    catch (e) { return send(res, 502, { error: e.message }); }
+  }
+  if (post && p === "/api/library/replace") { // { file, artist, title, videoId, by }
+    const b = await readBody(req);
+    const videoId = String(b.videoId || "");
+    if (!/^[\w-]{11}$/.test(videoId)) return send(res, 400, { error: "pick one of the videos" });
+    try {
+      const r = await replaceAudio({ file: b.file, artist: clean1(b.artist, 100), title: clean1(b.title, 150) }, videoId);
+      adminLog("replace", `"not the right song": new audio for ${r.artist} - ${r.title} (youtu.be/${videoId})`, clean1(b.by, 40) || null);
+      return send(res, 200, r);
+    } catch (e) { return send(res, 400, { error: e.message }); }
+  }
+  if (post && p === "/api/library/remove") { // { file, artist, title, profile, key }: admins only, into the archive
+    const b = await readBody(req);
+    const prof = b.profile ? ownProfile(String(b.profile), b.key) : null;
+    if (!adminOk(b, req) && !(prof && isAdmin(prof))) return send(res, 403, { error: "only admins can remove songs" });
+    try {
+      const from = songFile({ file: b.file, artist: clean1(b.artist, 100), title: clean1(b.title, 150) });
+      const relPath = path.relative(MUSIC, from), to = path.join(ARCHIVE_DIR, relPath);
+      fs.mkdirSync(path.dirname(to), { recursive: true });
+      fs.renameSync(from, to);
+      const lrc = from.replace(/\.[^.]+$/, ".lrc");
+      if (fs.existsSync(lrc)) fs.renameSync(lrc, to.replace(/\.[^.]+$/, ".lrc"));
+      const who = prof ? prof.name : clean1(b.by, 40) || null;
+      archived.push({ file: relPath, at: Date.now(), by: who, removed: true });
+      saveArchive();
+      const c = libCache[from];
+      if (c) library.keys.delete(songKey(c.aa || c.a, c.t));
+      delete libCache[from];
+      adminLog("remove", `removed ${relPath} from the library (it's in the archive)`, who);
+      return send(res, 200, { ok: true, file: relPath });
+    } catch (e) { return send(res, 400, { error: e.message }); }
   }
   if (post && p === "/api/library/fix") { // { file, action: retag | upgrade }
     const b = await readBody(req);
