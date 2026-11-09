@@ -613,14 +613,24 @@ async function botCopySongs(songs, kind, who, playlistId) {
   saveBotLib();
   return added;
 }
-// from YouTube: a link, or words to search for (rain ambience, a sword clash...). Ambience keeps the first hour.
+// words to search YouTube for: what kind of sound is wanted, unless the words already say it
+// ("tavern" -> "tavern ambience", "sword clash" -> "sword clash sound effect", a song -> its audio, not the video)
+function botSearchWords(words, kind) {
+  const w = words.slice(0, 200);
+  if (kind === "sfx") return /\b(sound|sfx|effects?)\b/i.test(w) ? w : `${w} sound effect`;
+  if (kind === "ambience") return /\b(ambien(ce|t)|sounds|noise|asmr)\b/i.test(w) ? w : `${w} ambience`;
+  return /\b(audio|lyrics?|official)\b/i.test(w) ? w : `${w} audio`;
+}
+// from YouTube: a link, a Spotify song link, or words to search for (rain, a tavern, a sword clash, a song).
+// Ambience keeps the first hour; sound effects can be 10 minutes, music 2 hours.
 function botFromYouTube(link, kind, title, who) {
   kind = BOT_KINDS.includes(kind) ? kind : "sfx";
-  let url = String(link || "").trim();
-  if (!url) throw new Error("paste a YouTube link, or type what to search for");
-  if (/^https?:\/\//i.test(url)) {
-    if (!/^https?:\/\/([\w-]+\.)?(youtube\.com|youtu\.be)\//i.test(url)) throw new Error("only YouTube links (or words to search for)");
-  } else url = "ytsearch1:" + url.slice(0, 200);
+  const typed = String(link || "").trim();
+  if (!typed) throw new Error("paste a YouTube link, or type what to search for");
+  const spotify = typed.match(/^https?:\/\/open\.spotify\.com\/(?:intl-[\w-]+\/)?track\/([A-Za-z0-9]{22})/i);
+  if (/^https?:\/\//i.test(typed) && !spotify && !/^https?:\/\/([\w-]+\.)?(youtube\.com|youtu\.be)\//i.test(typed)) {
+    throw new Error("a YouTube link, a Spotify song link, or words to search for");
+  }
   const id = newId();
   const it = { id, kind, title: clean1(title, 200) || "Downloading...", artist: "", duration: 0, file: "", status: "downloading", added: Date.now(), by: who };
   botLib.items.push(it);
@@ -628,15 +638,24 @@ function botFromYouTube(link, kind, title, who) {
   (async () => {
     try {
       fs.mkdirSync(BOT_FILES, { recursive: true });
+      let url = typed, name = clean1(title, 200), artist = "";
+      if (spotify) { // the song's name and artist from Spotify, the audio from YouTube
+        const e = await spotifyEmbed("track", spotify[1]);
+        artist = clean1((e.artists || []).map((a) => a.name).join(", "), 200);
+        name = name || clean1(e.name, 200);
+        url = `ytsearch1:${artist} ${e.name} audio`;
+      } else if (!/^https?:\/\//i.test(typed)) url = "ytsearch1:" + botSearchWords(typed, kind);
       const args = ["--no-playlist", "--no-warnings", "-x", "--audio-format", "opus", "--audio-quality", "0",
         "--print", "after_move:%(title)s\t%(uploader)s\t%(duration)s", "-o", path.join(BOT_FILES, id + ".%(ext)s")];
       if (kind === "ambience") args.push("--download-sections", "*0-3600");
-      else args.push("--match-filter", "duration < 7200");
+      else args.push("--match-filter", kind === "sfx" ? "duration < 600" : "duration < 7200");
       const r = await run("yt-dlp", [...args, url], { timeout: 20 * 60 * 1000 });
       const file = fs.readdirSync(BOT_FILES).find((f) => f.startsWith(id + "."));
-      if (!file) throw new Error(botNote(r.err) || (/does not pass filter/i.test(r.out + r.err) ? "that video is over 2 hours" : "the download failed"));
+      if (!file) {
+        throw new Error(botNote(r.err) || (/does not pass filter/i.test(r.out + r.err) ? `that video is over ${kind === "sfx" ? "10 minutes" : "2 hours"}` : "the download failed"));
+      }
       const [t, up, dur] = (r.out.trim().split("\n").pop() || "").split("\t");
-      Object.assign(it, { file, title: clean1(title, 200) || clean1(t, 200) || "Untitled", artist: clean1(up, 200), status: "ready",
+      Object.assign(it, { file, title: name || clean1(t, 200) || "Untitled", artist: artist || clean1(up, 200), status: "ready",
         duration: await botDuration(path.join(BOT_FILES, file)) || Math.round(Number(dur) || 0) });
     } catch (e) {
       Object.assign(it, { status: "failed", note: e.message, title: it.title === "Downloading..." ? String(link).slice(0, 80) : it.title });
