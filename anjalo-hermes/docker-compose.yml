@@ -15,7 +15,7 @@ services:
     # Umbrel updates replace this file but not the code folder, so the code for this version is fetched
     # from GitHub on start (and kept in /data/app). Falls back to the installed copy if that fails.
     environment:
-      HM_VERSION: "3.10.6"
+      HM_VERSION: "3.11.0"
     command:
       - sh
       - -c
@@ -25,7 +25,7 @@ services:
           mkdir -p "$$D" && node -e '
             const [dir, v] = process.argv.slice(1);
             const base = "https://raw.githubusercontent.com/Urmomnumber1/hermes-umbrel-store/hermes-music-" + v + "/anjalo-hermes/requests-app/";
-            Promise.all(["server.js", "index.html", "tv.html", "start.sh"].map(async (f) => {
+            Promise.all(["server.js", "index.html", "tv.html", "start.sh", "discord-bot.js"].map(async (f) => {
               let r;
               for (let i = 0; i < 4; i++) { // GitHub sometimes answers 404/5xx for a moment
                 r = await fetch(base + f).catch(() => null);

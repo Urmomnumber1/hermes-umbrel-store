@@ -5,7 +5,7 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
-const { spawn } = require("child_process");
+const { spawn, fork } = require("child_process");
 const { AsyncLocalStorage } = require("async_hooks");
 const crypto = require("crypto");
 
@@ -128,23 +128,31 @@ function updateConfig(b, ok) {
   }
   if (typeof b.paused === "boolean") next.paused = b.paused;
   if (int(b.ratePerMinute, 1, 30) != null) next.ratePerMinute = int(b.ratePerMinute, 1, 30);
+  // the Discord bot's token (Discord developer page > your app > Bot > Reset Token)
+  if (typeof b.discordToken === "string" && b.discordToken) {
+    const t = secret(b.discordToken);
+    if (t && !/^[\w-]{20,}\.[\w-]{4,}\.[\w-]{20,}$/.test(t)) return "that doesn't look like a Discord bot token (Discord developer page > your app > Bot > Reset Token)";
+    next.discordToken = t;
+  }
   if (typeof b.newPin === "string" && b.newPin) {
     if (b.newPin === "-") next.pin = "";
     else if (/^\d{4,12}$/.test(b.newPin)) next.pin = b.newPin;
     else return "PIN must be 4-12 digits";
   }
   if (next.engine !== "claude" && (!next.localUrl || !next.localModel)) return "the local model needs a base URL and model name";
+  const newBotToken = (next.discordToken || "") !== (config.discordToken || "");
   config = next;
   fs.writeFileSync(CFG, JSON.stringify(config, null, 1));
   Object.assign(dt, { cookie: "", blockedUntil: 0, noAuth: false, failed: "" }); // Downtify login may have changed
+  if (newBotToken) { stopBot(); bot.note = ""; bot.restarts = 0; if (config.discordToken) setTimeout(startBot, 300); }
   wake();
   return null;
 }
 // What the page may see: never the PIN or secrets.
 const publicConfig = () => {
-  const { pin, localKey, claudeToken, auddToken: _audd, downtifyPassword, downtifyToken, spotifyClientId, spotifySecret, ...rest } = config; // spotify*: left over from 2.2.0 configs
+  const { pin, localKey, claudeToken, auddToken: _audd, downtifyPassword, downtifyToken, spotifyClientId, spotifySecret, discordToken, ...rest } = config; // spotify*: left over from 2.2.0 configs
   return { ...rest, hasPin: !!pin, hasKey: !!localKey, hasToken: !!claudeToken, aiKaraokeState: DEMUCS.state, aiKaraokeNote: DEMUCS.note, hasDowntifyPassword: !!downtifyPassword, downtifyPaired: !!downtifyToken,
-    hasYtCookies: fs.existsSync(YT_COOKIES), hasSpotify: !!(spotifyClientId && spotifySecret) };
+    hasYtCookies: fs.existsSync(YT_COOKIES), hasSpotify: !!(spotifyClientId && spotifySecret), hasDiscordToken: !!discordToken, discordBot: botSummary() };
 };
 // YouTube sometimes answers "Sign in to confirm you're not a bot". yt-dlp's own answer is to sign in: a
 // cookies.txt exported from a browser where you're logged into YouTube (Config > YouTube sign-in). It stays
@@ -455,6 +463,314 @@ async function songAlternatives(artist, title, seconds) {
     .map((v) => ({ ...v, kind: kind(v), score: score(v) }))
     .sort((x, y) => y.score - x.score).slice(0, 8);
 }
+
+// ---------- the Discord bot (3.11): music, ambience and sound effects in a Discord voice channel ----------
+// For D&D nights on the friends' Discord. Admins, and whoever they allow in Config > Sour Player accounts, run
+// it from the Discord Bot tab in Sour Player. Its songs, playlists, ambience and sound effects live in Hermes
+// Music's own data folder, not in the music library, so they never show up in Navidrome or Sour Player's
+// normal pages. The bot runs as its own process (discord-bot.js) once a bot token is saved in Config; its
+// Discord libraries are installed into /data/tools/discord-bot the first time.
+const BOT_DIR = "/data/discord-bot";
+const BOT_FILES = path.join(BOT_DIR, "files");
+const BOT_LIB = path.join(BOT_DIR, "library.json");
+const BOT_DEPS = "/data/tools/discord-bot";
+const BOT_PACKAGES = { "discord.js": "14.28.1", "@discordjs/voice": "0.19.2", opusscript: "0.1.1", "libsodium-wrappers": "0.8.4" };
+const BOT_KINDS = ["music", "ambience", "sfx"];
+const BOT_AUDIO = /\.(mp3|m4a|aac|ogg|oga|opus|wav|flac|webm|weba|mp4|wma|aiff?)$/i;
+const NO_BOT = "the Discord bot is for admins and the people they allow (Hermes Music > Config > Sour Player accounts)";
+let botLib = { items: [], playlists: [] };
+try { botLib = { items: [], playlists: [], ...JSON.parse(fs.readFileSync(BOT_LIB, "utf8")) }; } catch {}
+for (const it of botLib.items) if (it.status === "downloading") Object.assign(it, { status: "failed", note: "Hermes Music restarted during the download" });
+const saveBotLib = () => { fs.mkdirSync(BOT_DIR, { recursive: true }); fs.writeFileSync(BOT_LIB, JSON.stringify(botLib)); };
+const bot = { proc: null, state: null, pending: new Map(), seq: 0, installing: false, note: "", restarts: 0, stopping: false, timer: null };
+const botAllowed = (p) => !!p && !p.mergedInto && (isAdmin(p) || !!p.botAccess);
+
+async function installBotDeps() {
+  const mark = path.join(BOT_DEPS, ".installed"), want = JSON.stringify(BOT_PACKAGES);
+  try { if (fs.readFileSync(mark, "utf8") === want) return true; } catch {}
+  if (bot.installing) return false;
+  bot.installing = true;
+  bot.note = "installing the Discord libraries (once, about a minute)";
+  try {
+    fs.mkdirSync(BOT_DEPS, { recursive: true });
+    fs.writeFileSync(path.join(BOT_DEPS, "package.json"), JSON.stringify({ name: "hermes-discord-bot", private: true, dependencies: BOT_PACKAGES }, null, 1));
+    const r = await run("npm", ["install", "--prefix", BOT_DEPS, "--omit=dev", "--no-audit", "--no-fund", "--no-package-lock"], { timeout: 10 * 60 * 1000 });
+    if (r.code !== 0) throw new Error((r.err || r.out || "").trim().split("\n").slice(-2).join(" ").slice(0, 300) || "npm failed");
+    fs.writeFileSync(mark, want);
+    bot.note = "";
+    return true;
+  } catch (e) {
+    bot.note = "couldn't install the Discord libraries: " + e.message;
+    console.warn("Discord bot:", bot.note);
+    return false;
+  } finally { bot.installing = false; }
+}
+async function startBot() {
+  if (bot.proc || bot.installing || !config.discordToken) return;
+  if (!(await installBotDeps())) { clearTimeout(bot.timer); bot.timer = setTimeout(startBot, 10 * 60 * 1000); return; }
+  if (bot.proc || !config.discordToken) return;
+  bot.stopping = false;
+  const proc = fork(path.join(__dirname, "discord-bot.js"), [], {
+    env: { ...process.env, BOT_DEPS, BOT_DATA: BOT_DIR, BOT_FAKE: process.env.HERMES_BOT_FAKE === "1" ? "1" : "" },
+    stdio: ["ignore", "inherit", "inherit", "ipc"],
+  });
+  bot.proc = proc;
+  proc.on("message", (m) => {
+    if (!m) return;
+    if (m.type === "state") { bot.state = m.state; if (m.state && m.state.online) bot.restarts = 0; return; }
+    if (m.type === "log") { console.log("Discord bot:", m.text); return; }
+    if (m.state) bot.state = m.state;
+    const w = bot.pending.get(m.id);
+    if (!w) return;
+    bot.pending.delete(m.id);
+    if (m.ok) w.ok(m.result); else w.fail(new Error(m.error));
+  });
+  proc.on("exit", (code) => {
+    if (bot.proc === proc) { bot.proc = null; bot.state = null; }
+    for (const w of bot.pending.values()) w.fail(new Error("the bot stopped"));
+    bot.pending.clear();
+    if (!bot.stopping && config.discordToken) {
+      const wait = Math.min(5 * 60 * 1000, 3000 * 2 ** bot.restarts++);
+      console.warn(`Discord bot stopped (${code}); starting it again in ${Math.round(wait / 1000)} s`);
+      clearTimeout(bot.timer);
+      bot.timer = setTimeout(startBot, wait);
+    }
+  });
+  botCall("login", { token: config.discordToken }, 60000).then(() => { bot.note = ""; }, (e) => { bot.note = e.message; });
+}
+function stopBot() {
+  bot.stopping = true;
+  clearTimeout(bot.timer);
+  if (bot.proc) { try { bot.proc.kill(); } catch {} }
+  bot.proc = null;
+  bot.state = null;
+}
+function botCall(cmd, args = {}, timeout = 30000) {
+  if (!bot.proc) {
+    return Promise.reject(new Error(!config.discordToken ? "there's no Discord bot yet: an admin adds its token in Hermes Music > Config"
+      : bot.installing ? "the bot is still being set up, try again in a minute" : bot.note || "the bot is starting, try again in a moment"));
+  }
+  const id = ++bot.seq;
+  return new Promise((ok, fail) => {
+    const t = setTimeout(() => { bot.pending.delete(id); fail(new Error("the bot didn't answer")); }, timeout);
+    bot.pending.set(id, { ok: (r) => { clearTimeout(t); ok(r); }, fail: (e) => { clearTimeout(t); fail(e); } });
+    try { bot.proc.send({ id, cmd, args }); } catch (e) { bot.pending.delete(id); clearTimeout(t); fail(e); }
+  });
+}
+// the invite link (a bot's id is the first part of its token): View Channel, Connect and Speak
+function botInvite() {
+  let id = bot.state && bot.state.user && /^\d{15,22}$/.test(bot.state.user.id) ? bot.state.user.id : "";
+  if (!id) { try { const s = Buffer.from(String(config.discordToken || "").split(".")[0], "base64").toString(); if (/^\d{15,22}$/.test(s)) id = s; } catch {} }
+  return id ? `https://discord.com/oauth2/authorize?client_id=${id}&scope=bot&permissions=3146752` : "";
+}
+function botSummary() {
+  const s = bot.state;
+  return { configured: !!config.discordToken, installing: bot.installing, online: !!(s && s.online), name: s && s.user ? s.user.name : "",
+    servers: s ? s.guilds.length : 0, error: (s && s.error) || bot.note || "", invite: botInvite() };
+}
+const botStateView = () => {
+  const s = bot.state || {};
+  return { ...botSummary(), fake: !!s.fake, guilds: s.guilds || [], voice: s.voice || null,
+    music: s.music || { current: null, index: -1, position: 0, paused: true, loop: "off", shuffle: false, queue: [] },
+    ambience: s.ambience || [], sfx: s.sfx || [], volumes: s.volumes || { master: 0.9, music: 0.7, ambience: 0.5, sfx: 0.9 } };
+};
+const botItemView = (it) => ({ id: it.id, kind: it.kind, title: it.title, artist: it.artist || "", album: it.album || "", duration: it.duration || 0,
+  status: it.status || "ready", note: it.note || "", by: it.by || "", added: it.added || 0 });
+const botLibView = () => ({ items: botLib.items.map(botItemView),
+  playlists: botLib.playlists.map((pl) => ({ id: pl.id, name: pl.name, by: pl.by || "", items: pl.items.filter((id) => botLib.items.some((x) => x.id === id)) })) });
+// library ids -> what the bot plays (with the file)
+const botResolve = (ids) => (Array.isArray(ids) ? ids : []).slice(0, 500).map((id) => botLib.items.find((x) => x.id === id))
+  .filter((it) => it && it.status === "ready" && it.file)
+  .map((it) => ({ id: it.id, title: it.title, artist: it.artist || "", duration: it.duration || 0, file: path.join(BOT_FILES, it.file) }));
+async function botDuration(file) {
+  const r = await run("ffprobe", ["-v", "quiet", "-print_format", "json", "-show_format", file], { timeout: 30000 });
+  try { return Math.round((Number(JSON.parse(r.out).format.duration) || 0) * 10) / 10; } catch { return 0; }
+}
+// "Copy to Discord bot" on songs, albums and playlists in Sour Player: the files are copied out of the library
+async function botCopySongs(songs, kind, who, playlistId) {
+  kind = BOT_KINDS.includes(kind) ? kind : "music";
+  const list = (Array.isArray(songs) ? songs : []).slice(0, 300);
+  if (!list.length) throw new Error("no songs to copy");
+  fs.mkdirSync(BOT_FILES, { recursive: true });
+  const added = [];
+  for (const s of list) {
+    let file;
+    try { file = songFile({ file: s && s.path, artist: s && s.artist, title: s && s.title }); } catch { continue; }
+    const source = path.relative(MUSIC, file);
+    let it = botLib.items.find((x) => x.source === source && x.kind === kind && x.status === "ready");
+    if (!it) {
+      const id = newId(), ext = (path.extname(file) || ".mp3").toLowerCase();
+      await fs.promises.copyFile(file, path.join(BOT_FILES, id + ext));
+      it = { id, kind, title: clean1(s.title, 200) || path.basename(file, ext), artist: clean1(s.artist, 200), album: clean1(s.album, 200),
+        duration: Math.round(Number(s.duration) || 0) || await botDuration(path.join(BOT_FILES, id + ext)), file: id + ext, source, status: "ready", added: Date.now(), by: who };
+      botLib.items.push(it);
+    }
+    added.push(it);
+  }
+  if (!added.length) throw new Error("couldn't find those songs' files in the library");
+  const pl = playlistId && botLib.playlists.find((x) => x.id === playlistId);
+  if (pl) for (const it of added) if (!pl.items.includes(it.id)) pl.items.push(it.id);
+  saveBotLib();
+  return added;
+}
+// from YouTube: a link, or words to search for (rain ambience, a sword clash...). Ambience keeps the first hour.
+function botFromYouTube(link, kind, title, who) {
+  kind = BOT_KINDS.includes(kind) ? kind : "sfx";
+  let url = String(link || "").trim();
+  if (!url) throw new Error("paste a YouTube link, or type what to search for");
+  if (/^https?:\/\//i.test(url)) {
+    if (!/^https?:\/\/([\w-]+\.)?(youtube\.com|youtu\.be)\//i.test(url)) throw new Error("only YouTube links (or words to search for)");
+  } else url = "ytsearch1:" + url.slice(0, 200);
+  const id = newId();
+  const it = { id, kind, title: clean1(title, 200) || "Downloading...", artist: "", duration: 0, file: "", status: "downloading", added: Date.now(), by: who };
+  botLib.items.push(it);
+  saveBotLib();
+  (async () => {
+    try {
+      fs.mkdirSync(BOT_FILES, { recursive: true });
+      const args = ["--no-playlist", "--no-warnings", "-x", "--audio-format", "opus", "--audio-quality", "0",
+        "--print", "after_move:%(title)s\t%(uploader)s\t%(duration)s", "-o", path.join(BOT_FILES, id + ".%(ext)s")];
+      if (kind === "ambience") args.push("--download-sections", "*0-3600");
+      else args.push("--match-filter", "duration < 7200");
+      const r = await run("yt-dlp", [...args, url], { timeout: 20 * 60 * 1000 });
+      const file = fs.readdirSync(BOT_FILES).find((f) => f.startsWith(id + "."));
+      if (!file) throw new Error(botNote(r.err) || (/does not pass filter/i.test(r.out + r.err) ? "that video is over 2 hours" : "the download failed"));
+      const [t, up, dur] = (r.out.trim().split("\n").pop() || "").split("\t");
+      Object.assign(it, { file, title: clean1(title, 200) || clean1(t, 200) || "Untitled", artist: clean1(up, 200), status: "ready",
+        duration: await botDuration(path.join(BOT_FILES, file)) || Math.round(Number(dur) || 0) });
+    } catch (e) {
+      Object.assign(it, { status: "failed", note: e.message, title: it.title === "Downloading..." ? String(link).slice(0, 80) : it.title });
+    }
+    saveBotLib();
+  })();
+  return it;
+}
+// a file from the Discord Bot tab (the request body is the file)
+function botUpload(req, name, kind, who) {
+  return new Promise((ok, fail) => {
+    fs.mkdirSync(BOT_FILES, { recursive: true });
+    const id = newId(), ext = path.extname(name).toLowerCase(), dest = path.join(BOT_FILES, id + ext);
+    const out = fs.createWriteStream(dest);
+    let size = 0, over = false;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > 100 * 1024 * 1024 && !over) {
+        over = true;
+        req.unpipe(out);
+        out.destroy();
+        fs.rmSync(dest, { force: true });
+        req.resume();
+        fail(new Error("that file is over 100 MB"));
+      }
+    });
+    req.on("error", fail);
+    out.on("error", fail);
+    out.on("finish", async () => {
+      if (over) return;
+      const duration = await botDuration(dest);
+      if (!duration) { fs.rmSync(dest, { force: true }); return fail(new Error("that file doesn't play (is it a sound file?)")); }
+      const it = { id, kind, title: clean1(path.basename(name, path.extname(name)).replace(/_+/g, " "), 200) || "Untitled", artist: "",
+        duration, file: id + ext, status: "ready", added: Date.now(), by: who };
+      botLib.items.push(it);
+      saveBotLib();
+      ok(it);
+    });
+    req.pipe(out);
+  });
+}
+function botEdit(b) {
+  const it = botLib.items.find((x) => x.id === b.id);
+  if (!it) throw new Error("that's gone already");
+  if (typeof b.title === "string" && b.title.trim()) it.title = clean1(b.title, 200);
+  if (typeof b.artist === "string") it.artist = clean1(b.artist, 200);
+  if (BOT_KINDS.includes(b.kind)) it.kind = b.kind;
+  saveBotLib();
+  return botItemView(it);
+}
+function botRemove(b) {
+  const ids = new Set((Array.isArray(b.ids) ? b.ids : [b.id]).map(String));
+  for (const it of botLib.items) if (ids.has(it.id) && it.file) fs.rmSync(path.join(BOT_FILES, it.file), { force: true });
+  botLib.items = botLib.items.filter((x) => !ids.has(x.id));
+  for (const pl of botLib.playlists) pl.items = pl.items.filter((id) => !ids.has(id));
+  saveBotLib();
+  return botLibView();
+}
+// a playlist: new (no id), renamed, songs added or taken out, or put in a new order (items)
+function botPlaylistSave(b, who) {
+  let pl = b.id && botLib.playlists.find((x) => x.id === b.id);
+  if (!pl) {
+    pl = { id: newId(), name: "New playlist", items: [], by: who, created: Date.now() };
+    botLib.playlists.push(pl);
+  }
+  if (typeof b.name === "string" && b.name.trim()) pl.name = clean1(b.name, 100);
+  const known = (ids) => (Array.isArray(ids) ? ids : []).map(String).filter((id) => botLib.items.some((x) => x.id === id));
+  if (Array.isArray(b.items)) pl.items = [...new Set(known(b.items))];
+  for (const id of known(b.add)) if (!pl.items.includes(id)) pl.items.push(id);
+  if (Array.isArray(b.remove)) pl.items = pl.items.filter((id) => !b.remove.includes(id));
+  saveBotLib();
+  return { ...botLibView(), playlist: pl.id };
+}
+async function botDo(b) {
+  const a = String(b.action || "");
+  const one = (id) => botResolve([id])[0];
+  switch (a) {
+    case "join": return botCall("join", { guildId: String(b.guildId || ""), channelId: String(b.channelId || "") }, 30000);
+    case "play": return botCall("play", { items: botResolve(b.ids), start: Number(b.start) || 0 });
+    case "playlist": {
+      const pl = botLib.playlists.find((x) => x.id === b.id);
+      if (!pl) throw new Error("that playlist is gone");
+      await botCall("shuffle", { on: !!b.shuffle });
+      return botCall("play", { items: botResolve(pl.items), start: 0 });
+    }
+    case "enqueue": return botCall("enqueue", { items: botResolve(b.ids), next: !!b.next });
+    case "ambience": case "sfx": {
+      const it = one(b.id);
+      if (!it) throw new Error("that sound is gone");
+      return botCall(a, { item: it, on: b.on !== false, volume: b.volume == null ? undefined : Number(b.volume) });
+    }
+    case "leave": case "remove": case "move": case "clear": case "jump": case "pause": case "resume": case "skip": case "previous": case "seek":
+    case "stopMusic": case "loop": case "shuffle": case "ambienceOff": case "stopSfx": case "volume": case "stopAll":
+      return botCall(a, b.args && typeof b.args === "object" ? b.args : {});
+    default: throw new Error("unknown action");
+  }
+}
+async function botRoute(req, res, p, url) {
+  if (req.method !== "POST") return send(res, 405, { error: "POST only" });
+  // a file from the Discord Bot tab: the body is the file, the headers say who sends it and its name
+  if (p === "/api/discord-bot/upload") {
+    const me = ownProfile(String(req.headers["x-sour-profile"] || ""), String(req.headers["x-sour-key"] || ""));
+    if (!botAllowed(me)) { req.resume(); return send(res, 403, { error: NO_BOT }); }
+    let name = "";
+    try { name = decodeURIComponent(String(req.headers["x-file-name"] || "")); } catch {}
+    const kind = BOT_KINDS.includes(url.searchParams.get("kind")) ? url.searchParams.get("kind") : "sfx";
+    if (!BOT_AUDIO.test(name)) { req.resume(); return send(res, 400, { error: "that isn't a sound file (mp3, m4a, ogg, opus, wav, flac...)" }); }
+    try { return send(res, 200, botItemView(await botUpload(req, name, kind, me.name))); } catch (e) { return send(res, 400, { error: e.message }); }
+  }
+  const b = await readBody(req, 400000);
+  const me = ownProfile(String(b.profile || ""), b.key);
+  if (!botAllowed(me)) return send(res, 403, { error: NO_BOT });
+  try {
+    switch (p) {
+      case "/api/discord-bot/state": return send(res, 200, botStateView());
+      case "/api/discord-bot/library": return send(res, 200, botLibView());
+      case "/api/discord-bot/do": await botDo(b); return send(res, 200, botStateView());
+      case "/api/discord-bot/copy": {
+        const added = await botCopySongs(b.songs, b.kind, me.name, b.playlist);
+        return send(res, 200, { ...botLibView(), added: added.length });
+      }
+      case "/api/discord-bot/youtube": return send(res, 200, botItemView(botFromYouTube(b.url, b.kind, b.title, me.name)));
+      case "/api/discord-bot/edit": return send(res, 200, botEdit(b));
+      case "/api/discord-bot/remove": return send(res, 200, botRemove(b));
+      case "/api/discord-bot/playlist": return send(res, 200, botPlaylistSave(b, me.name));
+      case "/api/discord-bot/playlist/remove":
+        botLib.playlists = botLib.playlists.filter((x) => x.id !== b.id);
+        saveBotLib();
+        return send(res, 200, botLibView());
+      default: return send(res, 404, { error: "not found" });
+    }
+  } catch (e) { return send(res, 400, { error: e.message }); }
+}
+setTimeout(() => { if (config.discordToken) startBot(); }, 5000);
 
 // ---------- /duplicate: find copies of the same song, keep the best one ----------
 // ---- library tools (Sour Player 0.4): a song file by its path inside the library, tag/cover edits, the archive ----
@@ -4297,7 +4613,7 @@ async function sourRoute(req, res, p, get, post, url) {
     const owner = ownProfile(prof.id, b.key);
     const helper = !owner && b.as && perksOf(String(b.as)).includes("admin") ? ownProfile(String(b.as), b.key) : null;
     if (!owner && !(helper && ["", "me", "image"].includes(sub))) return send(res, 403, { error: "that isn't your profile" });
-    const mine = () => (helper ? { ...publicProfile(prof, true), visits: [], resume: null } : publicProfile(prof, true));
+    const mine = () => (helper ? { ...publicProfile(prof, true), visits: [], resume: null } : { ...publicProfile(prof, true), discordBot: botAllowed(prof) });
     if (sub === "me") return send(res, 200, mine());
     if (sub === "inbox") { // pings and new wall notes since you last looked
       const since = Number(b.since) || 0;
@@ -4577,14 +4893,17 @@ http.createServer(async (req, res) => {
     "/api/duels", "/api/hall", "/api/hotseat", "/api/asks", "/api/duo/", "/api/wrapped-night", "/api/daily-color", "/api/sourness/", "/api/karaoke", "/api/feedback", "/api/along/", "/api/shop", "/api/inbox", "/api/polls", "/api/daily-guess", "/api/album-club", "/api/hot-takes", "/api/predict"];
   const isSour = SOUR_PREFIXES.some((x) => p.startsWith(x)) || SOUR_ROUTES.includes(p);
   if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/lyrics") || p.startsWith("/api/requests") || p.startsWith("/api/library") || p.startsWith("/api/duplicates") || isSour
-    || ["/api/status", "/api/now", "/api/bump", "/api/storage", "/api/song-dna", "/api/announcement", "/api/liner-notes"].includes(p) || p.startsWith("/api/admin/")) { // used by Sour Player (the custom Feishin)
+    || ["/api/status", "/api/now", "/api/bump", "/api/storage", "/api/song-dna", "/api/announcement", "/api/liner-notes"].includes(p) || p.startsWith("/api/admin/")
+    || p.startsWith("/api/discord-bot/")) { // used by Sour Player (the custom Feishin)
     res.setHeader("access-control-allow-origin", "*");
     if (req.method === "OPTIONS") {
-      res.writeHead(204, { "access-control-allow-methods": "GET, POST", "access-control-allow-headers": "content-type", "access-control-max-age": "86400" });
+      // the Discord bot's uploads say who sends them (and the file's name) in headers
+      res.writeHead(204, { "access-control-allow-methods": "GET, POST", "access-control-allow-headers": "content-type, x-sour-profile, x-sour-key, x-file-name", "access-control-max-age": "86400" });
       return res.end();
     }
   }
   if (p.startsWith("/api/group/")) return groupRoute(req, res, p, get, post, url);
+  if (p.startsWith("/api/discord-bot/")) return botRoute(req, res, p, url);
   if (isSour) return sourRoute(req, res, p, get, post, url);
 
   if (get && p === "/") return send(res, 200, PAGE, "text/html");
@@ -5142,8 +5461,18 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
   }
   if (get && p === "/api/config/sour-users") { // Sour Player profiles, for removing someone in the config page
     return send(res, 200, visibleProfiles().map((x) => ({ id: x.id, name: x.name, account: x.navidrome || null, created: x.created || null, lastSeen: x.lastSeen || null,
-      admin: isAdmin(x), navidromeAdmin: !!x.admin }))
+      admin: isAdmin(x), navidromeAdmin: !!x.admin, bot: botAllowed(x) }))
       .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0)));
+  }
+  if (post && p === "/api/config/sour-users/bot") { // let someone use the Discord bot (admins always can)
+    const b = await readBody(req);
+    if (!adminOk(b, req)) return send(res, 403, { error: "admins only - sign in on the Config page" });
+    const prof = profiles[String(b.id || "")];
+    if (!prof || prof.mergedInto) return send(res, 404, { error: "no such profile" });
+    prof.botAccess = !!b.allowed;
+    saveProfiles();
+    adminLog("config", `${prof.botAccess ? "let" : "stopped"} ${prof.name} ${prof.botAccess ? "use" : "using"} the Discord bot`, (adminTokens.get(String(req.headers["x-hermes-admin"] || "")) || {}).user || null);
+    return send(res, 200, { bot: botAllowed(prof) });
   }
   if (post && p === "/api/config/sour-users/admin") { // make someone a Sour Player admin by hand (or take it back)
     const b = await readBody(req);
