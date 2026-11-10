@@ -154,7 +154,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             <div id="sess">Session: -</div>
           </div>
           <div class="rt">
-            <h2>Hermes Music v3.12.0</h2>
+            <h2>Hermes Music v3.13.0</h2>
             <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
             <div class="sec"><span class="k">&#9662; Workers</span><br><span id="w-worker" class="d">-</span></div>
             <div class="sec"><span class="k">&#9662; Library</span><br><span class="d" id="w-lib">-</span></div>
@@ -468,6 +468,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
       <div class="row"><label for="c-paused">Pause requests<small>worker skips the queue</small></label><input type="checkbox" id="c-paused"></div>
       <div class="row"><label for="c-rate">Requests per minute<small>per device, stops spam</small></label><input type="number" id="c-rate" min="1" max="30"></div>
       <div class="row"><label for="c-fast">Fast lanes<small>songs downloaded side by side (0-6). More is faster, but YouTube may ask this server to sign in sooner</small></label><input type="number" id="c-fast" min="0" max="6"></div>
+      <div class="row"><label for="c-vidgb">Music video copies<small>GB kept so Sour Player plays videos smoothly (0 = off: YouTube's own player instead)</small></label><input type="number" id="c-vidgb" min="0" max="100"></div>
 
       <div class="grp">&#9662; Security</div>
       <div class="row" id="r-cur"><label for="c-cur">Current PIN<small>needed to save changes</small></label><input type="password" id="c-cur" inputmode="numeric" autocomplete="off"></div>
@@ -848,7 +849,7 @@ function fillCfg() {
   $("c-url").value = cfg.localUrl; $("c-lmodel").value = cfg.localModel; $("c-ctx").value = cfg.contextLength; $("c-key").value = "";
   $("keyhint").textContent = cfg.hasKey ? "a key is saved" : "optional";
   $("c-fmt").value = cfg.audioFormat; $("c-max").value = cfg.maxMinutes; $("c-art").checked = cfg.embedArt;
-  $("c-paused").checked = cfg.paused; $("c-rate").value = cfg.ratePerMinute; $("c-fast").value = cfg.fastWorkers ?? 3; $("c-folders").checked = cfg.artistFolders; $("c-maxalb").value = cfg.artistMaxAlbums;
+  $("c-paused").checked = cfg.paused; $("c-rate").value = cfg.ratePerMinute; $("c-fast").value = cfg.fastWorkers ?? 3; $("c-vidgb").value = cfg.videoCacheGB ?? 4; $("c-folders").checked = cfg.artistFolders; $("c-maxalb").value = cfg.artistMaxAlbums;
   $("c-ndurl").value = cfg.navidromeUrl || "";
   $("ythint").textContent = cfg.hasYtCookies ? "cookies are saved" : "none saved";
   $("c-dten").checked = cfg.downtifyEnabled; $("c-dturl").value = cfg.downtifyUrl || ""; $("c-dtuser").value = cfg.downtifyUser || ""; $("c-dtpass").value = "";
@@ -875,7 +876,7 @@ $("c-save").onclick = async () => {
       spotifyClientId: $("c-spid").value.trim(), spotifySecret: $("c-spsec").value.trim(),
       navidromeUrl: $("c-ndurl").value,
       downtifyEnabled: $("c-dten").checked, downtifyUrl: $("c-dturl").value, downtifyUser: $("c-dtuser").value, downtifyPassword: $("c-dtpass").value, downtifyToken: $("c-dtcode").value.trim() === "-" ? "-" : undefined,
-      paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, fastWorkers: +$("c-fast").value, claudeToken: $("c-token").value, aiKaraoke: $("c-aik").checked, announcement: $("c-ann").value, banned: $("c-ban").value, approveBig: $("c-appr").checked,
+      paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, fastWorkers: +$("c-fast").value, videoCacheGB: +$("c-vidgb").value, claudeToken: $("c-token").value, aiKaraoke: $("c-aik").checked, announcement: $("c-ann").value, banned: $("c-ban").value, approveBig: $("c-appr").checked,
       discordToken: $("c-dbtok").value.trim(),
       currentPin: $("c-cur").value, newPin: $("c-pin").value }) });
     fillCfg(); m.textContent = "saved"; render(); watchBot();

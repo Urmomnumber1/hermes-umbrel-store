@@ -60,7 +60,7 @@ const DEFAULTS = {
   // Navidrome on this Umbrel: Sour Player profiles are tied to Navidrome accounts (blank = find it by itself)
   navidromeUrl: "",
   // queue
-  paused: false, ratePerMinute: 5, fastWorkers: 3,
+  paused: false, ratePerMinute: 5, fastWorkers: 3, videoCacheGB: 4,
   // security
   pin: "",
 };
@@ -129,6 +129,7 @@ function updateConfig(b, ok) {
   if (typeof b.paused === "boolean") next.paused = b.paused;
   if (int(b.ratePerMinute, 1, 30) != null) next.ratePerMinute = int(b.ratePerMinute, 1, 30);
   if (int(b.fastWorkers, 0, 6) != null) next.fastWorkers = int(b.fastWorkers, 0, 6);
+  if (int(b.videoCacheGB, 0, 100) != null) next.videoCacheGB = int(b.videoCacheGB, 0, 100);
   // the Discord bot's token (Discord developer page > your app > Bot > Reset Token)
   if (typeof b.discordToken === "string" && b.discordToken) {
     const t = secret(b.discordToken);
@@ -2535,6 +2536,59 @@ for (const w of WORKERS) {
     }
   })();
 }
+// ---------- music video copies: Sour Player 0.11+ plays these instead of YouTube's own player (smoother,
+// lighter, no YouTube buttons). Video only (the song plays from the library), 720p at most, H.264 so iPhones
+// play it too. The least recently watched ones go when the folder is over Config's size. ----------
+const VIDEO_CACHE = "/data/video-cache";
+const videoJobs = new Map(); // id -> { error, at }
+const videoFile = (id) => path.join(VIDEO_CACHE, `${id}.mp4`);
+function trimVideoCache() {
+  const cap = (config.videoCacheGB ?? 4) * 1024 ** 3;
+  let files = [];
+  try {
+    files = fs.readdirSync(VIDEO_CACHE).filter((f) => /^[\w-]{11}\.mp4$/.test(f))
+      .map((f) => { const p = path.join(VIDEO_CACHE, f), s = fs.statSync(p); return { p, size: s.size, used: s.mtimeMs }; });
+  } catch { return; }
+  let total = files.reduce((n, f) => n + f.size, 0);
+  for (const f of files.sort((a, b) => a.used - b.used)) { if (total <= cap) break; fs.rmSync(f.p, { force: true }); total -= f.size; }
+}
+// "ready", or starts making the copy (one at a time) and answers "preparing" / "failed"
+function prepareVideo(id) {
+  if (fs.existsSync(videoFile(id))) return { status: "ready" };
+  if (!(config.videoCacheGB ?? 4)) return { status: "failed", error: "video copies are off in Config" };
+  const job = videoJobs.get(id);
+  if (job && !job.error) return { status: "preparing" };
+  if (job?.error && Date.now() - job.at < 30 * 60000) return { status: "failed", error: job.error };
+  if (!ready()) return { status: "failed", error: "Hermes Music is still setting up its tools" };
+  const j = { error: null, at: Date.now() };
+  videoJobs.set(id, j);
+  oneAtATime("video", async () => {
+    fs.mkdirSync(VIDEO_CACHE, { recursive: true });
+    const r = await run("yt-dlp", ["--no-playlist", "--no-warnings", "-N", "4",
+      "-f", "bv*[height<=720][vcodec^=avc1][ext=mp4]/bv*[height<=720][ext=mp4]/b[height<=720][ext=mp4]",
+      "-o", path.join(VIDEO_CACHE, `${id}.tmp.%(ext)s`), `https://www.youtube.com/watch?v=${id}`], { timeout: 15 * 60000 });
+    const parts = fs.readdirSync(VIDEO_CACHE).filter((f) => f.startsWith(`${id}.tmp.`));
+    const got = parts.find((f) => f === `${id}.tmp.mp4`);
+    if (got) fs.renameSync(path.join(VIDEO_CACHE, got), videoFile(id));
+    for (const f of parts) if (f !== got) fs.rmSync(path.join(VIDEO_CACHE, f), { force: true });
+    if (got) { videoJobs.delete(id); trimVideoCache(); }
+    else Object.assign(j, { error: ytError(r.err, "video download failed").message, at: Date.now() });
+  }).catch((e) => Object.assign(j, { error: e.message, at: Date.now() }));
+  return { status: "preparing" };
+}
+// a file with seeking (Range requests), for <audio> and <video>
+function sendRanged(req, res, file, type) {
+  const size = fs.statSync(file).size, range = String(req.headers.range || "").match(/bytes=(\d*)-(\d*)/);
+  const head = { "content-type": type, "accept-ranges": "bytes", "access-control-allow-origin": "*", "cache-control": "private, max-age=86400" };
+  if (range && (range[1] || range[2])) {
+    const start = range[1] ? Math.min(Number(range[1]), size - 1) : Math.max(0, size - Number(range[2]));
+    const end = range[1] && range[2] ? Math.min(Number(range[2]), size - 1) : size - 1;
+    res.writeHead(206, { ...head, "content-range": `bytes ${start}-${end}/${size}`, "content-length": end - start + 1 });
+    return fs.createReadStream(file, { start, end }).pipe(res);
+  }
+  res.writeHead(200, { ...head, "content-length": size });
+  return fs.createReadStream(file).pipe(res);
+}
 // ---------- music videos (/video): matched here, streamed by the custom Feishin from YouTube ----------
 // Nothing is downloaded. Hermes Music only remembers which YouTube video belongs to which song in the library.
 const VIDEOS = "/data/videos.json";
@@ -4617,11 +4671,25 @@ async function sourRoute(req, res, p, get, post, url) {
     }
     // who they're listening along with right now (friends see who is riding along)
     me.alongWith = typeof b.alongWith === "string" && profiles[b.alongWith] ? b.alongWith : null;
-    // the Sour Shop: the song before this one earns a point if you got past halfway
+    // the Sour Shop. Sour Player 0.11+ sends the songs this device heard past halfway (kept on the device until
+    // Hermes has them, so a phone asleep in a pocket still earns them); older ones are followed beat by beat.
+    const heardList = Array.isArray(b.heard) ? b.heard : null;
+    if (heardList) {
+      const seen = new Set(Array.isArray(me.heardSeen) ? me.heardSeen : []);
+      for (const h of heardList.slice(0, 50)) {
+        const at = Number(h?.at) || 0, id = String(h?.id || "").slice(0, 100), k = `${id}@${at}`;
+        if (!id || at < now - 3 * 86400000 || at > now + 600000 || seen.has(k)) continue;
+        seen.add(k);
+        const n = 1 + (!(me.stats?.songs?.[id]?.n > 1) ? 1 : 0) + (h.social ? 1 : 0); // new to you, with friends
+        addPoints(me, n, String(h.title || "a song").slice(0, 120));
+      }
+      me.heardSeen = [...seen].slice(-500);
+      profilesDirty = true;
+    }
     const pos = Number(b.position) || 0;
     let pt = before && before.pt ? before.pt : null;
     if (pt && (!song || pt.id !== song.id)) {
-      if (pt.dur && pt.max * 1000 >= pt.dur / 2) {
+      if (!heardList && pt.dur && pt.max * 1000 >= pt.dur / 2) {
         let n = 1;
         if (pt.fresh) n++; // a song new to you
         if (pt.social) n++; // in Group Play or listening along
@@ -5481,6 +5549,15 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
   }
 
   // ---- music videos ----
+  if (get && (p === "/api/videos/file" || p === "/api/videos/file/status")) { // ?id= Hermes Music's copy of a video
+    const id = String(url.searchParams.get("id") || "");
+    if (!/^[\w-]{11}$/.test(id)) return send(res, 400, { error: "bad video id" });
+    const st = prepareVideo(id);
+    if (p.endsWith("/status") || st.status !== "ready") return send(res, p.endsWith("/status") ? 200 : st.status === "failed" ? 502 : 202, st);
+    const now = new Date();
+    try { fs.utimesSync(videoFile(id), now, now); } catch {} // recently watched: kept longest
+    return sendRanged(req, res, videoFile(id), "video/mp4");
+  }
   if (get && p === "/api/videos/lookup") { // asked by Feishin for the song that's playing; open to any origin (read-only)
     const cors = { "access-control-allow-origin": "*", "cache-control": "no-store" };
     const key = songKey(url.searchParams.get("artist") || "", url.searchParams.get("title") || ""), v = videos[key];

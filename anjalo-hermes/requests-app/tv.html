@@ -187,7 +187,16 @@ const $ = (id) => document.getElementById(id);
 const SCREEN = new URLSearchParams(location.search).get("screen");
 if (SCREEN) document.body.classList.add("screen");
 // tell the iPhone app which party is on, so it can show it on the TV
-const tellApp = (code) => { try { window.webkit?.messageHandlers?.sourtv?.postMessage({ code: code || null, auth: code && login ? auth() : null }); } catch {} };
+// inside Sour Player 0.11+ (TV party, ?app=1): tell the app around this page too, so it puts the party on the TV
+const APP_PARENT = (() => {
+  const q = new URLSearchParams(location.search);
+  return q.get("app") === "1" && window.parent !== window ? q.get("parent") || location.origin : null;
+})();
+const tellApp = (code) => {
+  const msg = { code: code || null, auth: code && login ? auth() : null };
+  try { window.webkit?.messageHandlers?.sourtv?.postMessage(msg); } catch {}
+  try { if (APP_PARENT) window.parent.postMessage({ sourtv: msg }, APP_PARENT); } catch {}
+};
 const audio = $("audio");
 const store = {
   get(k) { try { return JSON.parse(localStorage.getItem(k) || "null"); } catch { return null; } },
