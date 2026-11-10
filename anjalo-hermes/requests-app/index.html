@@ -154,7 +154,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
             <div id="sess">Session: -</div>
           </div>
           <div class="rt">
-            <h2>Hermes Music v3.11.1</h2>
+            <h2>Hermes Music v3.12.0</h2>
             <div class="sec"><span class="k">&#9662; Queue</span><br><span class="d" id="w-queue">-</span></div>
             <div class="sec"><span class="k">&#9662; Workers</span><br><span id="w-worker" class="d">-</span></div>
             <div class="sec"><span class="k">&#9662; Library</span><br><span class="d" id="w-lib">-</span></div>
@@ -229,7 +229,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
           <div class="in">
             <ol>
               <li>Type <code>/album</code>, then the artist and the album name.</li>
-              <li>The tracklist is looked up (iTunes, then Deezer) and every track downloads one by one.</li>
+              <li>The tracklist is looked up (Apple Music, then Deezer; the tags come from Spotify when it has the album) and the tracks download a few at a time.</li>
               <li>The line shows progress like <code>downloading 4/12</code>. Songs you already have are skipped.</li>
             </ol>
             <div class="shot">
@@ -421,7 +421,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
       <div class="row"><label for="c-fmt">Audio format<small>what gets saved to the library</small></label>
         <select id="c-fmt"><option>mp3</option><option>opus</option><option>m4a</option><option>flac</option></select></div>
       <div class="row"><label for="c-max">Max song length (min)<small>longer videos are skipped</small></label><input type="number" id="c-max" min="1" max="30"></div>
-      <div class="row"><label for="c-art">Embed cover art<small>album cover from iTunes/Deezer, else video thumbnail</small></label><input type="checkbox" id="c-art"></div>
+      <div class="row"><label for="c-art">Embed cover art<small>album cover from Spotify, Apple Music or Deezer, else the video thumbnail</small></label><input type="checkbox" id="c-art"></div>
       <div class="row"><label for="c-folders">Artist folders<small>music/Artist/Album/Song, off = all in one folder</small></label><input type="checkbox" id="c-folders"></div>
 
       <div class="grp">&#9662; Albums &amp; artists</div>
@@ -429,7 +429,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
       <div class="row"><label for="c-singles">Include singles &amp; EPs<small>for /artist</small></label><input type="checkbox" id="c-singles"></div>
 
       <div class="grp">&#9662; Spotify (optional)</div>
-      <p class="sub2">Without keys, Spotify playlists stop at 100 songs. With a free Spotify developer app you get whole playlists and can import a whole profile: developer.spotify.com/dashboard &rarr; Create app (any name, redirect URI http://localhost/callback, tick Web API) &rarr; Settings &rarr; copy the Client ID and secret here.</p>
+      <p class="sub2">Not needed for Spotify tags: Hermes reads them from Spotify's public pages whenever MusicBrainz links the album to Spotify. Keys add Spotify's search for every song, but since 2026 Spotify only gives them to Spotify Premium accounts, and whole playlists past 100 songs or profile import may no longer work with them: developer.spotify.com/dashboard &rarr; Create app (any name, redirect URI http://localhost/callback, tick Web API) &rarr; Settings &rarr; copy the Client ID and secret here.</p>
       <div class="row"><label for="c-spid">Client ID<small id="sphint">not set</small></label><input type="password" id="c-spid" placeholder="blank = keep" autocomplete="off"></div>
       <div class="row"><label for="c-spsec">Client secret</label><input type="password" id="c-spsec" placeholder="blank = keep" autocomplete="off"></div>
 
@@ -467,6 +467,7 @@ input[type=checkbox]{accent-color:var(--acc);width:16px;height:16px}
       <div class="grp">&#9662; Queue</div>
       <div class="row"><label for="c-paused">Pause requests<small>worker skips the queue</small></label><input type="checkbox" id="c-paused"></div>
       <div class="row"><label for="c-rate">Requests per minute<small>per device, stops spam</small></label><input type="number" id="c-rate" min="1" max="30"></div>
+      <div class="row"><label for="c-fast">Fast lanes<small>songs downloaded side by side (0-6). More is faster, but YouTube may ask this server to sign in sooner</small></label><input type="number" id="c-fast" min="0" max="6"></div>
 
       <div class="grp">&#9662; Security</div>
       <div class="row" id="r-cur"><label for="c-cur">Current PIN<small>needed to save changes</small></label><input type="password" id="c-cur" inputmode="numeric" autocomplete="off"></div>
@@ -504,7 +505,7 @@ function demo(path, opt) {
     library: { files: 16785, scanning: false, scanned: true } };
   if (path === "api/config") return { engine: "both", claudeModel: "sonnet", localUrl: "http://umbrel.local:11434/v1", localModel: "qwen3.8:27b", contextLength: 8192, downtifyPaired: true,
     hasKey: false, hasToken: true, audioFormat: "mp3", maxMinutes: 10, embedArt: true, artistFolders: true, artistMaxAlbums: 50, includeSingles: true,
-    paused: false, ratePerMinute: 5, hasPin: true, downtifyEnabled: true, downtifyUrl: "http://downtify_downtify_1:8000", downtifyUser: "admin", hasDowntifyPassword: false };
+    paused: false, ratePerMinute: 5, fastWorkers: 3, hasPin: true, downtifyEnabled: true, downtifyUrl: "http://downtify_downtify_1:8000", downtifyUser: "admin", hasDowntifyPassword: false };
   if (path === "api/videos" && opt && opt.method === "POST") return { artist: "The Killers", song: "Mr. Brightside", videoId: "gGdGFtwCNBE", title: "The Killers - Mr. Brightside (Official Music Video)", channel: "TheKillersMusic" };
   if (path === "api/videos") return [{ artist: "Adele", song: "Rolling in the Deep", videoId: "rYEDA3JcQqw" }, { artist: "The Killers", song: "Mr. Brightside", videoId: "gGdGFtwCNBE" }];
   if (path === "api/now") return { pos: 3, name: "mr brightside the killers", count: 1 };
@@ -591,7 +592,7 @@ function render() {
       : lib.scanned ? lib.files.toLocaleString() + " songs indexed · duplicates are skipped" : "not scanned yet";
   }
   if (cfg) {
-    $("w-cfg").textContent = cfg.audioFormat + " · max " + cfg.maxMinutes + " min · " + cfg.ratePerMinute + " requests/min · catalogues: iTunes + Deezer" + (cfg.downtifyEnabled ? " · backup: Downtify" : "");
+    $("w-cfg").textContent = cfg.audioFormat + " · max " + cfg.maxMinutes + " min · " + cfg.ratePerMinute + " requests/min · " + (cfg.fastWorkers ?? 3) + " fast lanes · tags: Spotify, Apple Music, Deezer, YouTube Music" + (cfg.downtifyEnabled ? " · backup: Downtify" : "");
     const claude = "Claude Code · " + cfg.claudeModel, lm = cfg.localModel || "local model";
     $("eng").textContent = cfg.engine === "local" ? lm : cfg.engine === "both" ? claude + " + " + lm : claude;
   }
@@ -758,7 +759,7 @@ $("f").onsubmit = async (e) => {
           if (pending && pending.cls === "sys" && /^(fixing|checking the library)/.test(pending.text)) pending.text = text; else push("sys", text);
           render();
         }
-        push("ok", r.total ? r.fixed + " fixed" + (r.failed ? ", " + r.failed + " couldn't be fixed (no match on iTunes/Deezer - rename them 'Artist - Title')" : "") : "nothing needed fixing");
+        push("ok", r.total ? r.fixed + " fixed" + (r.failed ? ", " + r.failed + " couldn't be fixed (no match on Spotify, Apple Music or Deezer - rename them 'Artist - Title')" : "") : "nothing needed fixing");
       } catch (e) { push("err", e.message); }
     }
     else if (name === "/fix" || name === "/upgrade") {
@@ -847,14 +848,14 @@ function fillCfg() {
   $("c-url").value = cfg.localUrl; $("c-lmodel").value = cfg.localModel; $("c-ctx").value = cfg.contextLength; $("c-key").value = "";
   $("keyhint").textContent = cfg.hasKey ? "a key is saved" : "optional";
   $("c-fmt").value = cfg.audioFormat; $("c-max").value = cfg.maxMinutes; $("c-art").checked = cfg.embedArt;
-  $("c-paused").checked = cfg.paused; $("c-rate").value = cfg.ratePerMinute; $("c-folders").checked = cfg.artistFolders; $("c-maxalb").value = cfg.artistMaxAlbums;
+  $("c-paused").checked = cfg.paused; $("c-rate").value = cfg.ratePerMinute; $("c-fast").value = cfg.fastWorkers ?? 3; $("c-folders").checked = cfg.artistFolders; $("c-maxalb").value = cfg.artistMaxAlbums;
   $("c-ndurl").value = cfg.navidromeUrl || "";
   $("ythint").textContent = cfg.hasYtCookies ? "cookies are saved" : "none saved";
   $("c-dten").checked = cfg.downtifyEnabled; $("c-dturl").value = cfg.downtifyUrl || ""; $("c-dtuser").value = cfg.downtifyUser || ""; $("c-dtpass").value = "";
   $("dthint").textContent = cfg.hasDowntifyPassword ? "a password is saved" : "blank = default (downtify)";
   $("pairhint").textContent = cfg.downtifyPaired ? "\u2714 paired (type - and Save to unpair)" : "best: no password needed"; $("c-dtcode").value = "";
   $("c-singles").checked = cfg.includeSingles; $("c-token").value = "";
-  $("c-spid").value = ""; $("c-spsec").value = ""; $("sphint").textContent = cfg.hasSpotify ? "keys are saved" : "not set";
+  $("c-spid").value = ""; $("c-spsec").value = ""; $("sphint").textContent = cfg.hasSpotify ? "keys are saved · " + (cfg.spotifyState || "not checked yet") : "not set (tags still come from Spotify through MusicBrainz)";
   $("tokhint").textContent = cfg.hasToken ? "a token is saved" : "run: claude setup-token";
   $("c-aik").checked = cfg.aiKaraoke !== false;
   $("c-appr").checked = !!cfg.approveBig; $("c-ann").value = cfg.announcement || ""; $("c-ban").value = (cfg.banned || []).join("\n");
@@ -874,7 +875,7 @@ $("c-save").onclick = async () => {
       spotifyClientId: $("c-spid").value.trim(), spotifySecret: $("c-spsec").value.trim(),
       navidromeUrl: $("c-ndurl").value,
       downtifyEnabled: $("c-dten").checked, downtifyUrl: $("c-dturl").value, downtifyUser: $("c-dtuser").value, downtifyPassword: $("c-dtpass").value, downtifyToken: $("c-dtcode").value.trim() === "-" ? "-" : undefined,
-      paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, claudeToken: $("c-token").value, aiKaraoke: $("c-aik").checked, announcement: $("c-ann").value, banned: $("c-ban").value, approveBig: $("c-appr").checked,
+      paused: $("c-paused").checked, ratePerMinute: +$("c-rate").value, fastWorkers: +$("c-fast").value, claudeToken: $("c-token").value, aiKaraoke: $("c-aik").checked, announcement: $("c-ann").value, banned: $("c-ban").value, approveBig: $("c-appr").checked,
       discordToken: $("c-dbtok").value.trim(),
       currentPin: $("c-cur").value, newPin: $("c-pin").value }) });
     fillCfg(); m.textContent = "saved"; render(); watchBot();

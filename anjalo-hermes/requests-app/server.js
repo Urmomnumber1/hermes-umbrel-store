@@ -60,7 +60,7 @@ const DEFAULTS = {
   // Navidrome on this Umbrel: Sour Player profiles are tied to Navidrome accounts (blank = find it by itself)
   navidromeUrl: "",
   // queue
-  paused: false, ratePerMinute: 5,
+  paused: false, ratePerMinute: 5, fastWorkers: 3,
   // security
   pin: "",
 };
@@ -128,6 +128,7 @@ function updateConfig(b, ok) {
   }
   if (typeof b.paused === "boolean") next.paused = b.paused;
   if (int(b.ratePerMinute, 1, 30) != null) next.ratePerMinute = int(b.ratePerMinute, 1, 30);
+  if (int(b.fastWorkers, 0, 6) != null) next.fastWorkers = int(b.fastWorkers, 0, 6);
   // the Discord bot's token (Discord developer page > your app > Bot > Reset Token)
   if (typeof b.discordToken === "string" && b.discordToken) {
     const t = secret(b.discordToken);
@@ -141,10 +142,12 @@ function updateConfig(b, ok) {
   }
   if (next.engine !== "claude" && (!next.localUrl || !next.localModel)) return "the local model needs a base URL and model name";
   const newBotToken = (next.discordToken || "") !== (config.discordToken || "");
+  const newSpotify = (next.spotifyClientId || "") !== (config.spotifyClientId || "") || (next.spotifySecret || "") !== (config.spotifySecret || "");
   config = next;
   fs.writeFileSync(CFG, JSON.stringify(config, null, 1));
   Object.assign(dt, { cookie: "", blockedUntil: 0, noAuth: false, failed: "" }); // Downtify login may have changed
   if (newBotToken) { stopBot(); bot.note = ""; bot.restarts = 0; if (config.discordToken) setTimeout(startBot, 300); }
+  if (newSpotify) { Object.assign(sp, { token: "", until: 0, state: "" }); delete pace.Spotify; metaCache.clear(); spotifyCheck(); }
   wake();
   return null;
 }
@@ -152,7 +155,8 @@ function updateConfig(b, ok) {
 const publicConfig = () => {
   const { pin, localKey, claudeToken, auddToken: _audd, downtifyPassword, downtifyToken, spotifyClientId, spotifySecret, discordToken, ...rest } = config; // spotify*: left over from 2.2.0 configs
   return { ...rest, hasPin: !!pin, hasKey: !!localKey, hasToken: !!claudeToken, aiKaraokeState: DEMUCS.state, aiKaraokeNote: DEMUCS.note, hasDowntifyPassword: !!downtifyPassword, downtifyPaired: !!downtifyToken,
-    hasYtCookies: fs.existsSync(YT_COOKIES), hasSpotify: !!(spotifyClientId && spotifySecret), hasDiscordToken: !!discordToken, discordBot: botSummary() };
+    hasYtCookies: fs.existsSync(YT_COOKIES), hasSpotify: !!(spotifyClientId && spotifySecret),
+    spotifyState: !(spotifyClientId && spotifySecret) ? "off" : sp.state || "not checked yet", hasDiscordToken: !!discordToken, discordBot: botSummary() };
 };
 // YouTube sometimes answers "Sign in to confirm you're not a bot". yt-dlp's own answer is to sign in: a
 // cookies.txt exported from a browser where you're logged into YouTube (Config > YouTube sign-in). It stays
@@ -197,6 +201,24 @@ const deaccent = (s) => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "")
 // loose form for matching titles: no brackets, no "feat.", no punctuation
 const norm = (s) => deaccent(s).toLowerCase()
   .replace(/\(.*?\)|\[.*?\]/g, " ").replace(/\b(feat|ft)\.?\s.*$/, " ").replace(/[^a-z0-9]+/g, " ").trim();
+// like norm, but names in other scripts (Japanese, Korean, Cyrillic...) keep their letters instead of becoming ""
+const normAny = (s) => deaccent(s).toLowerCase().replace(/[(（[【].*?[)）\]】]/g, " ").replace(/\b(feat|ft)\.?\s.*$/, " ")
+  .replace(/[^\p{L}\p{M}\p{N}]+/gu, " ").trim();
+// the same artist, or one name starting the other ("Kanye West" / "Kanye West & JAY-Z")
+const artistMatch = (have, want) => {
+  const n = normAny(have), a = normAny(want);
+  if (!n || !a) return !!String(have || "").trim() && String(have || "").trim().toLowerCase() === String(want || "").trim().toLowerCase();
+  return n === a || n.startsWith(a + " ") || a.startsWith(n + " ");
+};
+// looser, for YouTube channel and uploader names ("TheWeekndVEVO")
+const looseArtist = (have, want) => {
+  const n = normAny(have).replace(/ /g, ""), a = normAny(want).replace(/ /g, "");
+  return !!n && !!a && (n === a || n.includes(a) || (n.length > 3 && a.includes(n)));
+};
+const ytError = (err, what) => {
+  const bot = botNote(err);
+  return Object.assign(new Error(bot || `${what}: ` + (String(err).trim().split("\n").pop() || "unknown").slice(0, 150)), { bot: !!bot });
+};
 // versions we don't want unless asked for
 const VERSION = /\b(remix|live|demo|mix|edit|acoustic|instrumental|karaoke|cover|sped|slowed|nightcore|8d|version|remaster(ed)?)\b/i;
 const COMP = /\b(live|karaoke|tribute|hits|best of|collection|anthology|essentials?|playlist|now that|remix(es|ed)?|mix|reconfigured|soundtrack|motion picture)\b/i;
@@ -206,10 +228,13 @@ const albumBase = (n) => norm(String(n || "").replace(/\s+-\s+(single|ep)$/i, ""
 
 // ---------- duplicate check: index of what's already in /music ----------
 const AUDIO = /\.(mp3|m4a|flac|opus|ogg|oga|aac|wav|wma|aiff?|alac)$/i;
-const primaryArtist = (a) => norm(String(a || "").split(/\s*(?:,|;|\/|&|\bfeat\.?|\bft\.?|\bwith\b|\bx\b)\s*/i)[0]);
+// names in other scripts (Japanese, Korean, Cyrillic...) keep their letters instead of all becoming ""
+const primaryArtist = (a) => { const p = String(a || "").split(/\s*(?:,|;|\/|&|\bfeat\.?|\bft\.?|\bwith\b|\bx\b)\s*/i)[0]; return norm(p) || normAny(p); };
 // exact-ish title: keeps words in brackets (so "Song (Live)" != "Song"), drops "feat." parts
-const titleKey = (t) => deaccent(t).toLowerCase().replace(/[([]\s*(feat|ft)\.?[^)\]]*[)\]]/g, " ").replace(/\b(feat|ft)\.?\s.*$/, " ")
-  .replace(/[^a-z0-9]+/g, " ").trim();
+const titleKey = (t) => {
+  const s = deaccent(t).toLowerCase().replace(/[([]\s*(feat|ft)\.?[^)\]]*[)\]]/g, " ").replace(/\b(feat|ft)\.?\s.*$/, " ");
+  return s.replace(/[^a-z0-9]+/g, " ").trim() || s.replace(/[^\p{L}\p{M}\p{N}]+/gu, " ").trim();
+};
 const songKey = (artist, title) => `${primaryArtist(artist)}|${titleKey(title)}`;
 const library = { keys: new Set(), albums: new Map(), files: 0, scanning: false, scanned: false, lastScan: 0 };
 let libCache = {};
@@ -322,11 +347,16 @@ async function runFixAll() {
     while (issues.running) await sleep(1000);
     const todo = issues.list.filter((x) => x.problems.some((p) => !/^low quality/.test(p)));
     fixAll.total = todo.length;
-    for (const x of todo) {
-      try { const r = await fixSong(x.file, "retag"); fixAll.fixed++; fixAll.last = `${r.artist} - ${r.title}`; }
-      catch (e) { fixAll.failed++; fixAll.last = `${x.file}: ${e.message}`; }
-      fixAll.done++;
-    }
+    let at = 0;
+    const lane = async () => { // four songs at a time; each waits its turn at the catalogues (Spotify's first)
+      while (at < todo.length) {
+        const x = todo[at++];
+        try { const r = await fixSong(x.file, "retag", true); fixAll.fixed++; fixAll.last = `${r.artist} - ${r.title}${r.source ? ` (tags from ${r.source})` : ""}`; }
+        catch (e) { fixAll.failed++; fixAll.last = `${x.file}: ${e.message}`; }
+        fixAll.done++;
+      }
+    };
+    await Promise.all([1, 2, 3, 4].map(lane));
     if (fixAll.fixed) scanLibrary();
   } finally { fixAll.running = false; }
 }
@@ -354,8 +384,8 @@ async function scanIssues() {
   await Promise.all(Array.from({ length: 6 }, one));
   issues.running = false;
 }
-// re-tag a file in place (tags + cover from iTunes/Deezer), or replace it with a better download
-async function fixSong(rel, action) {
+// re-tag a file in place (tags + cover from Spotify, else Apple Music, Deezer or YouTube Music), or replace it with a better download
+async function fixSong(rel, action, patient) {
   const file = path.join(MUSIC, rel);
   if (!file.startsWith(MUSIC + path.sep) || !fs.existsSync(file)) throw new Error("that file isn't in the library any more");
   const cached = libCache[file] || {};
@@ -363,7 +393,7 @@ async function fixSong(rel, action) {
   const c = guessFromPath(file, { a: junkTag(cached.a) ? "" : cached.a, aa: junkTag(cached.aa) ? "" : cached.aa, t: junkTag(cached.t) ? "" : cached.t });
   const artist = c.a || c.aa, title = c.t;
   if (!artist || !title) throw new Error("not enough to go on - rename the file to 'Artist - Title' first");
-  const meta = (await catalogMeta(artist, title)) || { artist, title };
+  const meta = (await catalogMeta(artist, title, patient)) || { artist, title };
   const ext = path.extname(file).slice(1).toLowerCase();
   return ctx.run({ stage: path.join(STAGING, "fix-" + newId()) }, async () => {
     fs.mkdirSync(ST(), { recursive: true });
@@ -382,7 +412,7 @@ async function fixSong(rel, action) {
       if (meta.cover && !meta.ytCover && await fetchFile(meta.cover, path.join(ST(), "cover.jpg")).catch(() => false)) cover = path.join(ST(), "cover.jpg");
       else if (await fallbackCover(meta.artist, meta.title, path.join(ST(), "cover.jpg"))) cover = path.join(ST(), "cover.jpg");
       const out = path.join(ST(), `fixed.${outExt}`);
-      const tags = { title: meta.title, artist: meta.artist, album_artist: meta.albumArtist || meta.artist, album: meta.album, date: meta.date, track: meta.track, genre: meta.genre };
+      const tags = { title: meta.title, artist: meta.artist, album_artist: meta.albumArtist || meta.artist, album: meta.album, date: meta.date, track: meta.track, disc: meta.disc, genre: meta.genre };
       let t = await run("ffmpeg", tagArgs(src, cover, out, outExt, tags, !cover && src === file), { timeout: 120000 });
       if (t.code !== 0 && cover) t = await run("ffmpeg", tagArgs(src, null, out, outExt, tags, src === file), { timeout: 120000 });
       if (t.code !== 0 || !fs.existsSync(out)) throw new Error("tagging failed");
@@ -391,7 +421,7 @@ async function fixSong(rel, action) {
       if (dest !== file) fs.rmSync(file, { force: true });
       delete libCache[file];
       issues.list = issues.list.filter((x) => x.file !== rel);
-      return { artist: meta.artist, title: meta.title };
+      return { artist: meta.artist, title: meta.title, source: meta.source || "" };
     } finally { fs.rmSync(ST(), { recursive: true, force: true }); }
   });
 }
@@ -931,12 +961,36 @@ function removeDuplicates() {
 }
 setInterval(() => { if (ready() && Date.now() - library.lastScan > 30 * 60 * 1000) scanLibrary(); }, 20000);
 
-// ---------- iTunes (free, no key) ----------
-async function itunes(kind, params) {
+// ---------- pacing: the free catalogues stop answering when they are asked too fast ----------
+const pace = {};
+const paceOf = (name) => (pace[name] ||= { next: 0, until: 0, times: [] });
+// waits for this caller's turn: `gap` ms between calls, at most `perMinute` calls in any minute. Throws at once
+// ("... is busy") when the turn is further away than `maxWait`, so the caller can ask another catalogue instead.
+async function paced(name, gap, maxWait = 20000, perMinute = 0) {
+  const p = paceOf(name), now = Date.now();
+  let at = Math.max(now, p.next, p.until);
+  if (perMinute) {
+    p.times = p.times.filter((t) => t > at - 60000);
+    if (p.times.length >= perMinute) at = Math.max(at, p.times[p.times.length - perMinute] + 60000);
+  }
+  if (at - now > maxWait) throw new Error(`${name} is busy`);
+  p.next = at + gap;
+  if (perMinute) p.times.push(at);
+  if (at > now) await sleep(at - now);
+}
+const slowDown = (name, seconds) => { paceOf(name).until = Date.now() + seconds * 1000; };
+
+// ---------- Apple Music (the iTunes catalogue: free, no key) ----------
+async function itunes(kind, params, maxWait = 20000) {
   const qs = new URLSearchParams({ country: "US", ...params });
-  const res = await fetch(`https://itunes.apple.com/${kind}?${qs}`, { signal: AbortSignal.timeout(20000) });
-  if (!res.ok) throw new Error(`iTunes returned HTTP ${res.status}`);
-  return (await res.json()).results || [];
+  for (let attempt = 0; ; attempt++) {
+    await paced("Apple Music", 200, maxWait, 30); // it answers about 30 searches a minute
+    const res = await fetch(`https://itunes.apple.com/${kind}?${qs}`, { signal: AbortSignal.timeout(20000) });
+    if (res.ok) return (await res.json()).results || [];
+    if (res.status !== 429 && res.status !== 403) throw new Error(`Apple Music returned HTTP ${res.status}`);
+    // too many requests: one more try (another of its servers may answer), then it is left alone for a while
+    if (attempt) { slowDown("Apple Music", Math.min(Number(res.headers.get("retry-after")) || 30, 90)); throw new Error("Apple Music is busy"); }
+  }
 }
 const releaseType = (name) => (/ - single$/i.test(name) ? "single" : / - ep$/i.test(name) ? "ep" : "album");
 const cleanAlbum = (name) => String(name || "").replace(/\s+-\s+(single|ep)$/i, "").trim();
@@ -950,17 +1004,16 @@ function trackMeta(r) {
     disc: r.discNumber ? `${r.discNumber}${r.discCount ? "/" + r.discCount : ""}` : "",
     genre: r.primaryGenreName || "",
     cover: r.artworkUrl100 ? r.artworkUrl100.replace(/\/\d+x\d+bb\./, "/600x600bb.") : "",
-    seconds: r.trackTimeMillis ? Math.round(r.trackTimeMillis / 1000) : 0,
+    seconds: r.trackTimeMillis ? Math.round(r.trackTimeMillis / 1000) : 0, source: "Apple Music",
   };
 }
-// Best iTunes match for one song (prefers the original studio album).
-async function lookupMeta(artist, title) {
+// Best Apple Music match for one song (prefers the original studio album).
+async function lookupMeta(artist, title, maxWait) {
+  const t = normAny(title), wantVersion = VERSION.test(title);
+  if (!t) return null;
   for (const term of [`${artist} ${title}`, title]) {
-    const results = await itunes("search", { term, entity: "song", limit: 25 });
-    const a = norm(artist), t = norm(title), wantVersion = VERSION.test(title);
-    const good = results.filter((r) => norm(r.trackName) === t
-      && (wantVersion || !VERSION.test(r.trackName))
-      && (norm(r.artistName) === a || norm(r.artistName).startsWith(a + " ") || a.startsWith(norm(r.artistName))));
+    const results = await itunes("search", { term, entity: "song", limit: 25 }, maxWait);
+    const good = results.filter((r) => normAny(r.trackName) === t && (wantVersion || !VERSION.test(r.trackName)) && artistMatch(r.artistName, artist));
     const score = (x) => (COMP.test(x.collectionName) ? 100 : 0) + (x.collectionArtistName ? 50 : 0)
       + (/ - (single|ep)$/i.test(x.collectionName) ? 20 : 0)
       + (/deluxe|expanded|anniversary|edition|version|remaster/i.test(x.collectionName) ? 5 : 0)
@@ -971,47 +1024,117 @@ async function lookupMeta(artist, title) {
   return null;
 }
 
-// ---------- Spotify (with the keys in Config) and YouTube Music: when iTunes and Deezer don't know a song ----------
+// ---------- Spotify (asked first when its keys are saved in Config) and YouTube Music (asked last) ----------
+function spTrackMeta(hit, artist) {
+  const al = hit.album || {}, names = (hit.artists || []).map((x) => x.name).filter(Boolean);
+  return {
+    title: unremaster(hit.name), artist: names.join(", ") || artist || "",
+    album: unremaster(al.name || hit.name), releaseType: al.album_type === "single" ? (al.total_tracks > 3 ? "ep" : "single") : "album",
+    albumArtist: al.artists?.[0]?.name || names[0] || artist || "",
+    date: String(al.release_date || "").slice(0, 4),
+    track: hit.track_number ? `${hit.track_number}${al.total_tracks ? "/" + al.total_tracks : ""}` : "",
+    disc: hit.disc_number ? String(hit.disc_number) : "",
+    genre: "", cover: al.images?.[0]?.url || "",
+    seconds: Math.round((hit.duration_ms || 0) / 1000),
+    spotifyUrl: hit.external_urls?.spotify || "", source: "Spotify",
+  };
+}
+// Best Spotify match for one song: the same title by the same artist, the original studio album first
 async function spotifyMeta(artist, title) {
-  const sp = await spotifyApi(`/v1/search?type=track&limit=5&q=${encodeURIComponent(`track:${title} artist:${artist}`)}`);
-  const hit = (sp?.tracks?.items || []).find((x) => norm(x.name) === norm(title)) || sp?.tracks?.items?.[0];
-  if (!hit) return null;
-  const al = hit.album || {};
-  return { artist: (hit.artists || []).map((x) => x.name).join(", ") || artist, title: hit.name, album: al.name || title,
-    albumArtist: al.artists?.[0]?.name || hit.artists?.[0]?.name || artist, date: String(al.release_date || "").slice(0, 4),
-    track: hit.track_number ? String(hit.track_number) : undefined, cover: al.images?.[0]?.url || "",
-    releaseType: al.album_type === "single" ? "single" : "album", seconds: Math.round((hit.duration_ms || 0) / 1000) };
-}
-async function youtubeMeta(artist, title) {
-  // YouTube Music's "Artist - Topic" uploads carry the track, artist, album and year
-  const s = await run("yt-dlp", [`ytsearch5:${artist} ${title}`, "--skip-download", "--no-warnings", "--ignore-errors",
-    "--print", "%(.{id,title,channel,track,artist,album,release_year,duration})j"], { timeout: 120000 });
-  const rows = [];
-  for (const l of s.out.split("\n")) { try { rows.push(JSON.parse(l)); } catch {} }
-  const hit = rows.find((v) => v.track && norm(v.track) === norm(title)) || rows.find((v) => v.track && v.album);
-  if (!hit) return null;
-  return { artist: hit.artist || String(hit.channel || "").replace(/ - Topic$/, "") || artist, title: hit.track, album: hit.album || hit.track,
-    albumArtist: (hit.artist || artist).split(", ")[0], date: hit.release_year ? String(hit.release_year) : undefined,
-    cover: `https://i.ytimg.com/vi/${hit.id}/maxresdefault.jpg`, ytCover: true, seconds: Number(hit.duration) || 0, releaseType: "single" };
-}
-// every catalogue in turn: iTunes, Deezer, Spotify, YouTube Music
-async function catalogMeta(artist, title) {
-  for (const look of [lookupMeta, dzLookupMeta, spotifyMeta, youtubeMeta]) {
-    const found = await look(artist, title).catch(() => null);
-    if (found) return found;
+  if (!config.spotifyClientId || !config.spotifySecret) return null;
+  const t = normAny(unremaster(title)), wantVersion = VERSION.test(title);
+  if (!t) return null;
+  const ok = (x) => normAny(unremaster(x.name)) === t && (wantVersion || !VERSION.test(unremaster(x.name)))
+    && (x.artists || []).some((n) => artistMatch(n.name, artist));
+  const score = (x) => {
+    const al = x.album || {}, names = (x.artists || []).map((n) => normAny(n.name));
+    return (al.album_type === "compilation" || COMP.test(al.name || "") ? 100 : 0)
+      + (!names.includes(normAny(al.artists?.[0]?.name)) ? 50 : 0)
+      + (al.album_type === "single" ? 20 : 0)
+      + (/deluxe|expanded|anniversary|edition|version|remaster/i.test(al.name || "") ? 5 : 0)
+      + (/[([]/.test(al.name || "") ? 2 : 0);
+  };
+  for (const q of [`track:${title} artist:${artist}`, `${artist} ${title}`]) {
+    const r = await spotifyApi(`/search?type=track&limit=10&market=US&q=${encodeURIComponent(q)}`);
+    const good = (r?.tracks?.items || []).filter((x) => x && x.name && ok(x));
+    good.sort((x, y) => score(x) - score(y) || String(x.album?.release_date || "9").localeCompare(String(y.album?.release_date || "9")));
+    if (good[0]) return spTrackMeta(good[0], artist);
   }
   return null;
 }
+// YouTube Music's song results: its own catalogue tracks (the album audio), found in about two seconds
+async function ytMusicSongs(query, n = 8) {
+  const s = await run("yt-dlp", [`https://music.youtube.com/search?q=${encodeURIComponent(query)}#songs`, "--flat-playlist", "--playlist-end", String(n),
+    "--no-warnings", "--ignore-errors", "--print", "%(.{id,title})j"], { timeout: 60000 });
+  const rows = [];
+  for (const l of s.out.split("\n")) {
+    try { const v = JSON.parse(l); if (/^[\w-]{11}$/.test(v.id || "")) rows.push({ id: v.id, title: v.title || "" }); } catch {}
+  }
+  if (!rows.length && botNote(s.err)) throw Object.assign(new Error(botNote(s.err)), { bot: true });
+  return rows;
+}
+async function ytMusicTrack(id) {
+  const s = await run("yt-dlp", [`https://music.youtube.com/watch?v=${id}`, "--skip-download", "--no-warnings", "--no-playlist",
+    "--print", "%(.{id,title,channel,track,artist,artists,album,release_year,duration})j"], { timeout: 90000 });
+  for (const l of s.out.split("\n")) { try { const v = JSON.parse(l); if (v && v.id) return v; } catch {} }
+  return null;
+}
+// YouTube Music's own catalogue tracks carry the track, artist, album and year
+async function youtubeMeta(artist, title) {
+  const t = normAny(title), wantVersion = VERSION.test(title);
+  if (!t || !ready()) return null;
+  const hits = (await ytMusicSongs(`${artist} ${title}`, 6)).filter((v) => normAny(v.title) === t && (wantVersion || !VERSION.test(v.title))).slice(0, 2);
+  for (const h of hits) {
+    const v = await ytMusicTrack(h.id).catch(() => null);
+    if (!v) continue;
+    const names = [...(Array.isArray(v.artists) ? v.artists : []), v.artist, String(v.channel || "").replace(/ - Topic$/, "")].filter(Boolean);
+    if (normAny(artist) && names.length && !names.some((n) => looseArtist(n, artist))) continue;
+    const by = (Array.isArray(v.artists) && v.artists.length ? v.artists.join(", ") : v.artist) || names[0] || artist;
+    const album = v.album || v.track || v.title;
+    return { title: v.track || v.title, artist: by, album, albumArtist: by.split(", ")[0],
+      date: v.release_year ? String(v.release_year) : "", track: "", disc: "", genre: "",
+      cover: `https://i.ytimg.com/vi/${v.id}/maxresdefault.jpg`, ytCover: true, seconds: Math.round(Number(v.duration) || 0),
+      releaseType: normAny(album) === normAny(v.track || v.title) ? "single" : "album", videoId: v.id, source: "YouTube Music" };
+  }
+  return null;
+}
+// Every catalogue in turn: Spotify (when its keys are saved in Config), Apple Music, Deezer, YouTube Music.
+// Answers are remembered, so the same song is never looked up twice in a row. `patient` (fix-all) waits for
+// Apple Music's turn instead of moving on, so a whole album gets its tags from the same place.
+const metaCache = new Map();
+async function catalogMeta(artist, title, patient = false) {
+  const key = `${normAny(artist)}|${normAny(title)}`, hit = metaCache.get(key);
+  if (hit && hit.until > Date.now()) return hit.meta ? { ...hit.meta } : null;
+  let unsure = false; // a catalogue didn't answer (busy, offline): the result is only remembered for a short while
+  const ask = (look, ...more) => look(artist, title, ...more).catch(() => { unsure = true; return null; });
+  const quiet = (look, ...more) => look(artist, title, ...more).catch(() => null);
+  let meta = config.spotifyClientId && config.spotifySecret ? await ask(spotifyMeta) : null;
+  if (meta) { // Spotify lists no genre: Apple Music (or Deezer) fills that in when it answers quickly
+    const other = (await quiet(lookupMeta, patient ? 10000 : 4000)) || (await quiet(dzLookupMeta));
+    if (other?.genre) meta = { ...meta, genre: other.genre };
+  } else {
+    const found = (await ask(lookupMeta, patient ? 90000 : 20000)) || (await ask(dzLookupMeta));
+    // Spotify's own tags for it (no keys needed) when MusicBrainz links its album to Spotify
+    const viaAlbum = found && (await spotifyViaAlbum(found, patient ? 60000 : 8000).catch(() => { unsure = true; return null; }));
+    meta = viaAlbum || found || (await ask(youtubeMeta));
+  }
+  if (meta || !unsure) {
+    if (metaCache.size > 5000) metaCache.delete(metaCache.keys().next().value);
+    metaCache.set(key, { meta, until: Date.now() + (!meta ? 3600000 : unsure ? 600000 : 7 * 86400000) });
+  }
+  return meta ? { ...meta } : null;
+}
 
-// ---------- Deezer (free, no key): second catalogue after iTunes ----------
+// ---------- Deezer (free, no key): the catalogue after Apple Music ----------
 // drops "(Remastered 2009)", "- 2011 Remaster" etc. from Deezer names
 const unremaster = (s) => String(s || "").replace(/\s*[([]\s*(\d{4}\s+)?remaster(ed)?(\s+\d{4})?(\s+version)?\s*[)\]]/gi, "")
   .replace(/\s+-\s+(\d{4}\s+)?remaster(ed)?(\s+\d{4})?(\s+version)?\s*$/i, "").trim();
 async function deezer(p) {
+  await paced("Deezer", 120); // it allows 50 requests in 5 seconds
   const res = await fetch(`https://api.deezer.com/${p}`, { signal: AbortSignal.timeout(20000) });
   if (!res.ok) throw new Error(`Deezer returned HTTP ${res.status}`);
   const j = await res.json();
-  if (j.error) throw new Error(`Deezer: ${j.error.message || "error"}`);
+  if (j.error) { if (j.error.code === 4) slowDown("Deezer", 5); throw new Error(`Deezer: ${j.error.message || "error"}`); }
   return j;
 }
 const dzReleaseType = (a) => (a.record_type === "single" ? "single" : a.record_type === "ep" ? "ep" : "album");
@@ -1024,14 +1147,15 @@ function dzTrackMeta(t, album) {
     track: t.track_position ? `${t.track_position}${album.nb_tracks ? "/" + album.nb_tracks : ""}` : "",
     disc: t.disk_number ? String(t.disk_number) : "",
     genre: album.genres?.data?.[0]?.name || "", cover: album.cover_xl || album.cover_big || "",
-    seconds: Number(t.duration) || 0,
+    seconds: Number(t.duration) || 0, source: "Deezer",
   };
 }
 async function dzLookupMeta(artist, title) {
+  const t = normAny(unremaster(title)), wantVersion = VERSION.test(title);
+  if (!t) return null;
   const r = await deezer(`search/track?limit=15&q=${encodeURIComponent(`${artist} ${title}`)}`);
-  const a = norm(artist), t = norm(unremaster(title)), wantVersion = VERSION.test(title);
-  const pick = (r.data || []).find((x) => norm(unremaster(x.title)) === t && (wantVersion || !VERSION.test(unremaster(x.title)))
-    && (norm(x.artist?.name) === a || a.startsWith(norm(x.artist?.name)) || norm(x.artist?.name).startsWith(a + " "))
+  const pick = (r.data || []).find((x) => normAny(unremaster(x.title)) === t && (wantVersion || !VERSION.test(unremaster(x.title)))
+    && artistMatch(x.artist?.name, artist)
     && !COMP.test(x.album?.title || "")); // Deezer sorts by popularity
   if (!pick) return null;
   const [track, album] = await Promise.all([deezer(`track/${pick.id}`), deezer(`album/${pick.album.id}`)]);
@@ -1041,8 +1165,9 @@ async function deezerAlbum(item, id) {
   const [album, list] = await Promise.all([deezer(`album/${id}`), deezer(`album/${id}/tracks?limit=300`)]);
   const tracks = list.data || [];
   if (!tracks.length) return { status: "failed", note: "no tracks listed for this album" };
-  insertChildren(item, tracks.map((t) => ({ type: "song", query: `${t.artist?.name} - ${t.title}`, meta: dzTrackMeta(t, album) })));
-  return { status: "working", title: unremaster(album.title), artist: album.artist?.name, note: "tracklist from Deezer" };
+  const metas = await spotifyAlbumTags(tracks.map((t) => dzTrackMeta(t, album)));
+  insertChildren(item, metas.map((m) => ({ type: "song", query: `${m.artist} - ${m.title}`, meta: m })));
+  return { status: "working", title: unremaster(album.title), artist: album.artist?.name, note: `tracklist from Deezer${metas[0].source === "Spotify" ? ", tags from Spotify" : ""}` };
 }
 async function deezerArtist(item, id, name) {
   const r = await deezer(`artist/${id}/albums?limit=200`);
@@ -1070,12 +1195,108 @@ async function spotifyEmbed(kind, id) {
 }
 const spCover = (e) => (e.visualIdentity?.image || []).slice().sort((a, b) => (b.maxWidth || 0) - (a.maxWidth || 0))[0]?.url || "";
 const spUrl = (uri) => { const m = String(uri || "").match(/track:([A-Za-z0-9]{22})/); return m ? `https://open.spotify.com/track/${m[1]}` : ""; };
-// Fills in album tags for a song we only know by name (iTunes, then Deezer); keeps the known length and link.
+// ---------- Spotify without keys: MusicBrainz (free, open) knows which Spotify album a release is, and
+// Spotify's public album player (the embed page) lists that album's tracks ----------
+async function musicbrainz(p, maxWait = 20000) {
+  await paced("MusicBrainz", 1100, maxWait); // it allows one request a second
+  const res = await fetch(`https://musicbrainz.org/ws/2/${p}&fmt=json`, {
+    headers: { "user-agent": `HermesMusic/${process.env.HM_VERSION || "3"} ( https://github.com/Urmomnumber1/hermes-umbrel-store )`, accept: "application/json" },
+    signal: AbortSignal.timeout(20000),
+  });
+  if (res.status === 503 || res.status === 429) { slowDown("MusicBrainz", 10); throw new Error("MusicBrainz is busy"); }
+  if (!res.ok) throw new Error(`MusicBrainz returned HTTP ${res.status}`);
+  return res.json();
+}
+const EDITION = /\s*[([][^)\]]*\b(deluxe|edition|version|remaster(ed)?|expanded|anniversary|explicit|clean|bonus)\b[^)\]]*[)\]]/gi;
+const luq = (s) => `"${String(s).replace(/[^\p{L}\p{M}\p{N}' &.,!?-]+/gu, " ").trim()}"`; // a quoted search phrase
+const spAlbums = new Map(), spPages = new Map();
+// the Spotify album pages of one release (every edition MusicBrainz links to it)
+async function spotifyAlbums(artist, album, maxWait) {
+  const name = unremaster(cleanAlbum(album)).replace(EDITION, "").trim();
+  if (!name || !artist) return [];
+  const key = `${normAny(artist)}|${normAny(name)}`;
+  let found = spAlbums.get(key);
+  if (!found || found.until < Date.now()) {
+    const rg = await musicbrainz(`release-group?limit=5&query=${encodeURIComponent(`releasegroup:${luq(name)} AND artist:${luq(artist)}`)}`, maxWait);
+    const g = (rg["release-groups"] || []).find((x) => x.score >= 80 && normAny(x.title) === normAny(name)
+      && (x["artist-credit"] || []).some((a) => artistMatch(a.name || a.artist?.name, artist)));
+    let ids = [];
+    if (g) {
+      const rels = await musicbrainz(`release?limit=100&inc=url-rels&release-group=${g.id}`, maxWait);
+      ids = [...new Set((rels.releases || []).flatMap((r) => r.relations || [])
+        .map((x) => String(x.url?.resource || "").match(/open\.spotify\.com\/album\/([A-Za-z0-9]{22})/)?.[1]).filter(Boolean))].slice(0, 4);
+    }
+    found = { ids, year: String(g?.["first-release-date"] || "").slice(0, 4), until: Date.now() + (ids.length ? 7 : 1) * 86400000 };
+    if (spAlbums.size > 3000) spAlbums.delete(spAlbums.keys().next().value);
+    spAlbums.set(key, found);
+  }
+  const pages = await Promise.all(found.ids.map(async (id) => {
+    const had = spPages.get(id);
+    if (had && had.until > Date.now()) return had.page;
+    const ent = await spotifyEmbed("album", id).catch(() => null);
+    if (!ent?.trackList?.length) return null;
+    const page = { ...ent, year: found.year };
+    if (spPages.size > 300) spPages.delete(spPages.keys().next().value);
+    spPages.set(id, { page, until: Date.now() + 86400000 });
+    return page;
+  }));
+  return pages.filter(Boolean);
+}
+// one track of a Spotify album page as tags
+function spPageMeta(page, i) {
+  const t = page.trackList[i], n = page.trackList.length, names = String(t.subtitle || "").split(", ").filter(Boolean);
+  return {
+    title: unremaster(t.title), artist: names.join(", "), album: unremaster(page.name),
+    releaseType: n <= 3 ? "single" : n <= 6 ? "ep" : "album",
+    albumArtist: String(page.subtitle || "").split(", ")[0] || names[0] || "",
+    date: page.year || "", track: `${i + 1}/${n}`, disc: "", genre: "", cover: spCover(page),
+    seconds: Math.round((t.duration || 0) / 1000), spotifyUrl: spUrl(t.uri), source: "Spotify",
+  };
+}
+const sameTrack = (x, title) => normAny(unremaster(x.title)) === normAny(unremaster(title));
+// the edition that is this album: the same name first, then the closest track count
+function pickPage(pages, album, count, title) {
+  const want = normAny(unremaster(cleanAlbum(album)));
+  const same = (e) => (normAny(unremaster(e.name)) === want ? 1 : 0);
+  return pages.filter((e) => !title || e.trackList.some((x) => sameTrack(x, title)))
+    .sort((a, b) => same(b) - same(a) || Math.abs(a.trackList.length - count) - Math.abs(b.trackList.length - count))[0] || null;
+}
+// Spotify's tags for a song another catalogue found (no Spotify keys needed)
+async function spotifyViaAlbum(found, maxWait) {
+  if (!found?.album || !found.title) return null;
+  const pages = await spotifyAlbums(found.albumArtist || found.artist, found.album, maxWait);
+  const page = pickPage(pages, found.album, Number(String(found.track).split("/")[1]) || 0, found.title);
+  if (!page) return null;
+  const i = page.trackList.findIndex((x) => sameTrack(x, found.title) && (!found.seconds || !x.duration || Math.abs(x.duration / 1000 - found.seconds) <= 10));
+  return i < 0 ? null : { ...spPageMeta(page, i), genre: found.genre || "", date: page.year || found.date || "" };
+}
+// album requests: Spotify's names and numbering for the whole album, or none of it (one album name for every song)
+async function spotifyAlbumTags(metas) {
+  try {
+    const first = metas[0];
+    const page = first ? pickPage(await spotifyAlbums(first.albumArtist || first.artist, first.album, 60000), first.album, metas.length) : null;
+    if (!page) return metas;
+    const used = new Set();
+    const out = metas.map((m) => {
+      const i = page.trackList.findIndex((x, n) => !used.has(n) && sameTrack(x, m.title));
+      if (i < 0) return null;
+      used.add(i);
+      return { ...m, ...spPageMeta(page, i), genre: m.genre || "", date: page.year || m.date || "" };
+    });
+    return out.every(Boolean) ? out : metas;
+  } catch { return metas; }
+}
+// Fills in album tags for a song we only know by name (every catalogue in turn); keeps the known length and link.
 async function enrich(base) {
   const first = base.artist.split(", ")[0];
   const found = await catalogMeta(first, base.title);
-  if (found) return { ...found, seconds: base.seconds || found.seconds, spotifyUrl: base.spotifyUrl };
-  // in neither catalogue: a single named after the song, so it isn't filed under "Unknown Album"
+  if (found) {
+    const m = { ...found, seconds: base.seconds || found.seconds, spotifyUrl: base.spotifyUrl || found.spotifyUrl };
+    // a YouTube Music track of another length is another version: the search picks the upload instead
+    if (m.videoId && base.seconds && found.seconds && Math.abs(base.seconds - found.seconds) > 8) delete m.videoId;
+    return m;
+  }
+  // in no catalogue: a single named after the song, so it isn't filed under "Unknown Album"
   return { releaseType: "single", ...base, albumArtist: base.albumArtist || first, album: base.album || base.title };
 }
 async function spotifyAlbum(item, id) {
@@ -1091,22 +1312,37 @@ async function spotifyAlbum(item, id) {
   return { status: "working", title: e.name, artist, note: "tracklist from Spotify" };
 }
 // Spotify Web API with the app keys from Config (client credentials: public data only, no user login)
-const sp = { token: "", until: 0 };
+// Since February 2026 Spotify only lets an app's keys work while the Spotify account that made them has Premium,
+// so every failure here is quiet: the other catalogues answer instead, and Config shows how the keys are doing.
+const sp = { token: "", until: 0, state: "" };
 async function spotifyApi(pathname) {
   if (!config.spotifyClientId || !config.spotifySecret) return null;
+  await paced("Spotify", 120, 15000);
   if (Date.now() > sp.until) {
     const r = await fetch("https://accounts.spotify.com/api/token", {
       method: "POST", body: "grant_type=client_credentials", signal: AbortSignal.timeout(15000),
       headers: { "content-type": "application/x-www-form-urlencoded", authorization: "Basic " + Buffer.from(`${config.spotifyClientId}:${config.spotifySecret}`).toString("base64") },
     });
     const j = await r.json().catch(() => ({}));
-    if (!r.ok || !j.access_token) throw new Error("Spotify refused the keys in Config (check the Client ID and secret)");
+    if (!r.ok || !j.access_token) {
+      sp.state = "Spotify refused the keys (check the Client ID and secret)"; slowDown("Spotify", 300);
+      throw new Error("Spotify refused the keys in Config (check the Client ID and secret)");
+    }
     sp.token = j.access_token; sp.until = Date.now() + (j.expires_in - 60) * 1000;
   }
-  const r = await fetch(`https://api.spotify.com/v1${pathname}`, { headers: { authorization: `Bearer ${sp.token}` }, signal: AbortSignal.timeout(20000) });
+  // some callers say "/v1/search", others "/search": both mean the same address
+  const rel = String(pathname).replace(/^\/v1(?=\/)/, ""), search = rel.startsWith("/search");
+  const r = await fetch(`https://api.spotify.com/v1${rel}`, { headers: { authorization: `Bearer ${sp.token}` }, signal: AbortSignal.timeout(20000) });
+  if (r.status === 429) { sp.state = "Spotify says too many requests - it is left alone for a while"; slowDown("Spotify", Math.min(Number(r.headers.get("retry-after")) || 30, 3600)); }
+  else if (r.status === 401) { sp.until = 0; slowDown("Spotify", 60); }
+  else if (r.status === 403 && search) { sp.state = "Spotify said no (HTTP 403) - since 2026 its keys only work when the Spotify account that made them has Premium"; slowDown("Spotify", 600); }
   if (!r.ok) throw new Error(`Spotify returned HTTP ${r.status}${r.status === 404 ? " (private or deleted?)" : ""}`);
+  if (search) sp.state = "working";
   return r.json();
 }
+// one small search shortly after starting (and after new keys are saved), so Config can say whether the keys work
+const spotifyCheck = () => { if (config.spotifyClientId && config.spotifySecret) spotifyApi("/search?type=track&limit=1&market=US&q=hello").catch(() => {}); };
+setTimeout(spotifyCheck, 8000);
 async function spotifyPlaylistApi(item) { // every track, 100 at a time
   const info = await spotifyApi(`/playlists/${item.spotifyId}?fields=name,owner(display_name)`);
   if (!info) return null;
@@ -1208,7 +1444,7 @@ async function expandPlaylist(item) {
     meta: { title: t.title, artist: t.subtitle || "", seconds: Math.round((t.duration || 0) / 1000), spotifyUrl: spUrl(t.uri), lookup: true },
   })));
   return { status: "working", title: e.name, artist: e.subtitle || "",
-    note: tracks.length >= 100 && !config.spotifyClientId ? "Spotify only shows 100 songs without keys - add them in Config to get all" : undefined };
+    note: tracks.length >= 100 && !config.spotifyClientId ? "Spotify only shows the first 100 songs of a playlist - split a longer one into playlists of 100" : undefined };
 }
 // ---- importing a profile: every public playlist of a Spotify user or a YouTube channel becomes a request
 const SPOTIFY_USER = /open\.spotify\.com\/(?:intl-[a-z-]+\/)?user\/([^/?#\s]+)/i;
@@ -1219,7 +1455,9 @@ async function profilePlaylists(link) {
     if (!config.spotifyClientId) throw new Error("importing a Spotify profile needs the Spotify keys in Hermes Music's Config");
     const out = [];
     for (let next = `/users/${encodeURIComponent(decodeURIComponent(m[1]))}/playlists?limit=50`; next;) {
-      const page = await spotifyApi(next);
+      let page;
+      try { page = await spotifyApi(next); }
+      catch { throw new Error("Spotify stopped letting apps list a profile's playlists in 2026 - add the playlists by their links instead"); }
       for (const p of page.items || []) if (p && p.id && p.public !== false) out.push({ spotifyId: p.id, name: p.name });
       next = page.next ? page.next.replace("https://api.spotify.com/v1", "") : null;
       if (out.length > 300) break;
@@ -1251,7 +1489,7 @@ Request: ${JSON.stringify(query)}
 
 1. Work out the intended artist and song title (fix typos; prefer the original studio version).
 2. Find the best matching YouTube video with yt-dlp search, for example:
-   yt-dlp "ytsearch5:ARTIST TITLE official audio" --skip-download --print "%(id)s | %(title)s | %(channel)s | %(duration)s"
+   yt-dlp "ytsearch5:ARTIST TITLE official audio" --flat-playlist --print "%(id)s | %(title)s | %(channel)s | %(duration)s"
    Prefer the official audio or the artist's Topic channel. Avoid live versions, covers, remixes, sped-up/slowed versions and videos over ${config.maxMinutes} minutes.
 3. Reply with ONE line of JSON and nothing else:
    {"artist":"...","title":"...","video_id":"..."}
@@ -1262,8 +1500,9 @@ Request: ${JSON.stringify(query)}
   return lastJson(r.out || r.err);
 }
 async function ytSearch(query, n = 8) {
-  const s = await run("yt-dlp", [`ytsearch${n}:${query}`, "--skip-download", "--no-warnings", "--ignore-errors", // an unavailable result is skipped, not fatal
-    "--print", "%(.{id,title,channel,duration})j"], { timeout: 120000 }); // one JSON object per line
+  // a flat search reads only the result page: about 2 s instead of about 11 for a full look at every result
+  const s = await run("yt-dlp", [`ytsearch${n}:${query}`, "--flat-playlist", "--no-warnings", "--ignore-errors", // an unavailable result is skipped, not fatal
+    "--print", "%(.{id,title,channel,duration})j"], { timeout: 60000 }); // one JSON object per line
   const rows = [];
   for (const l of s.out.split("\n")) {
     try {
@@ -1271,7 +1510,7 @@ async function ytSearch(query, n = 8) {
       if (/^[\w-]{11}$/.test(v.id || "")) rows.push({ id: v.id, title: v.title || "", channel: v.channel || "", seconds: Number(v.duration) || 0 });
     } catch {}
   }
-  if (!rows.length && s.err.trim()) throw new Error(botNote(s.err) || "YouTube search failed: " + s.err.trim().split("\n").pop().slice(0, 150));
+  if (!rows.length && s.err.trim()) throw ytError(s.err, "YouTube search failed");
   return rows.filter((v) => v.seconds > 0 && v.seconds <= config.maxMinutes * 60);
 }
 // Local model: we search YouTube ourselves and the model only picks from the results.
@@ -1306,34 +1545,54 @@ If none match, reply {"error":"short reason"}.` },
   return pick;
 }
 // Album/artist tracks: we already know the exact song and its length, so match without AI.
-async function findVideo(meta) {
+// The uploads to try for a song we know exactly (title, artist, length), best first: YouTube Music's own
+// catalogue track (checked while it downloads), then ordinary uploads by score. Up to 5 { id, check }.
+async function findVideos(meta) {
   const first = meta.artist.split(", ")[0]; // Spotify lists every artist; search with the main one
-  for (const q of [`${first} ${meta.title}`, `${first} ${meta.title} audio`, `${meta.title} ${first} official`]) { // more searches if the first finds nothing good
-    const id = await bestVideo(await ytSearch(q), meta, first);
-    if (id) return id;
+  const t = normAny(meta.title), wantVersion = VERSION.test(meta.title);
+  let failed = null;
+  const [songs, plain] = await Promise.all([
+    ytMusicSongs(`${first} ${meta.title}`, 5).catch((e) => { if (e.bot) failed = e; return []; }),
+    ytSearch(`${first} ${meta.title}`).catch((e) => { failed = e; return []; }),
+  ]);
+  let scored = scoreVideos(plain, meta, first);
+  for (const q of [`${first} ${meta.title} audio`, `${meta.title} ${first} official`]) { // more searches if the first finds nothing good
+    if (scored.length || failed?.bot) break;
+    scored = scoreVideos(await ytSearch(q).catch((e) => { failed = e; return []; }), meta, first);
   }
-  return null;
+  const catalogue = songs.filter((v) => t && normAny(v.title) === t && (wantVersion || !VERSION.test(v.title))).slice(0, 2);
+  for (const v of catalogue) { const s = scored.find((x) => x.id === v.id); if (s) s.s += 15; }
+  scored.sort((x, y) => y.s - x.s);
+  const seen = new Set(scored.map((v) => v.id));
+  const list = [...catalogue.filter((v) => !seen.has(v.id)).map((v) => ({ id: v.id, check: true })), ...scored.map((v) => ({ id: v.id, check: false }))];
+  if (!list.length && failed) throw failed;
+  return list.slice(0, 5);
 }
-function bestVideo(results, meta, artist) {
-  const t = norm(meta.title), a = norm(artist), wantVersion = VERSION.test(meta.title);
-  let best = null;
+// ordinary uploads that are this song, best first (title words, Topic channel, artist's channel, length)
+function scoreVideos(results, meta, artist) {
+  const t = normAny(meta.title), a = normAny(artist), wantVersion = VERSION.test(meta.title);
+  const out = [];
+  if (!t) return out;
   for (const v of results) {
-    const vt = norm(v.title), ch = norm(v.channel);
+    const vt = normAny(v.title), ch = normAny(v.channel);
     // the title, or (for longer titles) most of its words: uploads often spell titles a little differently
     const tw = t.split(" ").filter(Boolean), vw = new Set(vt.split(" "));
     if (!vt.includes(t) && (tw.length < 2 || tw.filter((w) => vw.has(w)).length / tw.length < 0.75)) continue;
     let s = 0;
     if (!wantVersion && VERSION.test(v.title.replace(/remaster(ed)?/i, ""))) s -= 60;
     if (/ - topic$/i.test(v.channel)) s += 25;
-    if (ch.includes(a) || a.includes(ch.replace(/ topic$/, ""))) s += 20;
+    if (a && ch && (ch.includes(a) || a.includes(ch.replace(/ topic$/, "")))) s += 20;
     if (/official (audio|video)|audio/i.test(v.title)) s += 5;
-    if (meta.seconds) {
-      const d = Math.abs(v.seconds - meta.seconds);
-      s += d <= 3 ? 40 : d <= 8 ? 20 : d <= 20 ? 0 : -50;
-    }
-    if (!best || s > best.s) best = { ...v, s };
+    if (meta.seconds) { const d = Math.abs(v.seconds - meta.seconds); s += d <= 3 ? 40 : d <= 8 ? 20 : d <= 20 ? 0 : -50; }
+    if (s >= 20) out.push({ ...v, s });
   }
-  return best && best.s >= 20 ? best.id : null;
+  return out.sort((x, y) => y.s - x.s);
+}
+// YouTube thumbnails are wide: cut the cover to a square (Topic uploads are the album art with bars on the sides)
+async function squareCover(file) {
+  const out = file + ".sq.jpg";
+  const r = await run("ffmpeg", ["-y", "-loglevel", "error", "-i", file, "-vf", "crop='min(iw,ih)':'min(iw,ih)'", "-q:v", "2", out], { timeout: 60000 }).catch(() => ({ code: 1 }));
+  if (r.code === 0 && fs.existsSync(out)) fs.renameSync(out, file); else fs.rmSync(out, { force: true });
 }
 
 // ---------- download + tag ----------
@@ -1446,6 +1705,7 @@ async function finishSong(raw, ext, meta, thumb) {
     if (meta.cover && await fetchFile(meta.cover, c).catch(() => false)) cover = c;
     else if (thumb && fs.existsSync(thumb)) cover = thumb;
   }
+  if (cover && (meta.ytCover || cover === thumb)) await squareCover(cover);
   const out = path.join(ST(), `tagged.${ext}`);
   const tags = {
     title, artist, album_artist: albumArtist, album, date: meta.date, track: meta.track, disc: meta.disc, genre: meta.genre,
@@ -1456,7 +1716,12 @@ async function finishSong(raw, ext, meta, thumb) {
   const file = t.code === 0 && fs.existsSync(out) ? out : raw;
 
   fs.mkdirSync(dir, { recursive: true });
-  fs.copyFileSync(file, dest, fs.constants.COPYFILE_EXCL); // /music is a different disk mount, so copy (never overwrite)
+  try { fs.copyFileSync(file, dest, fs.constants.COPYFILE_EXCL); } // /music is a different disk mount, so copy (never overwrite)
+  catch (e) { // another lane saved the same song a moment ago
+    if (e.code !== "EEXIST") throw e;
+    fs.rmSync(ST(), { recursive: true, force: true });
+    return "already in the library";
+  }
   fs.rmSync(ST(), { recursive: true, force: true });
   console.log("added", dest);
   if (meta.karaoke) { // not a library song: remembered for karaoke only
@@ -1527,6 +1792,62 @@ setInterval(() => {
   }
   if (changed) { save(); wake(); }
 }, 6 * 3600 * 1000);
+// ---------- word-by-word lyrics: NetEase Cloud Music (free, no key) times every word of many songs ----------
+const WORDS_DIR = "/data/lyrics-words";
+const wordsInFlight = new Map();
+async function netease(pathname) {
+  await paced("NetEase", 300, 15000);
+  const res = await fetch(`https://music.163.com/api/${pathname}`, { headers: { "user-agent": "Mozilla/5.0", referer: "https://music.163.com/" }, signal: AbortSignal.timeout(12000) });
+  if (!res.ok) throw new Error(`NetEase returned HTTP ${res.status}`);
+  return res.json();
+}
+const CREDIT = /^\s*(作词|作曲|编曲|制作人|混音|母带|和声|监制|出品|lyrics by|written by|composed by|produced by|composer|lyricist|producer|arranger|mixed by|mastered by)\s*[:：]/i;
+// "[27360,1290](27360,240,0)I've (27600,90,0)been ..." -> { start, end, text, words: [[start, end, text], ...] } (ms)
+function parseYrc(lyric) {
+  const lines = [];
+  for (const raw of String(lyric || "").split("\n")) {
+    const m = raw.match(/^\[(\d+),(\d+)\](.*)$/);
+    if (!m) continue; // credit lines are JSON objects
+    const parts = m[3].split(/\((\d+),(\d+),\d+\)/), words = [];
+    for (let k = 1; k + 2 < parts.length; k += 3) words.push([+parts[k], +parts[k] + +parts[k + 1], parts[k + 2]]);
+    const text = words.map((w) => w[2]).join("");
+    if (!words.length || !text.trim() || CREDIT.test(text)) continue;
+    lines.push({ start: +m[1], end: +m[1] + +m[2], text: text.trim(), words });
+  }
+  return lines;
+}
+async function wordLyrics(artist, title, seconds) {
+  const key = crypto.createHash("sha1").update(`${normAny(artist)}|${normAny(title)}|${Math.round(seconds / 5)}`).digest("hex");
+  const file = path.join(WORDS_DIR, key + ".json");
+  try {
+    const had = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (had.found || Date.now() - (had.at || 0) < 7 * 86400000) return had; // a miss is asked again after a week
+  } catch {}
+  if (wordsInFlight.has(key)) return wordsInFlight.get(key);
+  const job = (async () => {
+    const first = artist.split(/,|&| feat\.? | x /i)[0].trim(), t = normAny(title);
+    const s = await netease(`search/get?s=${encodeURIComponent(`${title} ${first}`)}&type=1&limit=10&offset=0`);
+    const cands = (s.result?.songs || []).map((x) => {
+      const nt = normAny(x.name), exact = nt === t;
+      if (!nt || (!exact && !(t.length > 3 && (nt.includes(t) || t.includes(nt))))) return null;
+      const am = (x.artists || []).some((a) => artistMatch(a.name, first) || looseArtist(a.name, first));
+      const off = seconds && x.duration ? Math.abs(x.duration / 1000 - seconds) : null;
+      if ((off != null && off > 10) || (!am && !(off != null && off <= 3))) return null;
+      return { id: x.id, score: (exact ? 0 : 10) + (am ? 0 : 15) + (off == null ? 5 : off * 2) + (!VERSION.test(title) && VERSION.test(x.name) ? 20 : 0) };
+    }).filter(Boolean).sort((a, b) => a.score - b.score).slice(0, 3);
+    let out = { found: false };
+    for (const c of cands) {
+      const l = await netease(`song/lyric/v1?id=${c.id}&cp=false&tv=0&lv=0&rv=0&kv=0&yv=0&ytv=0&yrv=0`);
+      const lines = parseYrc(l.yrc?.lyric);
+      if (lines.length >= 4) { out = { found: true, source: "NetEase", lines }; break; }
+    }
+    fs.mkdirSync(WORDS_DIR, { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ ...out, at: Date.now() }));
+    return out;
+  })().finally(() => wordsInFlight.delete(key));
+  wordsInFlight.set(key, job);
+  return job;
+}
 async function saveLyrics(dest, meta) {
   if (config.lyrics === false) return;
   // the file's own length, not the catalogue's: lyrics are timed to one cut of a song
@@ -1549,15 +1870,32 @@ async function saveLyrics(dest, meta) {
   if (text) fs.writeFileSync(dest.replace(/\.[^.]+$/, ".lrc"), text);
 }
 // Downloads one YouTube video and saves it into the library. Returns a note, or null.
-async function saveSong(videoId, meta) {
+async function saveSong(videoId, meta, check) {
   const fmt = config.audioFormat;
   if (fs.existsSync(destFor(meta, fmt).dest)) return "already in the library";
   fs.rmSync(ST(), { recursive: true, force: true }); fs.mkdirSync(ST(), { recursive: true });
-  const d = await run("yt-dlp", ["--no-playlist", "--no-warnings", "-x", "--audio-format", fmt, "--audio-quality", "0",
-    ...(config.embedArt && !meta.cover ? ["--write-thumbnail", "--convert-thumbnails", "jpg"] : []),
+  const d = await run("yt-dlp", ["--no-playlist", "--no-warnings", "-x", "--audio-format", fmt, "--audio-quality", "0", "-N", "4",
+    ...(config.embedArt && (!meta.cover || meta.ytCover) ? ["--write-thumbnail", "--convert-thumbnails", "jpg"] : []),
+    // a catalogue track nobody looked at yet: only the right length downloads, and it says who it is by
+    ...(check && meta.seconds ? ["--match-filters", `duration>=${Math.max(1, meta.seconds - 4)} & duration<=${meta.seconds + 4}`] : []),
+    ...(check ? ["--no-simulate", "--print", "before_dl:%(.{id,title,channel,uploader,artist,artists,track,duration})j"] : []),
     "-o", path.join(ST(), "song.%(ext)s"), `https://www.youtube.com/watch?v=${videoId}`]);
   const raw = path.join(ST(), `song.${fmt}`);
-  if (!fs.existsSync(raw)) throw new Error(botNote(d.err) || "download failed: " + (d.err.trim().split("\n").pop() || "unknown"));
+  if (!fs.existsSync(raw)) {
+    if (check && meta.seconds && !d.err.trim()) throw new Error("that upload is a different length");
+    throw ytError(d.err, "download failed");
+  }
+  if (check) {
+    let info = null;
+    try { info = lastJson(d.out); } catch {}
+    const want = meta.artist.split(", ")[0];
+    const names = info ? [...(Array.isArray(info.artists) ? info.artists : []), info.artist, info.channel, info.uploader]
+      .map((n) => String(n || "").replace(/ - Topic$/i, "")).filter(Boolean) : [];
+    if (normAny(want) && names.length && !names.some((n) => looseArtist(n, want))) {
+      fs.rmSync(ST(), { recursive: true, force: true });
+      throw new Error("that upload is by someone else");
+    }
+  }
   return finishSong(raw, fmt, meta, path.join(ST(), "song.jpg"));
 }
 
@@ -1672,13 +2010,16 @@ async function saveViaDowntify(meta, query) {
   fs.promises.unlink(file).catch(() => {}); // don't leave a second copy in Downtify's folder (if we're allowed to delete)
   return { ...meta, skipped: note === "already in the library" };
 }
+// jobs that must not run side by side (Downtify, karaoke splitting): each waits for the one before
+const turns = {};
+const oneAtATime = (name, job) => { const r = (turns[name] || Promise.resolve()).then(job, job); turns[name] = r.catch(() => {}); return r; };
 // Runs our own attempt; if it fails and Downtify is set up, lets Downtify try.
 async function withBackup(ours, meta, query, why) {
   let err;
   try { const r = await ours(); if (r) return r; } catch (e) { err = e; }
   if (!config.downtifyEnabled) { if (err) throw err; return { status: "failed", artist: meta?.artist, title: meta?.title, note: why }; }
   try {
-    const m = await saveViaDowntify(meta, query);
+    const m = await oneAtATime("downtify", () => saveViaDowntify(meta, query)); // it finds its file by "newest": one at a time
     return { status: "done", artist: m.artist, title: m.title, note: m.skipped ? "already in the library" : "via Downtify (backup)" };
   } catch (e2) {
     return { status: "failed", artist: meta?.artist, title: meta?.title, note: `${err ? err.message.split("\n")[0] : why}; Downtify: ${e2.message}`.slice(0, 250) };
@@ -1686,9 +2027,43 @@ async function withBackup(ours, meta, query, why) {
 }
 // ---------- request handlers ----------
 
+// Downloads the song from the first upload that works: the given video (the AI's pick), then YouTube Music's
+// catalogue track, then the best ordinary uploads. Returns what processSong answers, or null (nothing to try).
+async function saveBest(meta, firstId) {
+  const tried = new Set();
+  let last = null, n = 0;
+  const attempt = async (id, check) => {
+    tried.add(id); n++;
+    try { return { note: await saveSong(id, meta, check) }; }
+    catch (e) { if (e.bot || e.code) throw e; last = e; return null; }
+  };
+  if (firstId) { const ok = await attempt(firstId, false); if (ok) return songDone(meta, ok.note); }
+  let list = [];
+  try { list = await findVideos(meta); } catch (e) { if (e.bot || !last) throw e; }
+  for (const v of list) {
+    if (n >= 4) break;
+    if (tried.has(v.id)) continue;
+    const ok = await attempt(v.id, v.check);
+    if (ok) return songDone(meta, ok.note);
+  }
+  if (last) throw last;
+  return null;
+}
+const inFlight = new Map();
+async function once(key, job) { // the same song asked for twice at the same moment is downloaded once
+  while (inFlight.has(key)) await inFlight.get(key);
+  const p = job().finally(() => inFlight.delete(key));
+  inFlight.set(key, p.catch(() => {}));
+  return p;
+}
+const fetchSong = (meta, firstId, query) => once(`${normAny(meta.albumArtist || meta.artist)}|${normAny(meta.title)}|${normAny(meta.album || "")}`, async () => {
+  if (inLibrary(meta.artist, meta.title, meta.album) || inLibrary(meta.albumArtist, meta.title, meta.album))
+    return { status: "done", artist: meta.artist, title: meta.title, note: "already in the library" };
+  return withBackup(() => saveBest(meta, firstId), meta, query, "no matching YouTube video");
+});
 function songDone(meta, skipped) {
   const info = meta.album ? `${meta.releaseType === "album" ? "" : meta.releaseType + ": "}${meta.album}${meta.date ? " (" + meta.date + ")" : ""}` : "";
-  return { status: "done", artist: meta.artist, title: meta.title, note: skipped || info };
+  return { status: "done", artist: meta.artist, title: meta.title, note: skipped || [info, meta.source ? `tags from ${meta.source}` : ""].filter(Boolean).join(" · ") };
 }
 async function processSong(item) {
   if (item.spotifyId && !item.meta) { // Spotify song link
@@ -1699,13 +2074,25 @@ async function processSong(item) {
   if (item.meta?.lookup) item.meta = await enrich(item.meta); // playlist song: find its album
   let meta = item.meta;
   if (meta) { // from an album/artist/playlist request or link: exact song known
-    if (inLibrary(meta.artist, meta.title, meta.album) || inLibrary(meta.albumArtist, meta.title, meta.album)) return { status: "done", artist: meta.artist, title: meta.title, note: "already in the library" };
-    return withBackup(async () => {
-      const id = meta.videoId || await findVideo(meta);
-      return id ? songDone(meta, await saveSong(id, meta)) : null; // null = no match, let the backup try
-    }, meta, null, "no matching YouTube video");
+    return fetchSong(meta, meta.videoId, null);
   }
-  // plain request: Claude Code / local model picks the video
+  // plain request. When a catalogue answer clearly is the song (title and artist both named), no AI is needed.
+  let known = null;
+  if (!item.aiOnly) {
+    known = await catalogCandidates(item.query).catch(() => []);
+    const pick = clearPick(known, item.query);
+    if (pick) {
+      const { lookup, ...base } = pick;
+      const meta = (await catalogMeta(base.artist.split(", ")[0], base.title)) || (lookup ? await enrich(base) : base);
+      Object.assign(item, { meta, title: meta.title, artist: meta.artist });
+      return processSong(item);
+    }
+  }
+  if (ctx.getStore()?.engine === "fast") { // fast lanes don't ask an AI: pass it to one, or ask the person
+    if (aiUsable()) return { status: "pending", aiOnly: true };
+    return askOrBackup(item, "no AI is set up to work this request out", known);
+  }
+  // Claude Code / local model picks the video
   let r;
   try {
     r = ctx.getStore()?.engine === "local" ? await identifyLocal(item.query) : await identifyClaude(item.query);
@@ -1718,15 +2105,7 @@ async function processSong(item) {
   meta = await enrich({ title: r.title, artist: r.artist }); // album tags from iTunes, then Deezer
   if (inLibrary(meta.artist, meta.title) || inLibrary(meta.albumArtist, meta.title))
     return { status: "done", artist: meta.artist, title: meta.title, note: "already in the library" };
-  return withBackup(async () => {
-    try {
-      return songDone(meta, await saveSong(r.video_id, meta));
-    } catch (e) { // that video wouldn't download (removed, blocked...): try another upload of the same song
-      const other = await findVideo(meta).catch(() => null);
-      if (other && other !== r.video_id) return songDone(meta, await saveSong(other, meta));
-      throw e;
-    }
-  }, meta, item.query);
+  return fetchSong(meta, r.video_id, item.query); // the AI's pick first, then other uploads of the same song
 }
 
 // ---------- "Is this the song?" ----------
@@ -1735,39 +2114,59 @@ async function processSong(item) {
 // it, one candidate at a time ("Is this the song? Hotel - Toby Fox").
 async function catalogCandidates(query) {
   const found = new Map();
-  // both catalogues list their best matches first (Deezer by popularity): earlier results get a small head start
+  // every catalogue lists its best matches first: earlier results get a small head start
   const add = (m, i) => {
     const k = songKey(m.artist, m.title);
     if (m.title && m.artist && !found.has(k)) found.set(k, { ...m, early: 0.4 * (1 - i / 8) });
   };
   const SKIP = /\b(karaoke|tribute|best of|greatest hits|now that)\b/i; // soundtracks are fine (game and film music)
-  try { (await itunes("search", { term: query, entity: "song", limit: 8 })).forEach((r, i) => { if (!SKIP.test(r.collectionName || "")) add(trackMeta(r), i); }); } catch {}
-  try {
-    ((await deezer(`search/track?limit=8&q=${encodeURIComponent(query)}`)).data || []).forEach((t, i) => {
-      if (SKIP.test(t.album?.title || "")) return;
-      add({ title: unremaster(t.title), artist: t.artist?.name || "", album: unremaster(t.album?.title || ""), seconds: Number(t.duration) || 0,
-        cover: t.album?.cover_xl || t.album?.cover_big || "", lookup: true }, i);
-    });
-  } catch {}
-  const q = norm(query), words = new Set(q.split(" ")), dash = String(query).match(/^(.+?)\s+-\s+(.+)$/);
+  const [sp, am, dz] = await Promise.all([ // asked together, added in the order Spotify, Apple Music, Deezer
+    config.spotifyClientId && config.spotifySecret
+      ? spotifyApi(`/search?type=track&limit=8&market=US&q=${encodeURIComponent(query)}`).then((j) => j?.tracks?.items || []).catch(() => []) : [],
+    itunes("search", { term: query, entity: "song", limit: 8 }, 8000).catch(() => []),
+    deezer(`search/track?limit=8&q=${encodeURIComponent(query)}`).then((j) => j.data || []).catch(() => []),
+  ]);
+  sp.forEach((x, i) => { if (!SKIP.test(x.album?.name || "")) add(spTrackMeta(x), i); });
+  am.forEach((r, i) => { if (!SKIP.test(r.collectionName || "")) add(trackMeta(r), i); });
+  dz.forEach((t, i) => {
+    if (SKIP.test(t.album?.title || "")) return;
+    add({ title: unremaster(t.title), artist: t.artist?.name || "", album: unremaster(t.album?.title || ""), seconds: Number(t.duration) || 0,
+      cover: t.album?.cover_xl || t.album?.cover_big || "", lookup: true, source: "Deezer" }, i);
+  });
+  const q = normAny(query), words = new Set(q.split(" ")), dash = String(query).match(/^(.+?)\s+-\s+(.+)$/);
   const COVERISH = /\b(piano|lofi|lo fi|cover|covers|tribute|8 ?bit|music box|arranged|arrangement|orchestral|acoustic|karaoke|instrumental|remix|version|sped|slowed|nightcore)\b/i;
   const score = (m) => {
-    const t = norm(m.title), a = norm(m.artist), tw = t.split(" ");
+    const t = normAny(m.title), a = normAny(m.artist), tw = t.split(" ");
     let s = tw.filter((w) => words.has(w)).length / Math.max(1, tw.length) + m.early;
     if (t && q.includes(t)) s += 3;
     if (a && (q.includes(a) || q.includes(primaryArtist(m.artist)))) s += 3;
-    if (dash && ((norm(dash[2]) === t && norm(dash[1]) === a) || (norm(dash[1]) === t && norm(dash[2]) === a))) s += 2;
+    if (dash && ((normAny(dash[2]) === t && normAny(dash[1]) === a) || (normAny(dash[1]) === t && normAny(dash[2]) === a))) s += 2;
     // "hotel undertale": the words that aren't the title often name the album (or the game)
-    if (norm(m.album || "").split(" ").some((w) => w.length > 3 && words.has(w) && !tw.includes(w))) s += 1.5;
-    if (COVERISH.test(`${m.title} ${m.album || ""} ${m.artist}`) && !COVERISH.test(query)) s -= 1.5;
+    if (normAny(m.album || "").split(" ").some((w) => w.length > 3 && words.has(w) && !tw.includes(w))) s += 1.5;
+    // covers, live recordings, remixes...: only when the request asks for one
+    if ((COVERISH.test(`${m.title} ${m.album || ""} ${m.artist}`) || VERSION.test(m.title.replace(/remaster(ed)?/i, ""))) && !COVERISH.test(query) && !VERSION.test(query)) s -= 1.5;
     return s;
   };
   return [...found.values()].map(({ early, ...m }) => ({ ...m, score: score({ ...m, early }) })).sort((x, y) => y.score - x.score).slice(0, 6);
 }
-async function askOrBackup(item, why) {
-  const candidates = await catalogCandidates(item.query).catch(() => []);
+const FILLER = new Set("a an and at by ft feat featuring from the of song track audio official video music lyrics lyric hd hq full original version".split(" "));
+// the catalogue answer that clearly is the request: high score, nothing as good, and every word of the
+// request is in its title, artist or album (or is a filler word). Then no AI is needed.
+function clearPick(c, query) {
+  const wantVersion = VERSION.test(query);
+  const list = c.filter((x) => wantVersion || !VERSION.test(x.title.replace(/remaster(ed)?/i, ""))); // live, remix...: only when asked for
+  const pick = list[0];
+  if (!pick || pick.score < 6.5 || (list[1] && list[1].score >= pick.score)) return null;
+  const have = new Set(`${titleKey(pick.title)} ${titleKey(pick.artist)} ${titleKey(pick.album || "")}`.split(" "));
+  if (!titleKey(query).split(" ").filter(Boolean).every((w) => have.has(w) || FILLER.has(w))) return null;
+  const { score, ...meta } = pick;
+  return meta;
+}
+async function askOrBackup(item, why, known) {
+  const candidates = known || await catalogCandidates(item.query).catch(() => []);
   // title and artist both in the request (and nothing else as good): no need to ask
-  if (candidates[0] && candidates[0].score >= 6.5 && !(candidates[1] && candidates[1].score >= candidates[0].score)) {
+  if (candidates[0] && candidates[0].score >= 6.5 && !(candidates[1] && candidates[1].score >= candidates[0].score)
+    && (VERSION.test(item.query) || !VERSION.test(candidates[0].title.replace(/remaster(ed)?/i, "")))) {
     const { score, ...meta } = candidates[0];
     Object.assign(item, { meta, title: meta.title, artist: meta.artist });
     return processSong(item);
@@ -1923,23 +2322,26 @@ setInterval(async () => {
 function insertChildren(parent, kids) {
   const at = items.indexOf(parent) + 1 + items.filter((k) => k.parent === parent.id).length;
   items.splice(at, 0, ...kids.map((k) => ({ id: newId(), parent: parent.id, root: parent.root || parent.id, status: "pending", created: new Date().toISOString(), ...k })));
+  wake(); // idle lanes start on the new tracks at once
 }
 
 // --- albums: iTunes first; if it has no good match, Deezer by name ---
 async function itunesAlbum(item, collectionId) {
-  const res = await itunes("lookup", { id: collectionId, entity: "song", limit: 200 });
+  const res = await itunes("lookup", { id: collectionId, entity: "song", limit: 200 }, 180000);
   const album = res.find((r) => r.wrapperType === "collection");
   const tracks = res.filter((r) => r.wrapperType === "track" && r.kind === "song")
     .sort((a, b) => (a.discNumber - b.discNumber) || (a.trackNumber - b.trackNumber));
   if (!tracks.length) return { status: "failed", note: "no tracks listed for this album" };
-  insertChildren(item, tracks.map((r) => ({ type: "song", query: `${r.artistName} - ${r.trackName}`, meta: trackMeta(r) })));
-  return { status: "working", title: cleanAlbum(album?.collectionName || tracks[0].collectionName), artist: album?.artistName || tracks[0].artistName, note: "tracklist from iTunes" };
+  const metas = await spotifyAlbumTags(tracks.map((r) => trackMeta(r)));
+  insertChildren(item, metas.map((m) => ({ type: "song", query: `${m.artist} - ${m.title}`, meta: m })));
+  return { status: "working", title: cleanAlbum(album?.collectionName || tracks[0].collectionName), artist: album?.artistName || tracks[0].artistName,
+    note: `tracklist from Apple Music${metas[0].source === "Spotify" ? ", tags from Spotify" : ""}` };
 }
 async function expandAlbum(item) {
   if (item.spotifyId) return spotifyAlbum(item, item.spotifyId);
   if (item.deezerId) return deezerAlbum(item, item.deezerId);
   if (item.collectionId) return itunesAlbum(item, item.collectionId);
-  const found = (await itunes("search", { term: item.query, entity: "album", limit: 15 }))
+  const found = (await itunes("search", { term: item.query, entity: "album", limit: 15 }, 180000).catch(() => []))
     .filter((c) => !/karaoke|tribute|various artists/i.test(`${c.collectionName} ${c.artistName}`));
   const iScore = (c) => albumScore(item.query, c.collectionName, releaseType(c.collectionName) === "album");
   found.sort((x, y) => iScore(x) - iScore(y)); // stable sort keeps iTunes order for ties
@@ -1967,17 +2369,17 @@ function newestAlbums(list, name, tracks, date) { // one edition per album (most
 }
 async function expandArtist(item) {
   if (item.spotifyId) item.query = (await spotifyEmbed("artist", item.spotifyId)).name; // Spotify artist link: use the name
-  const q = norm(item.query);
-  const artists = await itunes("search", { term: item.query, entity: "musicArtist", limit: 10 });
-  let artist = artists.find((a) => norm(a.artistName) === q);
+  const q = normAny(item.query);
+  const artists = await itunes("search", { term: item.query, entity: "musicArtist", limit: 10 }, 180000).catch(() => []);
+  let artist = artists.find((a) => normAny(a.artistName) === q);
   if (!artist) {
     const dz = (await deezer(`search/artist?limit=5&q=${encodeURIComponent(item.query)}`).catch(() => ({}))).data || [];
-    const hit = dz.find((a) => norm(a.name) === q) || dz[0];
+    const hit = dz.find((a) => normAny(a.name) === q) || dz[0];
     if (hit) return deezerArtist(item, hit.id, hit.name);
   }
   artist = artist || artists[0];
   if (!artist) return { status: "failed", note: "artist not found on iTunes or Deezer" };
-  const res = await itunes("lookup", { id: artist.artistId, entity: "album", limit: 200 });
+  const res = await itunes("lookup", { id: artist.artistId, entity: "album", limit: 200 }, 180000);
   const albums = res.filter((c) => c.wrapperType === "collection" && c.artistId === artist.artistId
     && !COMP.test(c.collectionName) && (config.includeSingles || releaseType(c.collectionName) === "album"))
     .sort((a, b) => (b.collectionExplicitness === "explicit") - (a.collectionExplicitness === "explicit")); // explicit edition wins ties
@@ -2019,11 +2421,27 @@ function rollup(id) {
 // Up to two workers run side by side: "claude" (Claude Code) and "local" (local model). Which ones run
 // depends on Config > Provider (claude, local or both). Album/artist/playlist tracks don't need AI, so
 // either worker takes them. A worker that isn't set up (no token / no model) just waits.
+// two AI workers (Claude, local model) for requests that need working out, and up to 6 fast lanes for
+// everything a catalogue already answers (albums, artists, playlists, clear song names, karaoke)
 const WORKERS = [
   { id: "claude", label: "Claude", busy: false, current: null, lastError: null },
   { id: "local", label: "Local model", busy: false, current: null, lastError: null },
+  ...[1, 2, 3, 4, 5, 6].map((n) => ({ id: `fast-${n}`, label: `Fast lane ${n}`, fast: true, n, busy: false, current: null, lastError: null })),
 ];
-const workerEnabled = (w) => config.engine === w.id || config.engine === "both";
+const workerEnabled = (w) => (w.fast ? w.n <= (config.fastWorkers ?? 3) : config.engine === w.id || config.engine === "both");
+const aiUsable = () => WORKERS.some((w) => !w.fast && ["ready", "busy"].includes(workerState(w)));
+function workerList() { // the AI workers one by one, the fast lanes as one row
+  const out = WORKERS.filter((w) => !w.fast && workerEnabled(w)).map((w) => ({ id: w.id, label: w.label, state: workerState(w), current: w.current, lastError: w.lastError }));
+  const lanes = WORKERS.filter((w) => w.fast && workerEnabled(w));
+  if (lanes.length) {
+    const busy = lanes.filter((w) => w.busy), st = workerState(lanes[0]);
+    out.push({ id: "fast", label: lanes.length === 1 ? "Fast lane" : `Fast lanes (${lanes.length})`,
+      state: st === "ready" || st === "busy" ? (busy.length ? "busy" : "ready") : st,
+      current: busy.length ? busy.map((w) => w.current).filter(Boolean).join(" · ").slice(0, 300) : null,
+      lastError: lanes.map((w) => w.lastError).find(Boolean) || null });
+  }
+  return out;
+}
 function workerState(w) {
   if (!workerEnabled(w)) return "off";
   if (!ready()) return "setup";
@@ -2049,8 +2467,19 @@ function pushForward(item) {
 const itemName = (i) => (i.title ? `${i.artist ? i.artist + " - " : ""}${i.title}` : i.query);
 // next job: anything pushed forward with /now or /bump first, then the queue in order
 const rootVotes = (i) => (items.find((r) => r.id === (i.root || i.id))?.votes || []).length;
-const nextItem = () => items.find((i) => i.status === "pending" && i.priority)
-  || items.filter((i) => i.status === "pending").sort((a, b) => rootVotes(b) - rootVotes(a))[0]; // stable: same votes keep their order
+// With fast lanes on, the AI workers only take what may need an AI (plain song requests); fast lanes take the rest,
+// and AI work too when no AI is set up.
+function nextItem(w) {
+  const ai = aiUsable(), fastOn = (config.fastWorkers ?? 3) > 0;
+  const mine = (i) => i.status === "pending" && (w.fast ? !i.aiOnly || !ai : !fastOn || i.aiOnly || ((i.type || "song") === "song" && !i.meta && !i.spotifyId));
+  const pool = items.filter(mine);
+  if (!pool.length) return null;
+  const pushed = pool.find((i) => i.priority);
+  if (pushed) return pushed;
+  const votes = new Map();
+  const v = (i) => { const k = i.root || i.id; if (!votes.has(k)) votes.set(k, rootVotes(i)); return votes.get(k); };
+  return pool.sort((a, b) => v(b) - v(a))[0]; // stable: same votes keep their order
+}
 
 async function processItem(item, w) {
   Object.assign(item, { status: "working", note: undefined, by: w.id }); save(); // claimed before any await, so the other worker skips it
@@ -2060,7 +2489,7 @@ async function processItem(item, w) {
   try {
     const type = item.type || "song";
     const result = type === "album" ? await expandAlbum(item) : type === "artist" ? await expandArtist(item)
-      : type === "playlist" ? await expandPlaylist(item) : type === "karaoke" ? await processKaraoke(item) : await processSong(item);
+      : type === "playlist" ? await expandPlaylist(item) : type === "karaoke" ? await oneAtATime("karaoke", () => processKaraoke(item)) : await processSong(item);
     Object.assign(item, result);
     if (item.group && (item.status === "done" || item.status === "failed")) {
       const g = groups.get(item.group);
@@ -2084,6 +2513,7 @@ async function processItem(item, w) {
     w.current = null;
     if (item.status !== "working" && item.parent) rollup(item.parent);
     save();
+    if (item.status === "pending") wake(); // handed on (to an AI worker)
   }
 }
 
@@ -2094,10 +2524,10 @@ for (const w of WORKERS) {
   (async function loop() {
     for (;;) {
       const st = workerState(w);
-      const next = (st === "ready") && nextItem();
+      const next = (st === "ready") && nextItem(w);
       if (next) {
         w.busy = true;
-        await ctx.run({ engine: w.id, stage }, () => processItem(next, w));
+        await ctx.run({ engine: w.fast ? "fast" : w.id, stage }, () => processItem(next, w));
         w.busy = false;
         continue;
       }
@@ -5017,7 +5447,7 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
         people: visibleProfiles().length,
         queue: items.filter((i) => i.status === "pending" || i.status === "working").length,
         failedToday: items.filter((i) => i.status === "failed" && now - new Date(i.created).getTime() < 86400000).length,
-        workers: WORKERS.filter(workerEnabled).map((w) => ({ label: w.label, state: workerState(w), current: w.current, lastError: w.lastError })),
+        workers: workerList(),
         library: library.files, groups: groups.size, aiKaraoke: DEMUCS.state, version: process.env.HM_VERSION || null,
       });
     }
@@ -5044,7 +5474,7 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
     const tops = items.filter((i) => !i.parent);
     const c = (s) => tops.filter((i) => i.status === s).length;
     return send(res, 200, {
-      workers: WORKERS.filter(workerEnabled).map((w) => ({ id: w.id, label: w.label, state: workerState(w), current: w.current, lastError: w.lastError })),
+      workers: workerList(),
       pending: c("pending"), working: c("working"), done: c("done"), failed: c("failed"), asking: c("ask"),
       library: { files: library.files, scanning: library.scanning, scanned: library.scanned },
     });
@@ -5139,6 +5569,12 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
       saveVideos();
     }
     return v.live ? send(res, 200, v.live) : send(res, 404, { error: "no live performance found" });
+  }
+  if (p === "/api/lyrics/words") { // GET ?artist&title&seconds -> { found, lines: [{ start, end, text, words }] } (ms)
+    const artist = clean1(url.searchParams.get("artist"), 200), title = clean1(url.searchParams.get("title"), 200);
+    if (!artist || !title) return send(res, 400, { error: "artist and title needed" });
+    try { return send(res, 200, await wordLyrics(artist, title, Number(url.searchParams.get("seconds")) || 0)); }
+    catch (e) { return send(res, 502, { found: false, error: String(e.message).slice(0, 150) }); }
   }
   if (p === "/api/lyrics/offset") { // GET ?artist&title -> {ms}; POST {artist, title, ms}
     if (get) return send(res, 200, { ms: lyricOffsets[songKey(url.searchParams.get("artist") || "", url.searchParams.get("title") || "")] || 0 });
@@ -5330,7 +5766,7 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
         if (a.cover_xl) out.push({ url: a.cover_xl, title: a.title, artist: a.artist?.name || "", source: "Deezer" });
     } catch {}
     try {
-      for (const a of await itunes("search", { term: q, entity: "album", limit: 8 }))
+      for (const a of await itunes("search", { term: q, entity: "album", limit: 8 }, 3000))
         if (a.artworkUrl100) out.push({ url: a.artworkUrl100.replace(/100x100bb/, "1200x1200bb"), title: a.collectionName, artist: a.artistName, source: "iTunes" });
     } catch {}
     try {
