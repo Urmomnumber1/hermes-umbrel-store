@@ -5401,6 +5401,198 @@ const readBody = (req, max = 10000) => new Promise((ok) => {
 });
 const rate = new Map(); // ip -> timestamps
 
+// ---- Podcasts (Sour Player 0.13) ----
+// Shows are found in Apple's free podcast directory, episodes come from each show's own RSS feed, and the
+// audio is relayed through here so it carries the header the player's EQ, reverb and visualizer need
+// (most podcast hosts don't send it). Nothing is kept but a short cache of feeds: every app keeps its own
+// subscriptions. The relay only plays episodes from feeds this server has read (it's no open proxy).
+const dnsPromises = require("dns").promises;
+const privateIp = (ip) => /^(127\.|10\.|0\.|192\.168\.|169\.254\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip.replace(/^::ffff:/i, "")) || /^(::1?$|f[cd]|fe80:)/i.test(ip);
+// fetch, but only from the open internet (never the home network), checking every redirect on the way
+const publicFetch = async (target, opts = {}, hops = 10) => {
+  const u = new URL(target);
+  if (!/^https?:$/.test(u.protocol)) throw new Error("not a web address");
+  const addrs = await dnsPromises.lookup(u.hostname.replace(/^\[|\]$/g, ""), { all: true });
+  if (!addrs.length || addrs.some((a) => privateIp(a.address))) throw new Error("that address isn't on the internet");
+  const r = await fetch(u, { ...opts, redirect: "manual" });
+  const next = r.status >= 300 && r.status < 400 && r.headers.get("location");
+  if (!next) {
+    r.hermesUrl = u.href; // where it really came from (after the redirects)
+    return r;
+  }
+  if (hops <= 0) throw new Error("too many redirects");
+  return publicFetch(new URL(next, u).href, opts, hops - 1);
+};
+const podcastFeeds = new Map(); // feed url -> { at, data }
+const podcastAudio = new Set(); // episode audio urls seen in feeds
+const podcastWhere = new Map(); // episode audio url -> { at, url } where it ends up after the trackers' redirects
+let podcastTop = null; // { at, list }
+const xmlText = (s) => String(s || "")
+  .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1")
+  .replace(/<[^>]+>/g, " ")
+  .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'")
+  .replace(/&#(\d+);/g, (m0, n) => { try { return String.fromCodePoint(Number(n)); } catch { return " "; } })
+  .replace(/&amp;/g, "&").replace(/\s+/g, " ").trim();
+const xmlTag = (block, tag) => {
+  const at = block.search(new RegExp("<" + tag + "(\\s[^>]*)?>", "i"));
+  if (at < 0) return "";
+  const open = block.indexOf(">", at) + 1;
+  const close = block.toLowerCase().indexOf("</" + tag.toLowerCase() + ">", open);
+  return close < 0 ? "" : block.slice(open, close);
+};
+const xmlAttr = (tag, name) => {
+  const m = String(tag || "").match(new RegExp(name + "\\s*=\\s*[\"']([^\"']+)[\"']", "i"));
+  return m ? m[1].replace(/&amp;/g, "&") : "";
+};
+const podcastSeconds = (d) => {
+  const s = xmlText(d);
+  if (!s) return 0;
+  if (s.includes(":")) return s.split(":").reduce((a, x) => a * 60 + (Number(x) || 0), 0);
+  return Math.round(Number(s) || 0);
+};
+const parsePodcast = (xml, feedUrl) => {
+  const head = xml.split(/<item[\s>]/i)[0];
+  const channelImage = xmlAttr((head.match(/<itunes:image[^>]*>/i) || [])[0], "href") || xmlText(xmlTag(xmlTag(head, "image"), "url"));
+  const episodes = [];
+  for (const m of xml.matchAll(/<item[\s>][\s\S]*?<\/item>/gi)) {
+    const it = m[0];
+    const audio = xmlAttr((it.match(/<enclosure[^>]*>/i) || [])[0], "url");
+    if (!/^https?:\/\//i.test(audio)) continue;
+    podcastAudio.add(audio);
+    episodes.push({
+      audio,
+      date: Date.parse(xmlText(xmlTag(it, "pubDate"))) || 0,
+      description: xmlText(xmlTag(it, "itunes:summary") || xmlTag(it, "description")).slice(0, 500),
+      duration: podcastSeconds(xmlTag(it, "itunes:duration")),
+      guid: xmlText(xmlTag(it, "guid")) || audio,
+      image: xmlAttr((it.match(/<itunes:image[^>]*>/i) || [])[0], "href") || null,
+      title: xmlText(xmlTag(it, "title")) || "Episode",
+    });
+    if (episodes.length >= 300) break;
+  }
+  episodes.sort((a, b) => b.date - a.date);
+  return {
+    author: xmlText(xmlTag(head, "itunes:author")) || xmlText(xmlTag(head, "managingEditor")),
+    description: xmlText(xmlTag(head, "itunes:summary") || xmlTag(head, "description")).slice(0, 800),
+    episodes,
+    image: channelImage || null,
+    title: xmlText(xmlTag(head, "title")) || "Podcast",
+    url: feedUrl,
+  };
+};
+const podcastFeed = async (feedUrl) => {
+  const cached = podcastFeeds.get(feedUrl);
+  if (cached && Date.now() - cached.at < 20 * 60 * 1000) return cached.data;
+  const r = await publicFetch(feedUrl, { headers: { "user-agent": `HermesMusic/${process.env.HM_VERSION || "3"}` }, signal: AbortSignal.timeout(20000) });
+  if (!r.ok) throw new Error(`the show's feed answered ${r.status}`);
+  const xml = await r.text();
+  if (!/<rss[\s>]|<channel[\s>]/i.test(xml)) throw new Error("that isn't a podcast feed");
+  const data = parsePodcast(xml, feedUrl);
+  podcastFeeds.set(feedUrl, { at: Date.now(), data });
+  if (podcastFeeds.size > 200) podcastFeeds.delete(podcastFeeds.keys().next().value);
+  return data;
+};
+const appleShows = (results) => (results || [])
+  .filter((x) => x.feedUrl)
+  .map((x) => ({ author: x.artistName || "", feed: x.feedUrl, genre: x.primaryGenreName || "", id: String(x.collectionId || x.trackId || x.feedUrl), image: x.artworkUrl600 || x.artworkUrl100 || null, title: x.collectionName || x.trackName || "Podcast" }));
+const podcastRoute = async (req, res, p, url) => {
+  try {
+    if (p === "/api/podcasts/search") {
+      const q = clean1(url.searchParams.get("q"), 120);
+      if (!q) return send(res, 200, []);
+      const r = await fetch(`https://itunes.apple.com/search?media=podcast&entity=podcast&limit=30&term=${encodeURIComponent(q)}`, { signal: AbortSignal.timeout(15000) });
+      return send(res, 200, appleShows((await r.json()).results));
+    }
+    if (p === "/api/podcasts/top") { // Apple's top shows in the US, looked up for their feeds (kept 6 hours)
+      if (!podcastTop || Date.now() - podcastTop.at > 6 * 3600 * 1000) {
+        const top = await fetch("https://rss.applemarketingtools.com/api/v2/us/podcasts/top/30/podcasts.json", { signal: AbortSignal.timeout(15000) }).then((r) => r.json());
+        const ids = (top.feed?.results || []).map((x) => x.id).filter(Boolean).slice(0, 30);
+        const look = ids.length ? await fetch(`https://itunes.apple.com/lookup?id=${ids.join(",")}`, { signal: AbortSignal.timeout(15000) }).then((r) => r.json()) : { results: [] };
+        const shows = appleShows(look.results);
+        podcastTop = { at: Date.now(), list: ids.map((id) => shows.find((s) => s.id === String(id))).filter(Boolean) };
+      }
+      return send(res, 200, podcastTop.list);
+    }
+    if (p === "/api/podcasts/feed") {
+      const feed = String(url.searchParams.get("url") || "");
+      if (!/^https?:\/\//i.test(feed) || feed.length > 2000) return send(res, 400, { error: "which feed?" });
+      return send(res, 200, await podcastFeed(feed));
+    }
+    if (p === "/api/podcasts/audio") { // the episode's audio, ranges and all, with the CORS header
+      const target = String(url.searchParams.get("url") || "");
+      // after a restart: the app says which show it's from, and the show's feed is read again
+      const from = String(url.searchParams.get("feed") || "");
+      if (!podcastAudio.has(target) && /^https?:\/\//i.test(from) && from.length <= 2000) await podcastFeed(from).catch(() => null);
+      if (!podcastAudio.has(target)) return send(res, 403, { error: "open the show first" });
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 30000);
+      req.on("close", () => ctrl.abort());
+      const headers = { "user-agent": `HermesMusic/${process.env.HM_VERSION || "3"}` };
+      if (req.headers.range) headers.range = req.headers.range;
+      const go = (from) => publicFetch(from, { headers, method: req.method === "HEAD" ? "HEAD" : "GET", signal: ctrl.signal });
+      // episodes usually pass through several tracking redirects: after the first time, a jump in the
+      // episode goes straight to where the audio is (for half an hour)
+      const known = podcastWhere.get(target);
+      let r = known && Date.now() - known.at < 30 * 60 * 1000 ? await go(known.url).catch(() => null) : null;
+      let fresh = false;
+      if (!r || !r.ok) {
+        if (r?.body) r.body.cancel().catch(() => {});
+        r = await go(target);
+        fresh = true;
+      }
+      if (fresh && r.ok && r.hermesUrl && r.hermesUrl !== target) {
+        podcastWhere.set(target, { at: Date.now(), url: r.hermesUrl });
+        if (podcastWhere.size > 300) podcastWhere.delete(podcastWhere.keys().next().value);
+      }
+      clearTimeout(timer);
+      const out = { "accept-ranges": "bytes", "access-control-allow-origin": "*", "cache-control": "no-store", "content-type": r.headers.get("content-type") || "audio/mpeg" };
+      for (const h of ["content-length", "content-range"]) if (r.headers.get(h)) out[h] = r.headers.get(h);
+      res.writeHead(r.status, out);
+      if (!r.body || req.method === "HEAD") return res.end();
+      require("stream").Readable.fromWeb(r.body).on("error", () => res.destroy()).pipe(res);
+      return;
+    }
+    return send(res, 404, { error: "not found" });
+  } catch (e) {
+    if (res.headersSent) return res.destroy();
+    return send(res, 502, { error: String(e.message || e).slice(0, 160) });
+  }
+};
+
+// ---- Radio relay (Sour Player 0.13) ----
+// Many radio stations don't send the header a browser needs to play them (or are plain http where the app
+// is https). The app tries the station itself first and comes here only when that fails. Audio only (this
+// is no way to open web pages) and only from the open internet.
+const radioRoute = async (req, res, p, url) => {
+  if (p !== "/api/radio/relay") return send(res, 404, { error: "not found" });
+  if (req.method === "OPTIONS") return send(res, 204, "");
+  const target = String(url.searchParams.get("url") || "");
+  if (!/^https?:\/\//i.test(target) || target.length > 2000) return send(res, 400, { error: "which station?" });
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  req.on("close", () => ctrl.abort());
+  try {
+    const headers = { "user-agent": `HermesMusic/${process.env.HM_VERSION || "3"}` };
+    if (req.headers["icy-metadata"]) headers["icy-metadata"] = "1";
+    const r = await publicFetch(target, { headers, signal: ctrl.signal });
+    clearTimeout(timer);
+    const type = (r.headers.get("content-type") || "").toLowerCase();
+    if (!r.ok || !/^(audio\/|application\/ogg|video\/mp2t|application\/octet-stream)/.test(type)) {
+      ctrl.abort();
+      return send(res, 415, { error: "that isn't a radio stream" });
+    }
+    const out = { "access-control-allow-origin": "*", "access-control-expose-headers": "icy-metaint, icy-name, icy-genre, icy-br, icy-description, icy-url", "cache-control": "no-store", "content-type": type };
+    for (const [k, v] of r.headers) if (k.startsWith("icy-")) out[k] = v;
+    res.writeHead(200, out);
+    if (!r.body || req.method === "HEAD") return res.end();
+    require("stream").Readable.fromWeb(r.body).on("error", () => res.destroy()).pipe(res);
+  } catch (e) {
+    clearTimeout(timer);
+    if (res.headersSent) return res.destroy();
+    return send(res, 502, { error: String(e.message || e).slice(0, 160) });
+  }
+};
+
 http.createServer(async (req, res) => {
   let m;
   const url = new URL(req.url, "http://x");
@@ -5411,16 +5603,18 @@ http.createServer(async (req, res) => {
   const isSour = SOUR_PREFIXES.some((x) => p.startsWith(x)) || SOUR_ROUTES.includes(p);
   if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/lyrics") || p.startsWith("/api/requests") || p.startsWith("/api/library") || p.startsWith("/api/duplicates") || isSour
     || ["/api/status", "/api/now", "/api/bump", "/api/storage", "/api/song-dna", "/api/announcement", "/api/liner-notes"].includes(p) || p.startsWith("/api/admin/")
-    || p.startsWith("/api/discord-bot/")) { // used by Sour Player (the custom Feishin)
+    || p.startsWith("/api/discord-bot/") || p.startsWith("/api/podcasts/") || p.startsWith("/api/radio/")) { // used by Sour Player (the custom Feishin)
     res.setHeader("access-control-allow-origin", "*");
     if (req.method === "OPTIONS") {
       // the Discord bot's uploads say who sends them (and the file's name) in headers
-      res.writeHead(204, { "access-control-allow-methods": "GET, POST", "access-control-allow-headers": "content-type, x-sour-profile, x-sour-key, x-file-name", "access-control-max-age": "86400" });
+      res.writeHead(204, { "access-control-allow-methods": "GET, POST", "access-control-allow-headers": "content-type, range, icy-metadata, x-sour-profile, x-sour-key, x-file-name", "access-control-max-age": "86400" });
       return res.end();
     }
   }
   if (p.startsWith("/api/group/")) return groupRoute(req, res, p, get, post, url);
   if (p.startsWith("/api/discord-bot/")) return botRoute(req, res, p, url);
+  if (p.startsWith("/api/podcasts/")) return podcastRoute(req, res, p, url);
+  if (p.startsWith("/api/radio/")) return radioRoute(req, res, p, url);
   if (isSour) return sourRoute(req, res, p, get, post, url);
 
   if (get && p === "/") return send(res, 200, PAGE, "text/html");
@@ -5545,6 +5739,7 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
       workers: workerList(),
       pending: c("pending"), working: c("working"), done: c("done"), failed: c("failed"), asking: c("ask"),
       library: { files: library.files, scanning: library.scanning, scanned: library.scanned },
+      canTranslate: !!config.claudeToken, // Sour Player's Translate button (the token itself never leaves)
     });
   }
 
