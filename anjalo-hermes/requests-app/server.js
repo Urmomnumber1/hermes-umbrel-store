@@ -85,6 +85,7 @@ function updateConfig(b, ok) {
   if (["claude", "local", "both"].includes(b.engine)) next.engine = b.engine;
   if (["sonnet", "opus", "haiku"].includes(b.claudeModel)) next.claudeModel = b.claudeModel;
   if (typeof b.aiKaraoke === "boolean") next.aiKaraoke = b.aiKaraoke;
+  if (typeof b.autoVersions === "boolean") next.autoVersions = b.autoVersions;
   if (typeof b.approveBig === "boolean") next.approveBig = b.approveBig;
   // artists or songs that never download (one per line)
   if (typeof b.banned === "string") next.banned = b.banned.split(/\r?\n/).map((x) => x.trim()).filter(Boolean).slice(0, 200);
@@ -319,6 +320,7 @@ async function scanLibrary() {
     library.scanned = true;
     fs.writeFileSync(LIBCACHE, JSON.stringify(libCache));
     console.log(`library: ${n} files indexed`);
+    setTimeout(() => { try { foldVersions(); } catch (e) { console.error("versions:", e.message); } }, 2000);
   } catch (e) {
     console.error("library scan failed:", e.message);
   } finally {
@@ -880,7 +882,7 @@ function libraryFile(rel) {
   // try the whole path, then without leading folders, until one is a file in the library
   for (let i = 0; i < parts.length; i++) {
     const file = path.resolve(MUSIC, parts.slice(i).join("/"));
-    if (!file.startsWith(MUSIC + path.sep) || /[/\\]\.(duplicates|archive)[/\\]/.test(file)) continue;
+    if (!file.startsWith(MUSIC + path.sep) || /[/\\]\.(duplicates|archive|versions|karaoke)[/\\]/.test(file)) continue;
     if (fs.existsSync(file) && fs.statSync(file).isFile()) return file;
   }
   throw new Error("that file isn't in the library any more");
@@ -2366,7 +2368,7 @@ setInterval(async () => {
   if (h < 2 || h > 5 || DEMUCS.busy || config.aiKaraoke === false) return;
   const w = groupStats.weeks[weekKey()];
   if (!w) return;
-  const todo = topEntries(w.songs, 30).map(([, s]) => s.song).filter((s) => !karaokeFile(s.artist, s.title) && libraryFileFor(s.artist, s.title)).slice(0, 4);
+  const todo = topEntries(w.songs, 30).map(([, s]) => s.song).filter((s) => !karaokeFile(s.artist, s.title) && !karaokeOff[karaokeKey(s.artist, s.title)] && libraryFileFor(s.artist, s.title)).slice(0, 4);
   DEMUCS.busy = true;
   try { for (const s of todo) await splitSong(s.artist, s.title).catch(() => null); } finally { DEMUCS.busy = false; }
 }, 30 * 60000);
@@ -2540,7 +2542,8 @@ async function processItem(item, w) {
   try {
     const type = item.type || "song";
     const result = type === "album" ? await expandAlbum(item) : type === "artist" ? await expandArtist(item)
-      : type === "playlist" ? await expandPlaylist(item) : type === "karaoke" ? await oneAtATime("karaoke", () => processKaraoke(item)) : await processSong(item);
+      : type === "playlist" ? await expandPlaylist(item) : type === "karaoke" ? await oneAtATime("karaoke", () => processKaraoke(item))
+      : type === "version" ? await oneAtATime("version", () => processVersion(item)) : await processSong(item);
     Object.assign(item, result);
     if (item.group && (item.status === "done" || item.status === "failed")) {
       const g = groups.get(item.group);
@@ -2900,6 +2903,573 @@ setTimeout(() => {
   }
 }, 15000);
 
+// ---------- song versions (3.16, for Sour Player 0.15) ----------
+// Other versions of a song (a Kasane Teto cover, a sped-up edit, a piano version...) live under the song instead
+// of next to it, in a hidden folder Navidrome doesn't scan (like the karaoke instrumentals), so search and the
+// library only show the song itself. Sour Player asks which version to play when someone starts the song, plays
+// their most-played one everywhere else (the original until they've played another), and switches between them
+// mid-song, in step when they line up: Hermes measures where each version sits against the original by matching
+// the sound, the same way it times music videos. Versions come from requests ("Request a version": a link or a few
+// words), from admins putting a song under another, and by themselves from singles that are clearly another
+// version of a song in the library ("Retry Now (Kasane Teto ver.)" next to "Retry Now").
+const VERSIONS_DIR = path.join(MUSIC, ".versions"), VERSIONS_LIST = "/data/versions.json";
+const VERSION_PLAYS = "/data/version-plays.json", NOT_VERSIONS = "/data/not-versions.json", KARAOKE_OFF = "/data/karaoke-off.json";
+const versionsDb = readJsonEarly(VERSIONS_LIST); // the original's songKey -> { artist, title, keys, versions: [...] }
+const versionPlays = readJsonEarly(VERSION_PLAYS); // profile -> songKey -> { "original" | version id: plays }
+const notVersions = readJsonEarly(NOT_VERSIONS); // library files an admin took back out (never moved again)
+const karaokeOff = readJsonEarly(KARAOKE_OFF); // karaokeKey -> { by, at }: no karaoke for these songs (nobody sings)
+const saveVersions = () => fs.writeFileSync(VERSIONS_LIST, JSON.stringify(versionsDb));
+let versionPlaysDirty = false;
+setInterval(() => {
+  if (!versionPlaysDirty) return;
+  versionPlaysDirty = false;
+  fs.promises.writeFile(VERSION_PLAYS, JSON.stringify(versionPlays)).catch(() => {});
+}, 20000);
+const AUDIO_TYPE = { mp3: "audio/mpeg", m4a: "audio/mp4", opus: "audio/ogg", ogg: "audio/ogg", oga: "audio/ogg", flac: "audio/flac", wav: "audio/wav", aac: "audio/aac", webm: "audio/webm" };
+const versionFile = (v) => path.join(VERSIONS_DIR, v.file);
+const keyDir = (key) => crypto.createHash("sha1").update(key).digest("hex").slice(0, 16);
+const newVersionId = () => "v" + crypto.randomBytes(5).toString("hex");
+const VERSION_ID = /^v[0-9a-f]{10}$/;
+function findVersion(id) {
+  for (const [key, s] of Object.entries(versionsDb)) {
+    const v = (s.versions || []).find((x) => x.id === id);
+    if (v) return { key, s, v };
+  }
+  return null;
+}
+function moveFile(from, to) {
+  try { fs.renameSync(from, to); }
+  catch (e) { if (e.code !== "EXDEV") throw e; fs.copyFileSync(from, to); fs.rmSync(from, { force: true }); }
+}
+// an album folder with nothing left to play goes into the archive (its cover and the rest), then an artist folder
+// left empty. A folder that still has music, or folders of its own (CD1, CD2...), stays as it is.
+function tidyFolder(dir) {
+  try {
+    if (dir === MUSIC || !dir.startsWith(MUSIC + path.sep)) return;
+    const list = fs.readdirSync(dir, { withFileTypes: true });
+    if (list.some((e) => e.isDirectory() || AUDIO.test(e.name))) return;
+    for (const e of list) {
+      const there = path.join(ARCHIVE_DIR, path.relative(MUSIC, dir), e.name);
+      fs.mkdirSync(path.dirname(there), { recursive: true });
+      fs.renameSync(path.join(dir, e.name), there);
+    }
+    fs.rmdirSync(dir);
+    const up = path.dirname(dir);
+    if (up !== MUSIC && up.startsWith(MUSIC + path.sep) && !fs.readdirSync(up).length) fs.rmdirSync(up);
+  } catch {} // a folder that can't be tidied stays
+}
+
+// the song a version goes under: its file in the library, and the keys Sour Player finds it by
+function versionBase(artist, title, file) {
+  let f = null;
+  if (file) { try { f = libraryFile(String(file)); } catch {} }
+  if (!f && artist && title) {
+    const want = karaokeKey(artist, title);
+    // any copy will do (the album's or the single's: it's the same song)
+    const hit = Object.entries(libCache).find(([x, c]) => c.t && (karaokeKey(c.a, c.t) === want || (c.aa && karaokeKey(c.aa, c.t) === want)) && fs.existsSync(x));
+    if (hit) f = hit[0];
+  }
+  if (!f && (artist || title)) { const h = findInLibrary(`${artist || ""} ${title || ""}`.trim())[0]; if (h && fs.existsSync(h.file)) f = h.file; }
+  if (!f) return null;
+  const c = libCache[f] || {};
+  const a = c.a || c.aa || String(artist || ""), t = c.t || String(title || "");
+  if (!a || !t) return null;
+  const keys = [...new Set([songKey(a, t), c.aa ? songKey(c.aa, t) : "", artist && title ? songKey(artist, title) : ""].filter(Boolean))];
+  // the song may already have versions under another of its keys (the album artist's)
+  const key = keys.find((k) => versionsDb[k]) || keys[0];
+  return { file: f, artist: a, title: t, key, keys };
+}
+function addVersion(base, v) {
+  const s = versionsDb[base.key] || (versionsDb[base.key] = { artist: base.artist, title: base.title, keys: [], versions: [] });
+  s.keys = [...new Set([base.key, ...(s.keys || []), ...(base.keys || [])])];
+  s.versions.push(v);
+  saveVersions();
+  return s;
+}
+function dropVersion(key, id) {
+  const s = versionsDb[key];
+  if (!s) return;
+  s.versions = s.versions.filter((x) => x.id !== id);
+  if (!s.versions.length) delete versionsDb[key];
+  for (const p of Object.values(versionPlays)) if (p[key]) delete p[key][id];
+  versionPlaysDirty = true;
+  saveVersions();
+}
+
+// what makes a title another version: "(Kasane Teto ver.)", " - Sped Up", "[piano cover]"... Not remasters,
+// instrumentals (those are karaoke), radio edits or "feat." credits.
+const VERSION_WORDS = /\b(ver|version|cover|covered|sped[\s-]*up|speed[\s-]*up|slowed|nightcore|8d|reverb|acoustic|piano|remix|live|ballad|orchestral|lo-?fi|music box|8[\s-]?bit|self[\s-]?cover|synth ?v|utau|vocaloid|tv[\s-]?size|male|female)\b/i;
+const NOT_VERSION_WORDS = /\b(remaster(ed)?|instrumental|karaoke|off ?vocal|radio edit|extended|clean|explicit|mono|demo|bonus|feat|ft)\b/i;
+function splitVersion(title) {
+  const t = String(title || "").replace(/\s*[([（【]\s*(feat|ft)\.?[^)\]）】]*[)\]）】]/gi, "").trim();
+  let m = t.match(/^(.*?\S)\s*[([（【「『]\s*([^)\]）】」』]+?)\s*[)\]）】」』]\s*$/);
+  if (!m) m = t.match(/^(.*?\S)\s+[-–—~]\s+([^-–—~]+)$/);
+  if (!m) return null;
+  const base = m[1].trim(), what = m[2].trim();
+  if (!base || !VERSION_WORDS.test(what) || NOT_VERSION_WORDS.test(what.replace(VERSION_WORDS, " "))) return null;
+  return { base, what };
+}
+const firstName = (artist) => String(artist || "").split(/\s*(?:,|&|;|\bfeat\.?|\bft\.?)\s*/i)[0].trim();
+// "Kasane Teto ver." -> "Kasane Teto", "Piano Version" -> "Piano", "cover" -> "<who sings it> cover"
+function versionLabel(what, artist, baseArtist) {
+  let l = String(what || "").replace(/\b(ver|version)\b\.?/gi, " ").replace(/\s+/g, " ").trim().replace(/^[-–:,.\s]+|[-–:,.\s]+$/g, "");
+  if (!l || /^(cover|covered)$/i.test(l)) {
+    const who = firstName(artist);
+    l = who && !artistMatch(who, baseArtist) ? `${who} cover` : "Cover";
+  }
+  return clean1(l.charAt(0).toUpperCase() + l.slice(1), 40);
+}
+// singing voices (Vocaloid, UTAU, Synthesizer V...) a cover is named after
+const VOICES_JP = [["重音テト", "Kasane Teto"], ["初音ミク", "Hatsune Miku"], ["鏡音リン", "Kagamine Rin"], ["鏡音レン", "Kagamine Len"],
+  ["巡音ルカ", "Megurine Luka"], ["可不", "KAFU"], ["星界", "SEKAI"], ["裏命", "RIME"], ["歌愛ユキ", "Kaai Yuki"], ["結月ゆかり", "Yuzuki Yukari"],
+  ["音街ウナ", "Otomachi Una"], ["ずんだもん", "Zundamon"], ["足立レイ", "Adachi Rei"], ["東北きりたん", "Tohoku Kiritan"], ["紲星あかり", "Kizuna Akari"],
+  ["欲音ルコ", "Yokune Ruko"], ["桃音モモ", "Momone Momo"], ["弱音ハク", "Yowane Haku"], ["亞北ネル", "Akita Neru"], ["神威がくぽ", "Kamui Gakupo"]];
+const VOICES_EN = /\b(kasane teto|hatsune miku|kagamine rin|kagamine len|megurine luka|kaai yuki|yuzuki yukari|otomachi una|zundamon|adachi rei|tohoku kiritan|kizuna akari|yokune ruko|momone momo|yowane haku|akita neru|kamui gakupo|teto|miku|gumi|kaito|meiko|kafu)\b/i;
+const VOICE_FULL = { teto: "Kasane Teto", miku: "Hatsune Miku", gumi: "GUMI", kaito: "KAITO", meiko: "MEIKO", kafu: "KAFU" };
+// a name for a requested version, from the upload's title: the voice, the kind of version, or who covers it
+function labelFromSource(title, channel, base, entry) {
+  const t = String(title || "");
+  for (const [jp, en] of VOICES_JP) if (t.includes(jp)) return en;
+  const voice = t.match(VOICES_EN);
+  if (voice) return VOICE_FULL[voice[1].toLowerCase()] || voice[1].split(/\s+/).map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ");
+  const plain = t.replace(/\s*[([（【][^)\]）】]*\b(official|audio|video|lyrics?|mv|hd|4k|visuali[sz]er)\b[^)\]）】]*[)\]）】]/gi, "");
+  const sv = splitVersion(plain);
+  if (sv) return versionLabel(sv.what, channel, base.artist);
+  const kind = t.match(/\b(sped[\s-]*up|slowed(?:\s*\+\s*reverb)?|nightcore|8d audio|acoustic|piano|remix|live|lo-?fi|orchestral|music box|8[\s-]?bit)\b/i);
+  if (kind) return clean1(kind[1].charAt(0).toUpperCase() + kind[1].slice(1).toLowerCase(), 40);
+  const who = String(channel || "").replace(/\s*-\s*topic$/i, "").replace(/\s*(official|music|vevo)$/i, "").trim();
+  if (/\bcover\b/i.test(t) && who) return clean1(`${who} cover`, 40);
+  return `Version ${((entry && entry.versions.length) || 0) + 2}`;
+}
+
+// ---- where a version sits against the original (and whether it stays in step all the way through) ----
+// loudness changes (as in onsets) at any frame size: 50 ms frames to find the place, 10 ms to pin it down
+function onsetsAt(pcm, frame) {
+  const n = Math.floor(pcm.length / frame), e = new Float64Array(n), o = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    let sum = 0;
+    for (let j = i * frame; j < (i + 1) * frame; j++) sum += pcm[j] * pcm[j];
+    e[i] = Math.log(1e-3 + sum / frame);
+  }
+  for (let i = 1; i < n; i++) o[i] = Math.max(0, e[i] - e[i - 1]);
+  let mean = 0; for (const x of o) mean += x; mean /= n || 1;
+  let sd = 0; for (const x of o) sd += (x - mean) ** 2; sd = Math.sqrt(sd / (n || 1)) || 1;
+  for (let i = 0; i < n; i++) o[i] = (o[i] - mean) / sd;
+  return o;
+}
+// how alike b is to a when b runs `lag` frames later (b[i + lag] ~ a[i]), over a's frames from..to
+function lagScore(a, b, lag, from = 0, to = a.length) {
+  let dot = 0, n = 0;
+  const lo = Math.max(from, -lag), hi = Math.min(to, b.length - lag);
+  for (let i = lo; i < hi; i++) { dot += a[i] * b[i + lag]; n++; }
+  return { score: n ? dot / n : -Infinity, n };
+}
+// offset: seconds to add to a moment in the original to get the same moment in the version
+async function alignVersion(origFile, verFile) {
+  const dir = path.join(STAGING, "version-align-" + newId());
+  fs.mkdirSync(dir, { recursive: true });
+  try {
+    const pa = await readPcm(origFile, path.join(dir, "a.raw")), pb = await readPcm(verFile, path.join(dir, "b.raw"));
+    const a = onsetsAt(pa, 400), b = onsetsAt(pb, 400); // 8 kHz: 400 samples = 50 ms
+    const reach = Math.min(1200, Math.floor(Math.min(a.length, b.length) * 0.4)); // up to a minute either way
+    const minOverlap = Math.floor(Math.min(a.length, b.length) * 0.5);
+    const scores = [];
+    let best = { lag: 0, score: -Infinity };
+    for (let lag = -reach; lag <= reach; lag++) {
+      const r = lagScore(a, b, lag);
+      if (r.n < minOverlap) continue;
+      scores.push(r.score);
+      if (r.score > best.score) best = { lag, score: r.score };
+    }
+    if (!scores.length) throw new Error("the two are too different in length to compare");
+    let mean = 0; for (const x of scores) mean += x; mean /= scores.length;
+    let sd = 0; for (const x of scores) sd += (x - mean) ** 2; sd = Math.sqrt(sd / scores.length) || 1;
+    const z = (best.score - mean) / sd; // how much the best match stands out
+    // in step all the way through? Each third of the song should match at the same place: another tempo, an
+    // extra verse or a longer bridge moves the later thirds
+    const thirds = [0, 1, 2].map((k) => {
+      const from = Math.floor((a.length * k) / 3), to = Math.floor((a.length * (k + 1)) / 3);
+      let top = { lag: best.lag, score: -Infinity };
+      for (let lag = best.lag - 40; lag <= best.lag + 40; lag++) {
+        const r = lagScore(a, b, lag, from, to);
+        if (r.n > (to - from) * 0.5 && r.score > top.score) top = { lag, score: r.score };
+      }
+      return top.lag;
+    });
+    const steady = thirds.every((l) => Math.abs(l - best.lag) <= 2);
+    // pinned down to 10 ms: in split ears the two play side by side, where 50 ms would sound like an echo
+    const fa = onsetsAt(pa, 80), fb = onsetsAt(pb, 80);
+    let fine = { lag: best.lag * 5, score: -Infinity };
+    for (let lag = best.lag * 5 - 8; lag <= best.lag * 5 + 8; lag++) {
+      const r = lagScore(fa, fb, lag);
+      if (r.score > fine.score) fine = { lag, score: r.score };
+    }
+    return { offset: Math.round(fine.lag) / 100, z, confident: z >= 5, lineUp: z >= 5 && steady };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+// measured in the background, one at a time: the timing, how loud it is next to the original, its length, and the
+// timing of its own music video
+const versionChecks = [];
+let checkingVersions = false;
+function queueVersionCheck(key, id, video = false) {
+  if (!versionChecks.some((x) => x.id === id && x.video === video)) versionChecks.push({ key, id, video });
+  runVersionChecks();
+}
+async function runVersionChecks() {
+  if (checkingVersions) return;
+  checkingVersions = true;
+  try {
+    while (versionChecks.length) {
+      if (!ready()) { await sleep(30000); continue; }
+      const job = versionChecks.shift();
+      const found = findVersion(job.id);
+      if (!found) continue;
+      const { s, v } = found, file = versionFile(v);
+      if (!fs.existsSync(file)) { v.timing = "failed"; saveVersions(); continue; }
+      if (job.video) {
+        if (!v.video || !v.video.videoId) continue;
+        const want = v.video.videoId;
+        try {
+          const r = await alignVideo(file, want);
+          if (v.video && v.video.videoId === want) Object.assign(v.video, { offset: r.offset, timing: r.confident ? "auto" : "guess" });
+        } catch (e) {
+          if (v.video && v.video.videoId === want) v.video.timing = "failed";
+          console.error("version video timing failed:", s.title, v.label, e.message);
+        }
+        saveVersions();
+        continue;
+      }
+      const orig = versionBase(s.artist, s.title);
+      if (!v.seconds) v.seconds = Math.round((await probeInfo(file)).d) || 0;
+      if (!orig) { v.timing = "failed"; saveVersions(); continue; }
+      try {
+        const r = await alignVersion(orig.file, file);
+        Object.assign(v, { offset: r.offset, lineUp: r.lineUp, z: Math.round(r.z * 10) / 10, timing: r.confident ? "auto" : "guess" });
+      } catch (e) {
+        v.timing = "failed";
+        console.error("version timing failed:", s.title, v.label, e.message);
+      }
+      try {
+        const [song, ver] = await Promise.all([loudness(orig.file), loudness(file)]);
+        if (song !== null && ver !== null) v.gain = Math.round(Math.min(2, Math.max(0.25, Math.pow(10, (song - ver) / 20))) * 1000) / 1000;
+      } catch {}
+      saveVersions();
+    }
+  } finally {
+    checkingVersions = false;
+  }
+}
+// measured on start when a restart came in the middle
+setTimeout(() => {
+  for (const [key, s] of Object.entries(versionsDb))
+    for (const v of s.versions || []) {
+      if (v.timing === "pending") queueVersionCheck(key, v.id);
+      if (v.video && v.video.timing === "pending") queueVersionCheck(key, v.id, true);
+    }
+}, 15000);
+
+// ---- "Request a version": a link (YouTube, YouTube Music, SoundCloud, Spotify, Niconico, Bilibili, Bandcamp,
+// Vimeo) or a few words ("kasane teto", "sped up") to look for on YouTube ----
+const VERSION_HOSTS = /(^|\.)(youtube\.com|youtu\.be|soundcloud\.com|nicovideo\.jp|nico\.ms|bilibili\.com|b23\.tv|bandcamp\.com|vimeo\.com)$/i;
+async function processVersion(item) {
+  const of = item.of || {};
+  const base = versionBase(of.artist, of.title, of.file);
+  if (!base) return { status: "failed", note: `${of.title || "that song"} isn't in the library, so there's nothing to put the version under` };
+  const q = String(item.query || "").trim();
+  let src = null;
+  const link = (q.match(/https?:\/\/\S+/) || [])[0];
+  if (link) {
+    const sp = link.match(SPOTIFY_LINK), id = ytId(link);
+    if (sp) {
+      if (sp[1].toLowerCase() !== "track") return { status: "failed", note: "paste a Spotify song link (not an album or a playlist)" };
+      const e = await spotifyEmbed("track", sp[2]);
+      const who = (e.artists || []).map((x) => x.name).join(", "), name = String(e.name || ""), secs = Math.round((e.duration || 0) / 1000);
+      const t = norm(name);
+      const pick = (await ytSearch(`${firstName(who)} ${name}`, 8))
+        .map((v) => ({ ...v, s: (norm(v.title).includes(t) ? 20 : 0) + (/ - topic$/i.test(v.channel) ? 15 : 0) - (secs ? Math.min(30, Math.abs(v.seconds - secs)) : 0) }))
+        .sort((x, y) => y.s - x.s)[0];
+      if (!pick) return { status: "failed", note: `couldn't find ${name} on YouTube` };
+      src = { url: `https://www.youtube.com/watch?v=${pick.id}`, videoId: pick.id, title: `${who} - ${name}`, channel: pick.channel, link };
+    } else if (id) src = { url: `https://www.youtube.com/watch?v=${id}`, videoId: id, link };
+    else {
+      let host = "";
+      try { const u = new URL(link); host = /^https?:$/.test(u.protocol) ? u.hostname : ""; } catch {}
+      if (!host || !VERSION_HOSTS.test(host)) return { status: "failed", note: "paste a YouTube, YouTube Music, SoundCloud, Spotify, Niconico, Bilibili, Bandcamp or Vimeo link" };
+      src = { url: link, link };
+    }
+  } else {
+    const rows = await ytSearch(`${firstName(base.artist)} ${base.title} ${q}`, 10).catch(() => []);
+    const t = norm(base.title), words = norm(q).split(" ").filter((w) => w.length > 1);
+    const pick = rows.map((v) => {
+      const vt = norm(`${v.title} ${v.channel}`), hits = words.filter((w) => vt.includes(w)).length;
+      return { ...v, hits, s: (vt.includes(t) ? 30 : 0) + hits * 15 };
+    }).filter((v) => v.s >= 30 && v.hits >= Math.ceil(words.length / 2)).sort((x, y) => y.s - x.s)[0];
+    if (!pick) return { status: "failed", note: `couldn't find a "${q}" version of ${base.title} on YouTube - paste its link instead` };
+    src = { url: `https://www.youtube.com/watch?v=${pick.id}`, videoId: pick.id, title: pick.title, channel: pick.channel };
+  }
+  const had = versionsDb[base.key];
+  if (had && src.videoId && had.versions.some((v) => v.source && v.source.videoId === src.videoId))
+    return { status: "done", artist: base.artist, title: base.title, note: "that one is already a version of this song" };
+  const id = newVersionId();
+  return ctx.run({ stage: path.join(STAGING, "version-" + id) }, async () => {
+    fs.rmSync(ST(), { recursive: true, force: true });
+    fs.mkdirSync(ST(), { recursive: true });
+    try {
+      const d = await run("yt-dlp", ["--no-playlist", "--no-warnings", "-x", "--audio-format", config.audioFormat, "--audio-quality", "0",
+        "--match-filters", "duration<=1800", "--no-simulate", "--print", "before_dl:%(.{id,title,channel,uploader,duration})j",
+        "-o", path.join(ST(), "song.%(ext)s"), "--", src.url], { timeout: 15 * 60000 });
+      const got = fs.readdirSync(ST()).map((f) => path.join(ST(), f)).find((f) => /^song\./.test(path.basename(f)) && AUDIO.test(f));
+      if (!got) throw new Error(botNote(d.err) || `the download failed${d.err.trim() ? ": " + d.err.trim().split("\n").pop().slice(0, 150) : ""}`);
+      let info = {};
+      try { info = lastJson(d.out); } catch {}
+      const ext = path.extname(got).slice(1).toLowerCase();
+      const rel = path.join(keyDir(base.key), `${id}.${ext}`);
+      fs.mkdirSync(path.join(VERSIONS_DIR, keyDir(base.key)), { recursive: true });
+      fs.copyFileSync(got, path.join(VERSIONS_DIR, rel));
+      const title = clean1(src.title || info.title || "", 200);
+      const channel = clean1(String(src.channel || info.channel || info.uploader || "").replace(/\s*-\s*Topic$/i, ""), 100);
+      const label = clean1(String(item.label || "").trim(), 40) || labelFromSource(title, channel, base, versionsDb[base.key]);
+      const videoId = src.videoId || null;
+      const v = { id, label, file: rel, seconds: Math.round((await probeInfo(path.join(VERSIONS_DIR, rel))).d) || Number(info.duration) || 0,
+        offset: 0, lineUp: false, timing: "pending", gain: 1,
+        source: { link: src.link || src.url, title, channel, videoId },
+        // a YouTube upload is its own music video (the same recording, so already in step)
+        video: videoId ? { videoId, title, channel, offset: 0, timing: "same" } : null,
+        by: item.askedBy || (item.profile && profiles[item.profile] ? profiles[item.profile].name : null), profile: item.profile || null,
+        at: new Date().toISOString() };
+      addVersion(base, v);
+      queueVersionCheck(base.key, id);
+      return { status: "done", artist: base.artist, title: `${base.title} (${label})`, note: `a version of ${base.title} now - pick it from the song's versions in Sour Player` };
+    } finally {
+      fs.rmSync(ST(), { recursive: true, force: true });
+    }
+  });
+}
+
+// ---- a song in the library becomes a version of another (admins, or by itself for clear cases) ----
+function foldFile(file, base, label, who) {
+  const c = libCache[file] || {};
+  const id = newVersionId(), ext = path.extname(file).slice(1).toLowerCase();
+  const rel = path.join(keyDir(base.key), `${id}.${ext}`), to = path.join(VERSIONS_DIR, rel);
+  fs.mkdirSync(path.dirname(to), { recursive: true });
+  const from = path.relative(MUSIC, file);
+  moveFile(file, to);
+  const lrc = file.replace(/\.[^.]+$/, ".lrc");
+  if (fs.existsSync(lrc)) { try { moveFile(lrc, to.replace(/\.[^.]+$/, ".lrc")); } catch {} }
+  tidyFolder(path.dirname(file));
+  delete libCache[file];
+  // its music video comes along as the version's own
+  const vk = c.t ? songKey(c.a || c.aa, c.t) : "", mv = vk ? videos[vk] : null;
+  const v = { id, label, file: rel, seconds: 0, offset: 0, lineUp: false, timing: "pending", gain: 1, source: null,
+    video: mv ? { videoId: mv.videoId, title: mv.title || "", channel: mv.channel || "", offset: mv.offset || 0, timing: mv.timing || "auto" } : null,
+    by: who || null, profile: null, at: new Date().toISOString(), from,
+    tags: { artist: c.a || "", albumArtist: c.aa || "", title: c.t || "", album: c.al || "" } };
+  addVersion(base, v);
+  queueVersionCheck(base.key, id);
+  return v;
+}
+// after each library scan: singles that are clearly another version of a song in the library ("Retry Now
+// (Kasane Teto ver.)" next to "Retry Now") move under it. Never a track on an album with other songs, never one an
+// admin took back out, and a cover by someone else only when exactly one song in the library has that name.
+function foldVersions() {
+  if (config.autoVersions === false || !library.scanned || library.scanning) return 0;
+  const entries = Object.entries(libCache).filter(([, c]) => c.t);
+  const albums = new Map();
+  // (brackets kept: "Retry Now (Kasane Teto ver.)" is another album than "Retry Now")
+  const albumKey = (c) => `${titleKey(c.aa || c.a)}|${titleKey(c.al)}`;
+  for (const [, c] of entries) if (c.al) albums.set(albumKey(c), (albums.get(albumKey(c)) || 0) + 1);
+  const byTitle = new Map();
+  for (const [f, c] of entries) {
+    if (splitVersion(c.t)) continue;
+    const k = titleKey(c.t);
+    if (!byTitle.has(k)) byTitle.set(k, []);
+    byTitle.get(k).push([f, c]);
+  }
+  let n = 0;
+  for (const [f, c] of entries) {
+    const sv = splitVersion(c.t);
+    if (!sv || notVersions[path.relative(MUSIC, f)]) continue;
+    if (c.al && (albums.get(albumKey(c)) || 0) > 1) continue; // a track on an album stays where it is
+    const cands = (byTitle.get(titleKey(sv.base)) || []).filter(([of]) => of !== f && fs.existsSync(of));
+    if (!cands.length) continue;
+    const mine = deaccent(`${c.t} ${c.a} ${c.aa || ""} ${c.al || ""}`).toLowerCase().replace(/[^\p{L}\p{M}\p{N}]+/gu, " ").trim();
+    const related = cands.filter(([, oc]) => {
+      const who = primaryArtist(oc.a || oc.aa);
+      return artistMatch(c.a, oc.a || oc.aa) || artistMatch(c.aa || c.a, oc.aa || oc.a) || (who.length > 2 && ` ${mine} `.includes(` ${who} `));
+    });
+    const singers = new Set(cands.map(([, oc]) => primaryArtist(oc.a || oc.aa)));
+    const pick = related.length ? related : singers.size === 1 && /\b(ver|version|cover|covered)\b/i.test(sv.what) ? cands : [];
+    if (!pick.length || !fs.existsSync(f)) continue;
+    const [of, oc] = pick[0];
+    const base = versionBase(oc.a || oc.aa, oc.t, path.relative(MUSIC, of));
+    if (!base) continue;
+    try {
+      const v = foldFile(f, base, versionLabel(sv.what, c.a || c.aa, base.artist), "Hermes Music");
+      adminLog("version", `put ${path.relative(MUSIC, f)} under ${base.artist} - ${base.title} as its "${v.label}" version`, null);
+      n++;
+    } catch (e) {
+      console.error("couldn't move a version:", f, e.message);
+    }
+  }
+  if (n) {
+    console.log(`versions: moved ${n} song(s) under their originals`);
+    fs.promises.writeFile(LIBCACHE, JSON.stringify(libCache)).catch(() => {});
+  }
+  return n;
+}
+// back into the library as its own song: a moved song goes back where it was, a requested one is tagged and
+// filed like any other single. It's never moved under a song again by itself.
+async function unfoldVersion(key, v, who) {
+  const file = versionFile(v);
+  if (!fs.existsSync(file)) throw new Error("the version's file is missing");
+  const s = versionsDb[key];
+  const back = v.from ? path.resolve(MUSIC, v.from) : null;
+  let dest;
+  if (back && back.startsWith(MUSIC + path.sep) && !fs.existsSync(back)) {
+    dest = back;
+    fs.mkdirSync(path.dirname(dest), { recursive: true });
+    moveFile(file, dest);
+  } else {
+    const name = `${s.title} (${v.label})`;
+    const meta = { artist: (v.tags && v.tags.artist) || s.artist, title: (v.tags && v.tags.title) || name, album: (v.tags && v.tags.album) || name,
+      albumArtist: (v.tags && (v.tags.albumArtist || v.tags.artist)) || s.artist, releaseType: "single" };
+    const ext = path.extname(file).slice(1).toLowerCase();
+    const where = destFor(meta, ext);
+    dest = where.dest;
+    if (fs.existsSync(dest)) throw new Error("a song with that name is already in the library");
+    fs.mkdirSync(where.dir, { recursive: true });
+    const stage = path.join(STAGING, "unfold-" + v.id);
+    fs.mkdirSync(stage, { recursive: true });
+    try {
+      const out = path.join(stage, `tagged.${ext}`);
+      const r = await run("ffmpeg", tagArgs(file, null, out, ext, { title: meta.title, artist: meta.artist, album_artist: meta.albumArtist, album: meta.album }), { timeout: 120000 });
+      fs.copyFileSync(r.code === 0 && fs.existsSync(out) ? out : file, dest);
+      fs.rmSync(file, { force: true });
+    } finally {
+      fs.rmSync(stage, { recursive: true, force: true });
+    }
+  }
+  const lrc = file.replace(/\.[^.]+$/, ".lrc");
+  if (fs.existsSync(lrc)) { try { moveFile(lrc, dest.replace(/\.[^.]+$/, ".lrc")); } catch {} }
+  notVersions[path.relative(MUSIC, dest)] = { at: Date.now(), by: who || null };
+  fs.writeFileSync(NOT_VERSIONS, JSON.stringify(notVersions));
+  dropVersion(key, v.id);
+  return path.relative(MUSIC, dest);
+}
+const publicVersion = (v) => ({ id: v.id, label: v.label, seconds: v.seconds || 0, offset: v.offset || 0, lineUp: !!v.lineUp, timing: v.timing,
+  gain: v.gain || 1, by: v.by || null, profile: v.profile || null, at: v.at, requested: !!v.source, moved: !!v.from,
+  link: v.source ? v.source.link || null : null,
+  video: v.video ? { videoId: v.video.videoId, title: v.video.title || "", channel: v.video.channel || "", offset: v.video.offset || 0, timing: v.video.timing || "" } : null });
+
+async function versionsRoute(req, res, p, get, post, url) {
+  if (get && p === "/api/versions") { // every song with versions, and the asking person's plays of each
+    const who = String(url.searchParams.get("profile") || "");
+    const plays = (who && versionPlays[who]) || {};
+    const songs = Object.entries(versionsDb).map(([key, s]) => ({ key, keys: s.keys && s.keys.length ? s.keys : [key], artist: s.artist, title: s.title,
+      versions: (s.versions || []).map(publicVersion) }));
+    const mine = {};
+    for (const { key } of songs) if (plays[key]) mine[key] = plays[key];
+    return send(res, 200, { songs, mine });
+  }
+  if (get && p === "/api/versions/file") { // the version's audio, with seeking
+    const id = String(url.searchParams.get("id") || "");
+    const found = VERSION_ID.test(id) && findVersion(id);
+    if (!found || !fs.existsSync(versionFile(found.v))) return send(res, 404, { error: "no such version" });
+    return sendRanged(req, res, versionFile(found.v), AUDIO_TYPE[path.extname(found.v.file).slice(1).toLowerCase()] || "application/octet-stream");
+  }
+  if (!post) return send(res, 404, { error: "not found" });
+  const b = await readBody(req, 20000);
+  const prof = b.profile ? ownProfile(String(b.profile), b.key) : null;
+  const admin = adminOk(b, req) || !!(prof && isAdmin(prof));
+  const who = prof ? prof.name : clean1(b.by, 40) || null;
+  if (p === "/api/versions/played") { // a song with versions counted as played: which one it was
+    if (!prof) return send(res, 403, { error: "sign in to your profile first" });
+    const key = String(b.song || ""), version = String(b.version || "");
+    const s = versionsDb[key];
+    if (!s || !(version === "original" || s.versions.some((v) => v.id === version))) return send(res, 404, { error: "no such version" });
+    const mine = versionPlays[prof.id] || (versionPlays[prof.id] = {});
+    const row = mine[key] || (mine[key] = {});
+    row[version] = (row[version] || 0) + 1;
+    versionPlaysDirty = true;
+    return send(res, 200, { plays: row });
+  }
+  if (p === "/api/versions/fold") { // admins: look for songs that are versions of others right now
+    if (!admin) return send(res, 403, { error: "admins only" });
+    return send(res, 200, { moved: foldVersions() });
+  }
+  if (p === "/api/versions/link") { // admins: { file, artist, title, album, under: { artist, title, file }, label }
+    if (!admin) return send(res, 403, { error: "only admins can put a song under another" });
+    let from;
+    try { from = songFile({ file: b.file, artist: clean1(b.artist, 150), title: clean1(b.title, 200), album: clean1(b.album, 200) }); }
+    catch (e) { return send(res, 400, { error: e.message }); }
+    const u = b.under || {};
+    const base = versionBase(clean1(u.artist, 150), clean1(u.title, 200), u.file ? clean1(u.file, 500) : "");
+    if (!base) return send(res, 404, { error: "couldn't find the song to put it under" });
+    if (path.resolve(base.file) === path.resolve(from)) return send(res, 400, { error: "that's the same song" });
+    const c = libCache[from] || {};
+    const sv = splitVersion(c.t || "");
+    const label = clean1(String(b.label || "").trim(), 40)
+      || (sv ? versionLabel(sv.what, c.a || c.aa, base.artist) : c.a && !artistMatch(c.a, base.artist) ? clean1(firstName(c.a), 40) : clean1(c.t || "Version", 40));
+    const ownKey = c.t ? songKey(c.a || c.aa, c.t) : "";
+    let v;
+    try { v = foldFile(from, base, label, who); } catch (e) { return send(res, 500, { error: e.message }); }
+    // the song had versions of its own: they come along
+    if (ownKey && ownKey !== base.key && versionsDb[ownKey]) {
+      for (const x of versionsDb[ownKey].versions) { versionsDb[base.key].versions.push(x); queueVersionCheck(base.key, x.id); }
+      delete versionsDb[ownKey];
+      saveVersions();
+    }
+    adminLog("version", `put ${c.a || "?"} - ${c.t || path.basename(from)} under ${base.artist} - ${base.title} as its "${v.label}" version`, who);
+    return send(res, 200, { ok: true, id: v.id, label: v.label, under: { artist: base.artist, title: base.title } });
+  }
+  const id = String(b.id || "");
+  const found = VERSION_ID.test(id) ? findVersion(id) : null;
+  if (!found) return send(res, 404, { error: "no such version" });
+  const { key, s, v } = found;
+  const mineToo = !!(prof && v.profile && v.profile === prof.id); // whoever requested it
+  if (p === "/api/versions/rename") {
+    if (!admin && !mineToo) return send(res, 403, { error: "only admins (or whoever asked for it) can rename a version" });
+    const label = clean1(String(b.label || "").trim(), 40);
+    if (!label) return send(res, 400, { error: "type a name" });
+    v.label = label;
+    saveVersions();
+    return send(res, 200, publicVersion(v));
+  }
+  if (p === "/api/versions/video") { // its own music video: a YouTube link, or "" for none
+    if (!prof && !admin) return send(res, 403, { error: "sign in to your profile first" });
+    const link = String(b.link || "").trim();
+    if (!link) { v.video = null; saveVersions(); return send(res, 200, publicVersion(v)); }
+    const videoId = ytId(link) || (/^[\w-]{11}$/.test(link) ? link : null);
+    if (!videoId) return send(res, 400, { error: "that doesn't look like a YouTube link" });
+    v.video = { videoId, title: clean1(b.videoTitle || "(picked)", 200), channel: "", offset: 0, timing: "pending" };
+    saveVersions();
+    queueVersionCheck(key, v.id, true);
+    adminLog("video", `picked a video for the "${v.label}" version of ${s.artist} - ${s.title}`, who);
+    return send(res, 200, publicVersion(v));
+  }
+  if (p === "/api/versions/unlink") { // admins: back into the library as its own song
+    if (!admin) return send(res, 403, { error: "only admins can do that" });
+    try {
+      const rel = await unfoldVersion(key, v, who);
+      adminLog("version", `took the "${v.label}" version of ${s.artist} - ${s.title} back out as its own song (${rel})`, who);
+      return send(res, 200, { ok: true, file: rel });
+    } catch (e) { return send(res, 400, { error: e.message }); }
+  }
+  if (p === "/api/versions/remove") { // admins (or whoever asked for it): into the archive
+    if (!admin && !mineToo) return send(res, 403, { error: "only admins (or whoever asked for it) can remove a version" });
+    try {
+      const file = versionFile(v), to = path.join(ARCHIVE_DIR, "versions", v.file);
+      if (fs.existsSync(file)) { fs.mkdirSync(path.dirname(to), { recursive: true }); moveFile(file, to); }
+    } catch (e) { return send(res, 500, { error: e.message }); }
+    dropVersion(key, v.id);
+    adminLog("version", `removed the "${v.label}" version of ${s.artist} - ${s.title} (it's in the archive)`, who);
+    return send(res, 200, { ok: true });
+  }
+  return send(res, 404, { error: "not found" });
+}
+
 // ---------- Group Play: works like a Spotify Jam ----------
 // The host's Sour Player plays the music and is the source of truth: it reports the queue, the song and the position
 // here, and everyone else's app follows it. Anyone can add songs (shown with who added them) and remove their own;
@@ -2971,6 +3541,7 @@ function groupState(g) {
     queue: g.queue.map((x, i) => ({ ...x, by: hide && x.requested && i >= g.index ? "?" : g.addedBy.get(x.id) || g.hostName })),
     index: g.index, playing: g.playing, position: g.position, updatedAt: g.updatedAt,
     syncLook: !!g.syncLook, speed: g.syncLook ? g.hostSpeed || 1 : 1, karaoke: g.syncLook ? !!g.hostKaraoke : false,
+    version: g.hostVersion || "original", vshift: g.hostVshift || 0,
     requests: g.requests, commands: g.commands,
     chat: g.chat.slice(-50), upvotes: Object.fromEntries([...g.upvotes].map(([id, s]) => [id, s.size])),
     djRotation: !!g.djRotation, dj: currentDj(g), watchVideo: !!g.watchVideo,
@@ -3687,6 +4258,9 @@ async function groupRoute(req, res, p, get, post, url) {
     if (Number.isFinite(b.position)) g.position = Math.max(0, b.position);
     if (Number.isFinite(b.speed)) g.hostSpeed = Math.min(2, Math.max(0.5, b.speed));
     if (typeof b.karaoke === "boolean") g.hostKaraoke = b.karaoke;
+    // (3.16) which version of the song the host hears, and how far its timeline sits from the original's
+    if (typeof b.version === "string") g.hostVersion = /^(original|v[0-9a-f]{10})$/.test(b.version) ? b.version : "original";
+    if (Number.isFinite(b.vshift)) g.hostVshift = Math.max(-120, Math.min(120, b.vshift));
     const now = g.queue[g.index];
     if (now && g.session.lastSong !== now.id) { // a new song started: count it for the session summary
       g.session.lastSong = now.id;
@@ -5310,9 +5884,19 @@ async function sourRoute(req, res, p, get, post, url) {
   }
   if (get && p === "/api/karaoke") { // is there an instrumental for this song? (and how loud to play it)
     const artist = url.searchParams.get("artist"), title = url.searchParams.get("title");
-    const file = karaokeFile(artist, title);
-    if (!file) return send(res, 200, { available: false });
-    return send(res, 200, { available: true, gain: await karaokeGain(artist, title, file) });
+    const file = karaokeFile(artist, title), off = !!karaokeOff[karaokeKey(artist || "", title || "")];
+    if (!file) return send(res, 200, { available: false, off });
+    return send(res, 200, { available: true, gain: await karaokeGain(artist, title, file), off });
+  }
+  if (post && p === "/api/karaoke/off") { // (3.16) no karaoke for this song (nobody sings in it), or back on
+    const b = await readBody(req);
+    const prof = ownProfile(String(b.profile || ""), b.key);
+    if (!prof) return send(res, 403, { error: "sign in to your profile first" });
+    if (!b.title) return send(res, 400, { error: "which song?" });
+    const k = karaokeKey(clean1(b.artist, 150), clean1(b.title, 200));
+    if (b.off) karaokeOff[k] = { by: prof.name, at: Date.now() }; else delete karaokeOff[k];
+    fs.writeFileSync(KARAOKE_OFF, JSON.stringify(karaokeOff));
+    return send(res, 200, { off: !!b.off });
   }
   if (get && p === "/api/karaoke/mixes") { // which practice mixes this song has (AI karaoke songs only)
     const dir = stemDir(url.searchParams.get("artist"), url.searchParams.get("title"));
@@ -5656,7 +6240,7 @@ http.createServer(async (req, res) => {
   const isSour = SOUR_PREFIXES.some((x) => p.startsWith(x)) || SOUR_ROUTES.includes(p);
   if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/lyrics") || p.startsWith("/api/requests") || p.startsWith("/api/library") || p.startsWith("/api/duplicates") || isSour
     || ["/api/status", "/api/now", "/api/bump", "/api/storage", "/api/song-dna", "/api/announcement", "/api/liner-notes"].includes(p) || p.startsWith("/api/admin/")
-    || p.startsWith("/api/discord-bot/") || p.startsWith("/api/podcasts/") || p.startsWith("/api/radio/")) { // used by Sour Player (the custom Feishin)
+    || p.startsWith("/api/discord-bot/") || p.startsWith("/api/podcasts/") || p.startsWith("/api/radio/") || p.startsWith("/api/versions")) { // used by Sour Player (the custom Feishin)
     res.setHeader("access-control-allow-origin", "*");
     if (req.method === "OPTIONS") {
       // the Discord bot's uploads say who sends them (and the file's name) in headers
@@ -5668,6 +6252,7 @@ http.createServer(async (req, res) => {
   if (p.startsWith("/api/discord-bot/")) return botRoute(req, res, p, url);
   if (p.startsWith("/api/podcasts/")) return podcastRoute(req, res, p, url);
   if (p.startsWith("/api/radio/")) return radioRoute(req, res, p, url);
+  if (p.startsWith("/api/versions")) return versionsRoute(req, res, p, get, post, url);
   if (isSour) return sourRoute(req, res, p, get, post, url);
 
   if (get && p === "/") return send(res, 200, PAGE, "text/html");
@@ -5769,12 +6354,12 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
     if (p === "/api/admin/log") return send(res, 200, adminLogList.slice(0, 200));
     if (p === "/api/admin/backup") { // everything Sour Player keeps, as one file
       const pack = {};
-      for (const f of [PROFILES, SOCIAL, SHOP_FILE, ROOMS, CFG, "/data/karaoke.json", "/data/lyric-offsets.json", "/data/video-misses.json"]) { try { pack[f] = fs.readFileSync(f, "utf8"); } catch {} }
+      for (const f of [PROFILES, SOCIAL, SHOP_FILE, ROOMS, CFG, "/data/karaoke.json", "/data/lyric-offsets.json", "/data/video-misses.json", "/data/versions.json", "/data/version-plays.json", "/data/not-versions.json", "/data/karaoke-off.json"]) { try { pack[f] = fs.readFileSync(f, "utf8"); } catch {} }
       return send(res, 200, { made: new Date().toISOString(), version: process.env.HM_VERSION || null, files: pack }, "application/json", { "content-disposition": `attachment; filename="hermes-backup-${dayKey()}.json"` });
     }
     if (p === "/api/admin/restore") { // put a backup back (Hermes restarts to load it)
       const files = b.backup && b.backup.files;
-      const allowed = [PROFILES, SOCIAL, SHOP_FILE, ROOMS, CFG, "/data/karaoke.json", "/data/lyric-offsets.json", "/data/video-misses.json"];
+      const allowed = [PROFILES, SOCIAL, SHOP_FILE, ROOMS, CFG, "/data/karaoke.json", "/data/lyric-offsets.json", "/data/video-misses.json", "/data/versions.json", "/data/version-plays.json", "/data/not-versions.json", "/data/karaoke-off.json"];
       if (!files || typeof files !== "object") return send(res, 400, { error: "that isn't a Hermes Music backup" });
       let n = 0;
       for (const [f, text] of Object.entries(files)) { if (!allowed.includes(f) || typeof text !== "string") continue; try { JSON.parse(text); fs.writeFileSync(f, text); n++; } catch {} }
@@ -6049,19 +6634,8 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
       if (fs.existsSync(lrc)) fs.renameSync(lrc, to.replace(/\.[^.]+$/, ".lrc"));
       // (3.15) an album folder with nothing left to play goes into the archive too (its cover and the rest), so
       // the album disappears instead of staying behind empty; then an artist folder left empty
-      try {
-        const dir = path.dirname(from);
-        if (dir !== MUSIC && dir.startsWith(MUSIC + path.sep) && !fs.readdirSync(dir).some((n) => AUDIO.test(n))) {
-          for (const n of fs.readdirSync(dir)) {
-            const there = path.join(path.dirname(to), n);
-            fs.mkdirSync(path.dirname(there), { recursive: true });
-            fs.renameSync(path.join(dir, n), there);
-          }
-          fs.rmdirSync(dir);
-          const up = path.dirname(dir);
-          if (up !== MUSIC && up.startsWith(MUSIC + path.sep) && !fs.readdirSync(up).length) fs.rmdirSync(up);
-        }
-      } catch {} // a folder that can't be tidied stays (the song itself is gone either way)
+      // (3.16) never a folder that still holds folders of its own (CD1, CD2...)
+      tidyFolder(path.dirname(from));
       const who = prof ? prof.name : clean1(b.by, 40) || null;
       archived.push({ file: relPath, at: Date.now(), by: who, removed: true });
       saveArchive();
@@ -6552,12 +7126,21 @@ Reply with ONE line of JSON and nothing else: {"songs":["Artist - Title", ...]} 
     rate.set(ip, [...hits, Date.now()]);
     const b = await readBody(req);
     const q = String(b.query || "").trim().slice(0, 200);
-    const type = ["song", "album", "artist", "karaoke"].includes(b.type) ? b.type : "song";
-    if (q.length < 2) return send(res, 400, { error: `Enter ${type === "song" || type === "karaoke" ? "a song" : type === "album" ? "an album" : "an artist"} name` });
+    const type = ["song", "album", "artist", "karaoke", "version"].includes(b.type) ? b.type : "song";
+    if (q.length < 2) return send(res, 400, { error: type === "version" ? "paste a link to the version, or type a few words about it (e.g. kasane teto)" : `Enter ${type === "song" || type === "karaoke" ? "a song" : type === "album" ? "an album" : "an artist"} name` });
     const item = { id: newId(), type, query: q, status: "pending", created: new Date().toISOString() };
     if (b.by) item.askedBy = String(b.by).slice(0, 40); // name of who asked (from Sour Player)
     if (typeof b.group === "string" && groups.has(b.group)) item.group = b.group; // asked from inside Group Play
     if (typeof b.profile === "string" && profiles[b.profile]) { item.profile = b.profile; sourStat(b.profile, "requests", 1); }
+    if (type === "version") { // (3.16) "Request a version": it goes under a song in the library, never into the library
+      const of = b.of && typeof b.of === "object" ? b.of : {};
+      item.of = { artist: clean1(of.artist, 150), title: clean1(of.title, 200), file: clean1(of.file, 500) };
+      if (!item.of.title) return send(res, 400, { error: "which song is it a version of?" });
+      if (typeof b.label === "string" && b.label.trim()) item.label = clean1(b.label.trim(), 40);
+      item.title = item.of.title; item.artist = item.of.artist;
+      items.push(item); save(); wake();
+      return send(res, 201, item);
+    }
     if (SPOTIFY_USER.test(q) || (YT_CHANNEL.test(q) && !YT_PLAYLIST.test(q) && !/watch\?/.test(q))) { // a whole profile
       try {
         const lists = await profilePlaylists(q);
