@@ -848,6 +848,29 @@ async function botRoute(req, res, p, url) {
   } catch (e) { return send(res, 400, { error: e.message }); }
 }
 setTimeout(() => { if (config.discordToken) startBot(); }, 5000);
+// (3.15) once: podcast episodes counted as songs by Sour Player 0.13 come out of the stats (song of the day,
+// the weekly tops, profiles' songs, months and top artists)
+setTimeout(() => {
+  let changed = false;
+  const drop = (map) => { for (const id of Object.keys(map || {})) if (isPodcastId(id)) { delete map[id]; changed = true; } };
+  for (const p of Object.values(profiles)) {
+    const st = p.stats;
+    if (st && st.songs) for (const [id, x] of Object.entries(st.songs)) {
+      if (!isPodcastId(id)) continue;
+      for (const a of String((x.song && x.song.artist) || "").split(/\s*(?:,|&|•|\bfeat\.?|\bft\.?)\s*/i).filter(Boolean)) {
+        if (st.artists && st.artists[a]) { st.artists[a] -= x.n || 0; if (st.artists[a] <= 0) delete st.artists[a]; }
+      }
+      delete st.songs[id]; changed = true;
+    }
+    for (const m of Object.values(p.months || {})) drop(m);
+    if (p.week && p.week.songs) drop(p.week.songs);
+    if (Array.isArray(p.recentPlays)) { const n = p.recentPlays.length; p.recentPlays = p.recentPlays.filter((r) => !isPodcastId(r.song && r.song.id)); changed ||= n !== p.recentPlays.length; }
+    for (const [k, list] of Object.entries(p.dayLog || {})) { const n = list.length; p.dayLog[k] = list.filter((x) => !isPodcastId(x.id)); changed ||= n !== p.dayLog[k].length; }
+  }
+  for (const d of Object.values(groupStats.days || {})) drop(d.songs);
+  for (const w of Object.values(groupStats.weeks || {})) drop(w.songs);
+  if (changed) { profilesDirty = true; statsDirty = true; console.log("removed podcast episodes from the listening stats"); }
+}, 4000);
 
 // ---------- /duplicate: find copies of the same song, keep the best one ----------
 // ---- library tools (Sour Player 0.4): a song file by its path inside the library, tag/cover edits, the archive ----
@@ -4067,7 +4090,10 @@ function recordStationPlay(g, song) {
   groupStats.stationSeconds = (groupStats.stationSeconds || 0) + songSeconds(song);
   statsDirty = true;
 }
+// (3.15) podcast episodes (Sour Player 0.13+, ids "podcast:...") aren't songs: they never count as plays
+const isPodcastId = (id) => String(id || "").startsWith("podcast:");
 function countPlay(p, song) {
+  if (!song || isPodcastId(song.id)) return;
   const st = (p.stats ??= { songs: {}, artists: {}, seconds: 0 });
   const s = (st.songs[song.id] ??= { song, n: 0 }); s.n++; s.song = song;
   for (const a of String(song.artist || "").split(/\s*(?:,|&|•|\bfeat\.?|\bft\.?)\s*/i).filter(Boolean)) st.artists[a] = (st.artists[a] || 0) + 1;
@@ -4670,7 +4696,7 @@ async function sourRoute(req, res, p, get, post, url) {
     const dev = clean1(b.device, 40) || "default";
     me.devices = me.devices && typeof me.devices === "object" ? me.devices : {};
     const before = me.devices[dev];
-    if (song && b.playing && !b.private && (!before || !before.listening || before.listening.id !== song.id)) {
+    if (song && !isPodcastId(song.id) && b.playing && !b.private && (!before || !before.listening || before.listening.id !== song.id)) {
       countPlay(me, song);
       // this week's songs (for "currently obsessed")
       const wk = weekKey();
