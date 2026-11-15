@@ -431,11 +431,24 @@ async function fixSong(rel, action, patient) {
 // A song in the library by its path (from Navidrome), or by artist and title when the path doesn't match here
 function songFile(b) {
   try { return libraryFile(String(b.file || "")); } catch (e) {
-    const f = b.artist && b.title ? libraryFileFor(String(b.artist), String(b.title)) : null;
-    if (f && fs.existsSync(f)) return f;
-    throw e;
+    // (3.15) by artist and title, preferring the album Sour Player names, and never guessing between versions:
+    // it used to take the first song with that name, which could be another album's copy or a live version
+    const artist = String(b.artist || ""), title = String(b.title || ""), album = norm(String(b.album || ""));
+    if (!artist || !title) throw e;
+    const want = karaokeKey(artist, title);
+    const hits = Object.entries(libCache).filter(([f, c]) => c.t && !c.karaoke
+      && (karaokeKey(c.a, c.t) === want || (c.aa && karaokeKey(c.aa, c.t) === want)) && fs.existsSync(f));
+    // the album by its tag, or by the folder the file sits in (folder names often add the year)
+    const sameAlbum = album ? hits.filter(([f, c]) => norm(c.al || "") === album || norm(path.basename(path.dirname(f))).includes(album)) : [];
+    const pick = sameAlbum.length ? sameAlbum : hits;
+    if (pick.length === 1) return pick[0][0];
+    if (!pick.length) throw e;
+    throw new Error(`there are ${pick.length} copies of that song in the library: open it from its album and try again`);
   }
 }
+// a re-encode into another format (when the new audio arrives as something else, the file keeps its name)
+const CONVERT = { mp3: ["-c:a", "libmp3lame", "-q:a", "0"], m4a: ["-c:a", "aac", "-b:a", "256k"], aac: ["-c:a", "aac", "-b:a", "256k"],
+  opus: ["-c:a", "libopus", "-b:a", "160k"], ogg: ["-c:a", "libvorbis", "-q:a", "6"], flac: ["-c:a", "flac"], wav: ["-c:a", "pcm_s16le"] };
 // The song played the music video's audio (an intro, a skit, a different mix): download another upload of it and
 // swap the audio in, keeping the file's own tags and cover (and its path, so plays and favourites stay). The old
 // audio is kept in Hermes Music's data folder (one copy per song) in case the new one is worse.
@@ -449,9 +462,16 @@ async function replaceAudio(b, videoId) {
       const fmt = { m4a: "m4a", mp3: "mp3", opus: "opus", flac: "flac", ogg: "vorbis", wav: "wav", aac: "aac" }[ext] || config.audioFormat;
       const d = await run("yt-dlp", ["--no-playlist", "--no-warnings", "-x", "--audio-format", fmt, "--audio-quality", "0",
         "-o", path.join(ST(), "song.%(ext)s"), `https://www.youtube.com/watch?v=${videoId}`]);
-      const src = fs.readdirSync(ST()).map((f) => path.join(ST(), f)).find((f) => /^song\./.test(path.basename(f)));
+      let src = fs.readdirSync(ST()).map((f) => path.join(ST(), f)).find((f) => /^song\./.test(path.basename(f)));
       if (!src) throw new Error(botNote(d.err) || "the download failed");
-      const outExt = path.extname(src).slice(1).toLowerCase();
+      let outExt = path.extname(src).slice(1).toLowerCase();
+      // (3.15) the same format as the file it replaces, so the file keeps its name (and with it its plays and
+      // favourites: a new name is a new song to Navidrome)
+      if (outExt !== ext && CONVERT[ext]) {
+        const conv = path.join(ST(), `converted.${ext}`);
+        const cv = await run("ffmpeg", ["-y", "-v", "error", "-i", src, "-vn", ...CONVERT[ext], conv], { timeout: 5 * 60000 });
+        if (cv.code === 0 && fs.existsSync(conv)) { src = conv; outExt = ext; }
+      }
       // the tags the file has now (ffprobe), else what the library index knows
       const probe = await run("ffprobe", ["-v", "quiet", "-print_format", "json", "-show_format", file], { timeout: 20000 });
       const t = {};
@@ -474,6 +494,13 @@ async function replaceAudio(b, videoId) {
       fs.copyFileSync(out, dest);
       if (dest !== file) fs.rmSync(file, { force: true });
       delete libCache[file];
+      // an instrumental made from the old audio would be wrong now: the next karaoke makes a new one
+      const kk = karaokeKey(keep.artist || b.artist || "", keep.title || b.title || "");
+      if (karaoke[kk]) {
+        fs.rmSync(path.join(KARAOKE_DIR, karaoke[kk]), { force: true });
+        delete karaoke[kk];
+        fs.writeFileSync(KARAOKE_LIST, JSON.stringify(karaoke));
+      }
       return { artist: keep.artist || "", title: keep.title || "", file: path.relative(MUSIC, dest) };
     } finally { fs.rmSync(ST(), { recursive: true, force: true }); }
   });
@@ -5978,7 +6005,7 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
     const videoId = String(b.videoId || "");
     if (!/^[\w-]{11}$/.test(videoId)) return send(res, 400, { error: "pick one of the videos" });
     try {
-      const r = await replaceAudio({ file: b.file, artist: clean1(b.artist, 100), title: clean1(b.title, 150) }, videoId);
+      const r = await replaceAudio({ file: b.file, artist: clean1(b.artist, 100), title: clean1(b.title, 150), album: clean1(b.album, 150) }, videoId);
       adminLog("replace", `"not the right song": new audio for ${r.artist} - ${r.title} (youtu.be/${videoId})`, clean1(b.by, 40) || null);
       return send(res, 200, r);
     } catch (e) { return send(res, 400, { error: e.message }); }
@@ -5988,12 +6015,27 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
     const prof = b.profile ? ownProfile(String(b.profile), b.key) : null;
     if (!adminOk(b, req) && !(prof && isAdmin(prof))) return send(res, 403, { error: "only admins can remove songs" });
     try {
-      const from = songFile({ file: b.file, artist: clean1(b.artist, 100), title: clean1(b.title, 150) });
+      const from = songFile({ file: b.file, artist: clean1(b.artist, 100), title: clean1(b.title, 150), album: clean1(b.album, 150) });
       const relPath = path.relative(MUSIC, from), to = path.join(ARCHIVE_DIR, relPath);
       fs.mkdirSync(path.dirname(to), { recursive: true });
       fs.renameSync(from, to);
       const lrc = from.replace(/\.[^.]+$/, ".lrc");
       if (fs.existsSync(lrc)) fs.renameSync(lrc, to.replace(/\.[^.]+$/, ".lrc"));
+      // (3.15) an album folder with nothing left to play goes into the archive too (its cover and the rest), so
+      // the album disappears instead of staying behind empty; then an artist folder left empty
+      try {
+        const dir = path.dirname(from);
+        if (dir !== MUSIC && dir.startsWith(MUSIC + path.sep) && !fs.readdirSync(dir).some((n) => AUDIO.test(n))) {
+          for (const n of fs.readdirSync(dir)) {
+            const there = path.join(path.dirname(to), n);
+            fs.mkdirSync(path.dirname(there), { recursive: true });
+            fs.renameSync(path.join(dir, n), there);
+          }
+          fs.rmdirSync(dir);
+          const up = path.dirname(dir);
+          if (up !== MUSIC && up.startsWith(MUSIC + path.sep) && !fs.readdirSync(up).length) fs.rmdirSync(up);
+        }
+      } catch {} // a folder that can't be tidied stays (the song itself is gone either way)
       const who = prof ? prof.name : clean1(b.by, 40) || null;
       archived.push({ file: relPath, at: Date.now(), by: who, removed: true });
       saveArchive();
