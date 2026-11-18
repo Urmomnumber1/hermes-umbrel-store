@@ -2918,6 +2918,11 @@ const versionsDb = readJsonEarly(VERSIONS_LIST); // the original's songKey -> { 
 const versionPlays = readJsonEarly(VERSION_PLAYS); // profile -> songKey -> { "original" | version id: plays }
 const notVersions = readJsonEarly(NOT_VERSIONS); // library files an admin took back out (never moved again)
 const karaokeOff = readJsonEarly(KARAOKE_OFF); // karaokeKey -> { by, at }: no karaoke for these songs (nobody sings)
+// (3.16.1) hearted versions: profile -> songKey -> { version id: { at, song } } (song: the music server's song id, to
+// play it from the favourites)
+const VERSION_FAVS = "/data/version-favs.json";
+const versionFavs = readJsonEarly(VERSION_FAVS);
+const saveVersionFavs = () => fs.promises.writeFile(VERSION_FAVS, JSON.stringify(versionFavs)).catch(() => {});
 const saveVersions = () => fs.writeFileSync(VERSIONS_LIST, JSON.stringify(versionsDb));
 let versionPlaysDirty = false;
 setInterval(() => {
@@ -2993,6 +2998,9 @@ function dropVersion(key, id) {
   if (!s.versions.length) delete versionsDb[key];
   for (const p of Object.values(versionPlays)) if (p[key]) delete p[key][id];
   versionPlaysDirty = true;
+  let favs = false;
+  for (const f of Object.values(versionFavs)) if (f[key] && f[key][id]) { delete f[key][id]; favs = true; }
+  if (favs) saveVersionFavs();
   saveVersions();
 }
 
@@ -3371,7 +3379,15 @@ async function versionsRoute(req, res, p, get, post, url) {
       versions: (s.versions || []).map(publicVersion) }));
     const mine = {};
     for (const { key } of songs) if (plays[key]) mine[key] = plays[key];
-    return send(res, 200, { songs, mine });
+    // (3.16.1) the versions they hearted, oldest first
+    const hearted = (who && versionFavs[who]) || {}, favs = {};
+    for (const [key, row] of Object.entries(hearted)) {
+      const have = versionsDb[key] ? versionsDb[key].versions : [];
+      const list = Object.entries(row || {}).filter(([id]) => have.some((v) => v.id === id))
+        .map(([id, f]) => ({ id, at: f.at || 0, song: f.song || null })).sort((x, y) => x.at - y.at);
+      if (list.length) favs[key] = list;
+    }
+    return send(res, 200, { songs, mine, favs });
   }
   if (get && p === "/api/versions/file") { // the version's audio, with seeking
     const id = String(url.searchParams.get("id") || "");
@@ -3394,6 +3410,19 @@ async function versionsRoute(req, res, p, get, post, url) {
     row[version] = (row[version] || 0) + 1;
     versionPlaysDirty = true;
     return send(res, 200, { plays: row });
+  }
+  if (p === "/api/versions/favorite") { // (3.16.1) heart a version of a song (or not): { song, version, on, songId }
+    if (!prof) return send(res, 403, { error: "sign in to your profile first" });
+    const key = String(b.song || ""), version = String(b.version || "");
+    const s = versionsDb[key];
+    if (!s || !s.versions.some((v) => v.id === version)) return send(res, 404, { error: "no such version" });
+    const mine = versionFavs[prof.id] || (versionFavs[prof.id] = {});
+    const row = mine[key] || (mine[key] = {});
+    if (b.on) row[version] = { at: (row[version] && row[version].at) || Date.now(), song: clean1(b.songId, 200) || (row[version] && row[version].song) || null };
+    else delete row[version];
+    if (!Object.keys(row).length) delete mine[key];
+    saveVersionFavs();
+    return send(res, 200, { favs: Object.keys(mine[key] || {}) });
   }
   if (p === "/api/versions/fold") { // admins: look for songs that are versions of others right now
     if (!admin) return send(res, 403, { error: "admins only" });
@@ -3420,6 +3449,17 @@ async function versionsRoute(req, res, p, get, post, url) {
       for (const x of versionsDb[ownKey].versions) { versionsDb[base.key].versions.push(x); queueVersionCheck(base.key, x.id); }
       delete versionsDb[ownKey];
       saveVersions();
+      // (3.16.1) and so do the plays and hearts people gave them (its own plays count for its new version)
+      for (const [store, plays] of [[versionPlays, true], [versionFavs, false]])
+        for (const mine of Object.values(store))
+          if (mine[ownKey]) {
+            const { original, ...rest } = mine[ownKey];
+            if (plays && original) rest[v.id] = (rest[v.id] || 0) + original;
+            mine[base.key] = { ...(mine[base.key] || {}), ...rest };
+            delete mine[ownKey];
+          }
+      versionPlaysDirty = true;
+      saveVersionFavs();
     }
     adminLog("version", `put ${c.a || "?"} - ${c.t || path.basename(from)} under ${base.artist} - ${base.title} as its "${v.label}" version`, who);
     return send(res, 200, { ok: true, id: v.id, label: v.label, under: { artist: base.artist, title: base.title } });
@@ -6354,12 +6394,12 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
     if (p === "/api/admin/log") return send(res, 200, adminLogList.slice(0, 200));
     if (p === "/api/admin/backup") { // everything Sour Player keeps, as one file
       const pack = {};
-      for (const f of [PROFILES, SOCIAL, SHOP_FILE, ROOMS, CFG, "/data/karaoke.json", "/data/lyric-offsets.json", "/data/video-misses.json", "/data/versions.json", "/data/version-plays.json", "/data/not-versions.json", "/data/karaoke-off.json"]) { try { pack[f] = fs.readFileSync(f, "utf8"); } catch {} }
+      for (const f of [PROFILES, SOCIAL, SHOP_FILE, ROOMS, CFG, "/data/karaoke.json", "/data/lyric-offsets.json", "/data/video-misses.json", "/data/versions.json", "/data/version-plays.json", "/data/not-versions.json", "/data/karaoke-off.json", "/data/version-favs.json"]) { try { pack[f] = fs.readFileSync(f, "utf8"); } catch {} }
       return send(res, 200, { made: new Date().toISOString(), version: process.env.HM_VERSION || null, files: pack }, "application/json", { "content-disposition": `attachment; filename="hermes-backup-${dayKey()}.json"` });
     }
     if (p === "/api/admin/restore") { // put a backup back (Hermes restarts to load it)
       const files = b.backup && b.backup.files;
-      const allowed = [PROFILES, SOCIAL, SHOP_FILE, ROOMS, CFG, "/data/karaoke.json", "/data/lyric-offsets.json", "/data/video-misses.json", "/data/versions.json", "/data/version-plays.json", "/data/not-versions.json", "/data/karaoke-off.json"];
+      const allowed = [PROFILES, SOCIAL, SHOP_FILE, ROOMS, CFG, "/data/karaoke.json", "/data/lyric-offsets.json", "/data/video-misses.json", "/data/versions.json", "/data/version-plays.json", "/data/not-versions.json", "/data/karaoke-off.json", "/data/version-favs.json"];
       if (!files || typeof files !== "object") return send(res, 400, { error: "that isn't a Hermes Music backup" });
       let n = 0;
       for (const [f, text] of Object.entries(files)) { if (!allowed.includes(f) || typeof text !== "string") continue; try { JSON.parse(text); fs.writeFileSync(f, text); n++; } catch {} }
