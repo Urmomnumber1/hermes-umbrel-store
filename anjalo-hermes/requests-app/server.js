@@ -3464,6 +3464,9 @@ async function versionsRoute(req, res, p, get, post, url) {
     adminLog("version", `put ${c.a || "?"} - ${c.t || path.basename(from)} under ${base.artist} - ${base.title} as its "${v.label}" version`, who);
     return send(res, 200, { ok: true, id: v.id, label: v.label, under: { artist: base.artist, title: base.title } });
   }
+  // (3.16.2) a request this Hermes Music doesn't know yet (from a newer Sour Player): say to update it
+  if (!["/api/versions/rename", "/api/versions/video", "/api/versions/unlink", "/api/versions/remove"].includes(p))
+    return send(res, 404, { error: "Update Hermes Music: this needs a newer version (in Umbrel: App Store → Hermes Music → Update)", update: true });
   const id = String(b.id || "");
   const found = VERSION_ID.test(id) ? findVersion(id) : null;
   if (!found) return send(res, 404, { error: "no such version" });
