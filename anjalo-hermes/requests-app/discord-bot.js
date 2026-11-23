@@ -8,6 +8,12 @@
 // any number of looping ambience tracks, and one-shot sound effects on top. ffmpeg decodes each file.
 // BOT_FAKE=1: no Discord at all (a pretend server with two voice channels, and what would be sent goes
 // into BOT_DATA/fake-voice.wav), for trying the tab out without a bot.
+// (3.17) "Hey Sour Box": with the ears switched on (Sour Player's Discord Bot tab), the bot stays undeafened
+// in the voice channel and listens. What someone says goes, one sentence at a time, to a helper on this
+// machine (sour-ears.py: Vosk speech recognition, nothing leaves the Umbrel); only sentences with "Sour Box"
+// in them go on to Hermes Music, as text. Nothing is recorded or kept. The same commands can be typed:
+// /sourbox, or a message that mentions the bot.
+//   bot -> Hermes: { type: "heard", user: { id, name }, text, typed?, reply? }
 "use strict";
 const { spawn } = require("child_process");
 const fs = require("fs");
@@ -248,6 +254,164 @@ let online = false;
 let error = "";
 let voiceLib = null;
 
+// ---------- (3.17) ears ----------
+const ears = { on: false, cfg: null, proc: null, ready: false, seq: 0, waiting: new Map(), buf: "", streams: new Map(), restarts: 0, watched: new WeakSet() };
+const replies = new Map(); // typed commands waiting for their answer: reply id -> { interaction | message, at }
+
+function earsLine(line) {
+  let m;
+  try { m = JSON.parse(line); } catch { return; }
+  if (m.ready) { ears.ready = true; ears.restarts = 0; log('listening for "Hey Sour Box"'); changed(); return; }
+  const w = ears.waiting.get(m.id);
+  if (w) { ears.waiting.delete(m.id); w(m); }
+}
+function earsStart() {
+  if (FAKE || ears.proc || !ears.cfg || !ears.on) return; // the pretend bot has no helper
+  const { python, script, model } = ears.cfg;
+  let p;
+  try { p = spawn(python, [script, model], { stdio: ["pipe", "pipe", "inherit"] }); } catch (e) { log("ears: " + e.message); return; }
+  ears.proc = p;
+  ears.ready = false;
+  ears.buf = "";
+  p.stdout.on("data", (d) => {
+    ears.buf += d;
+    let i;
+    while ((i = ears.buf.indexOf("\n")) >= 0) { const line = ears.buf.slice(0, i); ears.buf = ears.buf.slice(i + 1); earsLine(line); }
+  });
+  p.stdin.on("error", () => {});
+  p.on("error", (e) => log("ears: " + e.message));
+  p.on("exit", () => {
+    if (ears.proc !== p) return;
+    ears.proc = null;
+    ears.ready = false;
+    for (const w of ears.waiting.values()) w(null);
+    ears.waiting.clear();
+    changed();
+    if (ears.on && ears.restarts++ < 5) setTimeout(earsStart, 5000);
+  });
+  if (ears.cfg.words && ears.cfg.words.length) p.stdin.write(JSON.stringify({ grammar: ears.cfg.words }) + "\n");
+}
+function earsStop() {
+  const p = ears.proc;
+  ears.proc = null;
+  ears.ready = false;
+  if (p) { try { p.kill(); } catch {} }
+  for (const s of ears.streams.values()) { try { s.destroy(); } catch {} }
+  ears.streams.clear();
+}
+// one thing someone said (16 kHz mono PCM) -> { wake, text } from the helper (null when it isn't there)
+function earsHear(pcm, force = false) {
+  if (!ears.proc || !ears.ready) return Promise.resolve(null);
+  const id = ++ears.seq;
+  return new Promise((ok) => {
+    const t = setTimeout(() => { ears.waiting.delete(id); ok(null); }, 20000);
+    ears.waiting.set(id, (m) => { clearTimeout(t); ok(m); });
+    try {
+      ears.proc.stdin.write(JSON.stringify({ id, bytes: pcm.length, force: !!force }) + "\n");
+      ears.proc.stdin.write(pcm);
+    } catch { ears.waiting.delete(id); clearTimeout(t); ok(null); }
+  });
+}
+// Discord's Opus packets -> 48 kHz mono PCM
+function opusDecoder() {
+  try {
+    const { OpusEncoder } = need("@discordjs/opus");
+    const d = new OpusEncoder(RATE, 1);
+    return (packet) => d.decode(packet);
+  } catch {}
+  const OpusScript = need("opusscript");
+  const d = new OpusScript(RATE, 1, OpusScript.Application.VOIP);
+  return (packet) => Buffer.from(d.decode(packet));
+}
+// 48 kHz -> 16 kHz (what the recognizer takes): every three samples become one
+function to16k(pcm) {
+  const n = Math.floor(pcm.length / 6);
+  const out = Buffer.alloc(n * 2);
+  for (let i = 0; i < n; i++) out.writeInt16LE(Math.round((pcm.readInt16LE(i * 6) + pcm.readInt16LE(i * 6 + 2) + pcm.readInt16LE(i * 6 + 4)) / 3), i * 2);
+  return out;
+}
+const EAR_MIN = 16000 * 2 * 0.4; // shorter than 0.4 s: a cough, not a sentence
+const EAR_MAX = 16000 * 2 * 12; // nobody's command is longer than 12 s
+async function earsSaid(who, pcm) {
+  // after "Hey Sour Box" on its own (a chime answered), the next thing that person says is the command
+  const armed = ears.armed && ears.armed.id === who.id && Date.now() < ears.armed.until;
+  if (armed) ears.armed = null;
+  const heard = await earsHear(pcm, armed);
+  if (!heard || !heard.wake || !ears.on) return;
+  const text = String(heard.text || "");
+  send({ type: "heard", user: who, text: armed && !/sour box/.test(text) ? "sour box " + text : text });
+}
+// each person in the channel, one sentence at a time (a new one starts when they speak again)
+function earsWatch(connection, guildId) {
+  if (ears.watched.has(connection)) return;
+  ears.watched.add(connection);
+  const { EndBehaviorType } = voiceLib;
+  connection.receiver.speaking.on("start", (userId) => {
+    if (!ears.on || !ears.ready || ears.streams.has(userId)) return;
+    const member = client && client.guilds.cache.get(guildId) ? client.guilds.cache.get(guildId).members.cache.get(userId) : null;
+    if (member && member.user.bot) return;
+    let decode;
+    try { decode = opusDecoder(); } catch (e) { log("ears: " + e.message); return; }
+    const parts = [];
+    let size = 0, done = false;
+    const stream = connection.receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: 700 } });
+    ears.streams.set(userId, stream);
+    const finish = () => {
+      if (done) return;
+      done = true;
+      ears.streams.delete(userId);
+      try { stream.destroy(); } catch {}
+      if (size >= EAR_MIN) earsSaid({ id: userId, name: member ? member.displayName : "Someone" }, Buffer.concat(parts)).catch(() => {});
+    };
+    stream.on("data", (packet) => {
+      try { const pcm = to16k(decode(packet)); parts.push(pcm); size += pcm.length; } catch { return; }
+      if (size > EAR_MAX) finish();
+    });
+    stream.on("end", finish);
+    stream.on("close", finish);
+    stream.on("error", finish);
+  });
+}
+// deafened while the ears are off (Discord shows it), undeafened while they listen
+function earsApply() {
+  if (ears.on) earsStart(); else earsStop();
+  if (!FAKE && voice && voice.connection) {
+    try { voice.connection.rejoin({ channelId: voice.channelId, selfDeaf: !ears.on, selfMute: false }); } catch {}
+    if (ears.on) earsWatch(voice.connection, voice.guildId);
+  }
+  if (!FAKE && client && client.user) {
+    try {
+      const { ActivityType } = need("discord.js");
+      client.user.setPresence({ activities: ears.on ? [{ name: 'Hey Sour Box', type: ActivityType.Listening }] : [] }); // shows as: Listening to Hey Sour Box
+    } catch {}
+  }
+  changed();
+}
+// a short two-note chime (made here, once): "I heard you"
+function chimeFile() {
+  const file = path.join(DATA, "sour-box-chime.wav");
+  if (fs.existsSync(file)) return file;
+  const n = Math.floor(RATE * 0.34), pcm = Buffer.alloc(n * 2);
+  for (let i = 0; i < n; i++) {
+    const t = i / RATE, second = t >= 0.15, u = second ? t - 0.15 : t;
+    pcm.writeInt16LE(Math.round(Math.sin(2 * Math.PI * (second ? 1318.5 : 880) * t) * Math.min(1, u / 0.008) * Math.exp(-u * 9) * 9000), i * 2);
+  }
+  const head = Buffer.alloc(44);
+  head.write("RIFF", 0); head.writeUInt32LE(36 + pcm.length, 4); head.write("WAVEfmt ", 8); head.writeUInt32LE(16, 16);
+  head.writeUInt16LE(1, 20); head.writeUInt16LE(1, 22); head.writeUInt32LE(RATE, 24); head.writeUInt32LE(RATE * 2, 28);
+  head.writeUInt16LE(2, 32); head.writeUInt16LE(16, 34); head.write("data", 36); head.writeUInt32LE(pcm.length, 40);
+  fs.mkdirSync(DATA, { recursive: true });
+  fs.writeFileSync(file, Buffer.concat([head, pcm]));
+  return file;
+}
+// typed commands: /sourbox, or a message that mentions the bot
+function typedCommand(user, text, target) {
+  const reply = "r" + (++ears.seq);
+  replies.set(reply, { ...target, at: Date.now() });
+  for (const [k, v] of replies) if (Date.now() - v.at > 10 * 60 * 1000) replies.delete(k);
+  send({ type: "heard", user, text: "sour box " + String(text || "").trim(), typed: true, reply });
+}
+
 const FAKE_GUILDS = [{
   id: "g1", name: "Test server", channels: [
     { id: "c1", name: "Tavern", members: [{ id: "u1", name: "Owen", avatar: "" }, { id: "u2", name: "Gavin", avatar: "" }] },
@@ -297,6 +461,7 @@ function state() {
       shuffle: st.shuffle,
       queue: st.queue.map(view),
     },
+    ears: { on: ears.on, ready: FAKE ? ears.on : ears.ready },
     ambience: [...st.ambience.values()].filter((a) => !a.stopping).map((a) => ({ ...view(a.item), volume: a.gain })),
     sfx: [...st.sfx].filter((s) => !s.stopping).map((s) => view(s.item)),
     volumes: st.volumes,
@@ -351,13 +516,30 @@ async function login(token) {
   }
   const { Client, GatewayIntentBits, Events } = need("discord.js");
   voiceLib = need("@discordjs/voice");
-  client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
+  // (3.17) GuildMessages: messages that mention the bot (their text comes without the privileged intent)
+  client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessages] });
   client.once(Events.ClientReady, (c) => {
     online = true;
     error = "";
     user = { id: c.user.id, name: c.user.username, avatar: c.user.displayAvatarURL({ size: 64 }) };
     log(`online as ${c.user.tag} in ${c.guilds.cache.size} server(s)`);
     changed();
+    // /sourbox in every server (needs the bot to have been invited with slash commands; fine without)
+    const slash = { name: "sourbox", description: "Tell Sour Box what to do: play <song>, pause, resume, skip, stop",
+      options: [{ name: "do", description: "play <song>, pause, resume, skip, stop", type: 3, required: true }] };
+    for (const g of c.guilds.cache.values()) g.commands.create(slash).catch(() => {});
+    if (ears.on) earsApply();
+  });
+  client.on(Events.GuildCreate, (g) => { g.commands.create({ name: "sourbox", description: "Tell Sour Box what to do: play <song>, pause, resume, skip, stop",
+    options: [{ name: "do", description: "play <song>, pause, resume, skip, stop", type: 3, required: true }] }).catch(() => {}); });
+  client.on(Events.InteractionCreate, (i) => {
+    if (!i.isChatInputCommand || !i.isChatInputCommand() || i.commandName !== "sourbox") return;
+    i.deferReply().then(() => typedCommand({ id: i.user.id, name: (i.member && i.member.displayName) || i.user.username }, i.options.getString("do"), { interaction: i })).catch(() => {});
+  });
+  client.on(Events.MessageCreate, (m) => {
+    if (!client.user || m.author.bot || !m.mentions.users.has(client.user.id)) return;
+    const text = String(m.content || "").replace(/<@!?\d+>/g, " ").trim();
+    if (text) typedCommand({ id: m.author.id, name: (m.member && m.member.displayName) || m.author.username }, text, { message: m });
   });
   for (const ev of [Events.VoiceStateUpdate, Events.GuildCreate, Events.GuildDelete, Events.ChannelCreate, Events.ChannelDelete, Events.ChannelUpdate]) {
     client.on(ev, () => { checkAlone(); changed(); });
@@ -409,7 +591,7 @@ async function join({ guildId, channelId }) {
     if (voice.channelId === channel.id) return state().voice;
     voice.channelId = channel.id;
     aloneSince = 0;
-    voice.connection.rejoin({ channelId: channel.id, selfDeaf: true, selfMute: false });
+    voice.connection.rejoin({ channelId: channel.id, selfDeaf: !ears.on, selfMute: false });
     changed();
     return state().voice;
   }
@@ -417,8 +599,9 @@ async function join({ guildId, channelId }) {
   voice = { guildId: guild.id, channelId: channel.id, status: "connecting" };
   aloneSince = 0;
   changed();
-  const connection = joinVoiceChannel({ channelId: channel.id, guildId: guild.id, adapterCreator: guild.voiceAdapterCreator, selfDeaf: true });
+  const connection = joinVoiceChannel({ channelId: channel.id, guildId: guild.id, adapterCreator: guild.voiceAdapterCreator, selfDeaf: !ears.on });
   voice.connection = connection;
+  if (ears.on) earsWatch(connection, guild.id);
   connection.on("stateChange", (_, next) => {
     if (!voice || voice.connection !== connection) return;
     if (next.status === VoiceConnectionStatus.Ready) { voice.status = "ready"; if (busy()) player?.unpause(); }
@@ -627,6 +810,76 @@ const commands = {
     const out = [];
     for (let i = 0; i < p.length; i += 50) out.push(Math.max(...p.slice(i, i + 50)));
     return out;
+  },
+  // (3.17) the ears: on or off, and where the helper and its word list are
+  ears: ({ on, python, script, model, words }) => {
+    const cfg = on && python && script && model ? { python, script, model, words: Array.isArray(words) ? words : [] } : null;
+    const sameHelper = cfg && ears.cfg && cfg.python === ears.cfg.python && cfg.script === ears.cfg.script && cfg.model === ears.cfg.model;
+    const was = ears.on;
+    ears.on = !!on && (FAKE || !!cfg);
+    if (ears.on && sameHelper && ears.proc) { // only the words changed (the library grew)
+      ears.cfg = cfg;
+      try { ears.proc.stdin.write(JSON.stringify({ grammar: cfg.words }) + "\n"); } catch {}
+    } else {
+      if (ears.proc) earsStop();
+      ears.cfg = cfg;
+      ears.restarts = 0;
+    }
+    if (was !== ears.on || !sameHelper) earsApply();
+    return { on: ears.on };
+  },
+  // an answer: into the chat of the voice channel (or wherever the typed command came from)
+  say: async ({ text, reply }) => {
+    const msg = String(text || "").slice(0, 400);
+    if (!msg) return null;
+    const to = reply && replies.get(reply);
+    if (to) {
+      replies.delete(reply);
+      try { if (to.interaction) await to.interaction.editReply(msg); else await to.message.reply({ content: msg, allowedMentions: { repliedUser: false } }); } catch {}
+      return null;
+    }
+    if (FAKE || !client || !voice) return null;
+    try {
+      const g = client.guilds.cache.get(voice.guildId);
+      const c = g && g.channels.cache.get(voice.channelId);
+      if (c && c.isTextBased && c.isTextBased()) await c.send({ content: msg, allowedMentions: { parse: [] } });
+    } catch {}
+    return null;
+  },
+  chime: ({ arm }) => {
+    if (arm) ears.armed = { id: String(arm), until: Date.now() + 9000 };
+    if (!voice) return null;
+    try {
+      st.sfx.add(new Source({ id: "sour-box-chime", title: "chime", file: chimeFile() }, { gain: 0.5 }));
+      wake();
+    } catch {}
+    return null;
+  },
+  // tests: as if someone in the voice channel had said this (no speech recognition involved)
+  hear: ({ text, name }) => {
+    if (!ears.on) throw new Error("the ears are off");
+    send({ type: "heard", user: { id: "test", name: String(name || "Tester") }, text: String(text || "") });
+    return null;
+  },
+  // tests (on a machine with the real helper): a sound file through the same path Discord's voices take,
+  // Opus packets -> 16 kHz -> the helper. Answers what it understood.
+  eartest: async ({ file }) => {
+    if (!ears.proc || !ears.ready) throw new Error("the ears aren't ready");
+    const pcm = await new Promise((ok, fail) => {
+      const parts = [];
+      const p = spawn(FFMPEG, ["-v", "error", "-nostdin", "-i", file, "-vn", "-f", "s16le", "-ar", String(RATE), "-ac", "1", "pipe:1"], { stdio: ["ignore", "pipe", "inherit"] });
+      p.stdout.on("data", (d) => parts.push(d));
+      p.on("error", fail);
+      p.on("close", () => ok(Buffer.concat(parts)));
+    });
+    // into 20 ms Opus packets and back, like a voice in the channel
+    const OpusScript = need("opusscript");
+    const enc = new OpusScript(RATE, 1, OpusScript.Application.VOIP);
+    const decode = opusDecoder();
+    const out = [];
+    for (let at = 0; at + FRAME_SAMPLES * 2 <= pcm.length; at += FRAME_SAMPLES * 2) out.push(to16k(decode(Buffer.from(enc.encode(pcm.subarray(at, at + FRAME_SAMPLES * 2), FRAME_SAMPLES)))));
+    const heard = await earsHear(Buffer.concat(out));
+    return { seconds: Math.round((pcm.length / 2 / RATE) * 10) / 10, heard };
   },
   // which Discord libraries were found (opus, encryption, voice encryption)
   report: () => (FAKE ? "fake mode" : need("@discordjs/voice").generateDependencyReport()),

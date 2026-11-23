@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Sour Box - watch</title>
+<style>
+  /* Hermes Music 3.17: the watch page of the Discord bot. It shows the music video of the song the bot is
+     playing in the voice channel, in step with it and without sound (the sound is the bot's, in the call).
+     Open it on a TV, share it in the call (Discord's own screen share), or run it inside Discord as an
+     Activity (see Hermes Music > Config > Discord bot for how). */
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: #0b0b0f; color: #f4f1ea; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  .card { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 6vmin; text-align: center;
+    background: radial-gradient(1200px 700px at 20% 0%, rgba(244, 208, 63, .16), transparent 60%), radial-gradient(900px 600px at 100% 100%, rgba(84, 120, 255, .16), transparent 60%), #0b0b0f; }
+  .card h1 { margin: 0; font-size: clamp(28px, 7vmin, 84px); font-weight: 800; letter-spacing: -.02em; line-height: 1.05; }
+  .card p { margin: 0; font-size: clamp(16px, 3vmin, 34px); opacity: .75; }
+  .card small { font-size: clamp(12px, 1.8vmin, 18px); opacity: .5; }
+  .bar { position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: 14px; align-items: baseline; padding: 14px 18px calc(14px + env(safe-area-inset-bottom));
+    background: linear-gradient(transparent, rgba(0, 0, 0, .78)); transition: opacity .6s; }
+  .bar b { font-size: clamp(15px, 2.4vmin, 26px); }
+  .bar span { font-size: clamp(12px, 1.9vmin, 20px); opacity: .75; }
+  .bar i { margin-left: auto; font-style: normal; font-size: clamp(11px, 1.6vmin, 16px); opacity: .55; }
+  .hidden { display: none !important; }
+  .idle .bar { opacity: 0; }
+</style>
+</head>
+<body>
+<video id="v" muted playsinline preload="auto" class="hidden"></video>
+<div id="card" class="card"><h1 id="c-title">Sour Box</h1><p id="c-sub">Waiting for the bot...</p><small id="c-note"></small></div>
+<div id="bar" class="bar hidden"><b id="b-title"></b><span id="b-artist"></span><i id="b-note"></i></div>
+<script>
+const $ = (id) => document.getElementById(id);
+const video = $("v");
+// inside Discord (an Activity) the page says hello to the Discord app around it, so it stops showing its
+// loading screen. No sign-in is asked for: the page only shows what the bot plays.
+(() => {
+  const q = new URLSearchParams(location.search), frame = q.get("frame_id");
+  if (!frame || window.parent === window) return;
+  const to = window.parent.opener || window.parent;
+  const id = (location.hostname.match(/^(\d{15,22})\.discordsays\.com$/) || [])[1] || q.get("client_id") || "";
+  try { to.postMessage([0, { v: 1, encoding: "json", client_id: id, frame_id: frame }], document.referrer || "*"); } catch {}
+})();
+// the page's own little API sits next to it (api/now, api/video); behind Discord's proxy it may be under .proxy/
+let base = "";
+const get = async (path) => {
+  for (const b of base ? [base] : ["", ".proxy/"]) {
+    try { const r = await fetch(b + path, { cache: "no-store" }); if (r.ok) { base = b || ""; return r.json(); } } catch {}
+  }
+  return null;
+};
+let now = null, got = 0, shown = "", loaded = "", idleTimer = 0;
+const where = () => (now ? now.position + (now.paused ? 0 : (Date.now() - got) / 1000) : 0);
+const card = (title, sub, note = "") => { $("c-title").textContent = title; $("c-sub").textContent = sub; $("c-note").textContent = note; $("card").classList.remove("hidden"); video.classList.add("hidden"); };
+function draw() {
+  const cur = now && now.current;
+  if (!now || !now.online) return card("Sour Box", "The bot isn't online right now.");
+  if (!cur) { $("bar").classList.add("hidden"); return card("Sour Box", now.channel ? "Nothing is playing in " + now.channel + "." : "The bot isn't in a voice channel.", 'In the call: "Hey Sour Box, play ..."'); }
+  $("b-title").textContent = cur.title; $("b-artist").textContent = cur.artist || ""; $("bar").classList.remove("hidden");
+  const key = cur.title + "|" + cur.artist;
+  if (key !== shown) { shown = key; document.body.classList.remove("idle"); clearTimeout(idleTimer); idleTimer = setTimeout(() => document.body.classList.add("idle"), 9000); }
+  const v = now.video;
+  if (!v) { $("b-note").textContent = ""; return card(cur.title, cur.artist || "", "No music video for this song"); }
+  if (v.status !== "ready") { $("b-note").textContent = ""; return card(cur.title, cur.artist || "", v.status === "failed" ? "The video couldn't be fetched" : "Getting the video..."); }
+  if (loaded !== v.id) { loaded = v.id; video.src = base + "api/video?id=" + encodeURIComponent(v.id); video.load(); }
+  $("card").classList.add("hidden"); video.classList.remove("hidden");
+  $("b-note").textContent = now.paused ? "paused" : "";
+}
+// keep the picture in step with the bot's sound (the video's own sound stays off)
+function sync() {
+  const v = now && now.video;
+  if (!v || v.status !== "ready" || video.classList.contains("hidden") || video.readyState < 1) return;
+  const want = Math.max(0, where() + (v.offset || 0));
+  if (video.duration && want > video.duration - 0.2) { if (!video.paused) video.pause(); return; }
+  if (Math.abs(video.currentTime - want) > 0.7) video.currentTime = want;
+  if (now.paused && !video.paused) video.pause();
+  if (!now.paused && video.paused) video.play().catch(() => {});
+}
+async function tick() {
+  const n = await get("api/now");
+  if (n) { now = n; got = Date.now(); }
+  draw();
+  sync();
+}
+video.addEventListener("loadedmetadata", sync);
+setInterval(sync, 500);
+setInterval(tick, 2000);
+tick();
+</script>
+</body>
+</html>

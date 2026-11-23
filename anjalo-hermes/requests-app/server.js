@@ -321,6 +321,7 @@ async function scanLibrary() {
     fs.writeFileSync(LIBCACHE, JSON.stringify(libCache));
     console.log(`library: ${n} files indexed`);
     setTimeout(() => { try { foldVersions(); } catch (e) { console.error("versions:", e.message); } }, 2000);
+    setTimeout(() => { if (config.botEars && bot.proc) earsSync().catch(() => {}); }, 5000); // (3.17) new songs can be asked for by name
   } catch (e) {
     console.error("library scan failed:", e.message);
   } finally {
@@ -577,7 +578,14 @@ async function startBot() {
   bot.proc = proc;
   proc.on("message", (m) => {
     if (!m) return;
-    if (m.type === "state") { bot.state = m.state; if (m.state && m.state.online) bot.restarts = 0; return; }
+    if (m.type === "state") {
+      bot.state = m.state;
+      bot.stateAt = Date.now();
+      if (m.state && m.state.online) bot.restarts = 0;
+      if (m.state && m.state.online && !!config.botEars !== !!(m.state.ears && m.state.ears.on) && EARS.state !== "installing" && EARS.state !== "failed") earsSync().catch(() => {});
+      return;
+    }
+    if (m.type === "heard") { botHeard(m).catch((e) => console.warn("Hey Sour Box:", e.message)); return; }
     if (m.type === "log") { console.log("Discord bot:", m.text); return; }
     if (m.state) bot.state = m.state;
     const w = bot.pending.get(m.id);
@@ -632,7 +640,7 @@ const botStateView = () => {
   const s = bot.state || {};
   return { ...botSummary(), fake: !!s.fake, guilds: s.guilds || [], voice: s.voice || null,
     music: s.music || { current: null, index: -1, position: 0, paused: true, loop: "off", shuffle: false, queue: [] },
-    ambience: s.ambience || [], sfx: s.sfx || [], volumes: s.volumes || { master: 0.9, music: 0.7, ambience: 0.5, sfx: 0.9 } };
+    ambience: s.ambience || [], sfx: s.sfx || [], volumes: s.volumes || { master: 0.9, music: 0.7, ambience: 0.5, sfx: 0.9 }, ears: earsView() };
 };
 const botItemView = (it) => ({ id: it.id, kind: it.kind, title: it.title, artist: it.artist || "", album: it.album || "", duration: it.duration || 0,
   status: it.status || "ready", note: it.note || "", by: it.by || "", added: it.added || 0 });
@@ -789,6 +797,211 @@ function botPlaylistSave(b, who) {
   saveBotLib();
   return { ...botLibView(), playlist: pl.id };
 }
+// ---------- (3.17) "Hey Sour Box": spoken (and typed) commands for the Discord bot ----------
+// Switched on in Sour Player's Discord Bot tab. The bot then listens in its voice channel; its helper
+// (sour-ears.py: Vosk, on this machine, nothing leaves the Umbrel and nothing is kept) turns what follows
+// "Sour Box" into text, and this part works out what was meant: play <a song> (the bot's own music first, then
+// the library), queue <a song>, pause, resume, skip, back, stop. Typed commands (/sourbox, or a message that
+// mentions the bot) come the same way and work with the ears off too.
+const EARS = { state: "off", note: "", last: [], words: 0, synced: "", busy: false };
+const EARS_DIR = "/data/tools/ears";
+const EARS_MODEL_NAME = "vosk-model-small-en-us-0.15";
+const EARS_FAKE = process.env.HERMES_BOT_FAKE === "1"; // the pretend bot has pretend ears
+const earsPython = () => path.join(EARS_DIR, "bin", "python");
+const earsModel = () => path.join(EARS_DIR, EARS_MODEL_NAME);
+async function ensureEars() {
+  if (EARS_FAKE || fs.existsSync(path.join(EARS_DIR, ".ok"))) { EARS.state = "ready"; EARS.note = ""; return true; }
+  if (EARS.state === "installing") return false;
+  EARS.state = "installing"; EARS.note = "downloading the listening tools (about 100 MB, once)";
+  const env = { HOME: "/data/home", UV_CACHE_DIR: "/data/tools/uv-cache", UV_PYTHON_INSTALL_DIR: "/data/tools/uv-python" };
+  try {
+    if (!fs.existsSync(UV)) {
+      const arch = process.arch === "arm64" ? "aarch64" : "x86_64";
+      const r = await fetch(`https://github.com/astral-sh/uv/releases/latest/download/uv-${arch}-unknown-linux-gnu.tar.gz`);
+      if (!r.ok) throw new Error(`uv download: HTTP ${r.status}`);
+      const tgz = "/data/tools/uv.tar.gz";
+      fs.writeFileSync(tgz, Buffer.from(await r.arrayBuffer()));
+      const x = await run("tar", ["-xzf", tgz, "-C", "/data/tools", "--strip-components=1", "--wildcards", "*/uv"], { timeout: 120000 });
+      fs.rmSync(tgz, { force: true });
+      if (!fs.existsSync("/data/tools/uv")) throw new Error(`couldn't unpack uv: ${x.err || x.out}`);
+      fs.mkdirSync(path.dirname(UV), { recursive: true });
+      fs.renameSync("/data/tools/uv", UV); fs.chmodSync(UV, 0o755);
+    }
+    const py = earsPython();
+    let r;
+    if (!fs.existsSync(py)) {
+      fs.rmSync(EARS_DIR, { recursive: true, force: true }); // a try that broke off: start clean
+      r = await run(UV, ["venv", "--python", "3.11", EARS_DIR], { env, timeout: 15 * 60000 });
+      if (!fs.existsSync(py)) throw new Error(`python: ${(r.err || r.out).slice(-300)}`);
+    }
+    r = await run(UV, ["pip", "install", "--python", py, "vosk==0.3.45"], { env, timeout: 30 * 60000 });
+    if (r.code !== 0) throw new Error(`the speech recognizer: ${(r.err || r.out).slice(-300)}`);
+    if (!fs.existsSync(path.join(earsModel(), "am"))) {
+      const z = await fetch(`https://alphacephei.com/vosk/models/${EARS_MODEL_NAME}.zip`, { signal: AbortSignal.timeout(20 * 60000) });
+      if (!z.ok) throw new Error(`the speech model: HTTP ${z.status}`);
+      const zip = path.join(EARS_DIR, "model.zip");
+      fs.writeFileSync(zip, Buffer.from(await z.arrayBuffer()));
+      r = await run(py, ["-c", "import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])", zip, EARS_DIR], { timeout: 10 * 60000 });
+      fs.rmSync(zip, { force: true });
+      if (!fs.existsSync(path.join(earsModel(), "am"))) throw new Error(`couldn't unpack the speech model: ${(r.err || r.out).slice(-200)}`);
+    }
+    fs.writeFileSync(path.join(EARS_DIR, ".ok"), "");
+    EARS.state = "ready"; EARS.note = "";
+    return true;
+  } catch (e) {
+    EARS.state = "failed"; EARS.note = e.message;
+    console.warn("Hey Sour Box:", e.message);
+    return false;
+  }
+}
+// words as they are compared: lower case, no accents, any alphabet (typed commands can be in any)
+const earsTokens = (s) => deaccent(String(s || "")).toLowerCase().replace(/&/g, " and ").replace(/[^\p{L}\p{N}' ]+/gu, " ").split(/\s+/).filter(Boolean);
+const EARS_COMMANDS = ["hey", "sour", "box", "play", "put", "on", "queue", "add", "pause", "resume", "continue", "skip", "next", "previous", "back", "go", "stop", "by", "the", "a", "song", "some", "music", "please"];
+// the words the recognizer may hear after "Sour Box": the commands, and every word of the songs' titles and
+// artists that it can know (plain a-z words; it is an English recognizer)
+function earsWords() {
+  const words = new Set(EARS_COMMANDS);
+  const add = (s) => { for (const w of earsTokens(s)) if (/^[a-z']{1,24}$/.test(w)) words.add(w); };
+  for (const it of botLib.items) if (it.kind === "music" && it.status === "ready") { add(it.title); add(it.artist); }
+  for (const c of Object.values(libCache)) { if (words.size > 30000) break; add(c.t); add(c.a); }
+  return [...words];
+}
+// tell the bot (again) how to listen: when it comes online, when the switch changes, when the library grew
+async function earsSync() {
+  if (!bot.proc || EARS.busy) return;
+  EARS.busy = true;
+  try {
+    const on = !!(bot.state && bot.state.ears && bot.state.ears.on);
+    if (!config.botEars) {
+      if (on) await botCall("ears", { on: false }).catch(() => {});
+      EARS.synced = "";
+      if (EARS.state !== "installing") EARS.state = "off";
+      return;
+    }
+    if (!(await ensureEars())) return;
+    const words = EARS_FAKE ? [] : earsWords();
+    const sig = String(words.length);
+    if (on && EARS.synced === sig) return;
+    EARS.words = words.length;
+    await botCall("ears", { on: true, python: earsPython(), script: path.join(__dirname, "sour-ears.py"), model: earsModel(), words }, 60000)
+      .then(() => { EARS.synced = sig; }, (e) => { EARS.note = e.message; });
+  } finally { EARS.busy = false; }
+}
+// "sour box play retry now by nakiso" -> { cmd: "play", query: "retry now", artist: "nakiso" } (null: not for us)
+function earsParse(text) {
+  const t = earsTokens(text).join(" ");
+  const m = /(?:^|\s)sour box\b\s*(.*)$/.exec(t);
+  if (!m) return null;
+  const rest = m[1].replace(/^(?:please|can you|could you)\s+/, "").replace(/\s+please$/, "").trim();
+  if (!rest) return { cmd: "wake" };
+  if (/^(?:pause|hold on)\b/.test(rest)) return { cmd: "pause" };
+  if (/^(?:resume|continue|keep going|unpause)\b/.test(rest) || rest === "play") return { cmd: "resume" };
+  if (/^(?:skip|next)\b/.test(rest)) return { cmd: "skip" };
+  if (/^(?:previous|back|go back)\b/.test(rest)) return { cmd: "previous" };
+  if (/^stop\b/.test(rest)) return { cmd: "stop" };
+  const p = /^(play|put on|queue|add)\s+(.+)$/.exec(rest);
+  if (!p) return { cmd: "unknown", rest };
+  let query = p[2].replace(/^(?:the song|a song called|some|me)\s+/, "").trim();
+  let artist = "";
+  const by = /^(.+?)\s+by\s+(.+)$/.exec(query);
+  if (by) { query = by[1]; artist = by[2]; }
+  return { cmd: "play", query, artist, later: p[1] === "queue" || p[1] === "add" };
+}
+// the song that was meant: the bot's own music first, then the library
+function earsFind(query, artist) {
+  const q = earsTokens(query), qa = earsTokens(artist);
+  if (!q.length) return null;
+  const score = (title, by) => {
+    const tt = earsTokens(title), ta = earsTokens(by);
+    if (!tt.length) return 0;
+    const all = new Set([...tt, ...ta]);
+    const said = q.filter((w) => all.has(w)).length / q.length; // how much of what was said is in the song
+    if (said < 0.6) return 0;
+    const covered = tt.filter((w) => q.includes(w)).length / tt.length; // how much of the title was said
+    let s = said * 0.55 + covered * 0.45;
+    if (tt.join(" ") === q.join(" ")) s += 0.3; // the title, word for word
+    if (qa.length) s += (qa.filter((w) => ta.includes(w)).length / qa.length) * 0.4 - 0.2;
+    return s;
+  };
+  let best = null;
+  const consider = (s, make) => { if (s > 0 && (!best || s > best.s)) best = { s, make }; };
+  for (const it of botLib.items) {
+    if (it.kind !== "music" || it.status !== "ready" || !it.file) continue;
+    consider(score(it.title, it.artist) + 0.05, () => ({ id: it.id, title: it.title, artist: it.artist || "", duration: it.duration || 0, file: path.join(BOT_FILES, it.file) }));
+  }
+  for (const [file, c] of Object.entries(libCache)) {
+    if (!c || !c.t) continue;
+    consider(score(c.t, c.a || c.aa), () => ({ id: "lib-" + crypto.createHash("sha1").update(file).digest("hex").slice(0, 12), title: c.t, artist: c.a || c.aa || "", duration: 0, file }));
+  }
+  return best && best.s >= 0.6 ? best.make() : null;
+}
+// the bot heard (or was typed) something with "Sour Box" in it
+async function botHeard(m) {
+  const who = clean1((m.user && m.user.name) || "Someone", 40);
+  const cmd = earsParse(m.text);
+  if (!cmd || (!m.typed && !config.botEars)) return;
+  const note = (did) => { EARS.last = [{ at: Date.now(), by: who, text: clean1(m.text, 160), did, typed: !!m.typed }, ...EARS.last].slice(0, 12); };
+  const say = (text) => botCall("say", { text, reply: m.reply }).catch(() => {});
+  try {
+    if (cmd.cmd === "wake") { // just "Hey Sour Box": a chime, and the next thing they say is the command
+      note("listening");
+      if (m.typed) return say("Try: play <song>, queue <song>, pause, resume, skip, back, stop");
+      return botCall("chime", { arm: m.user && m.user.id }).catch(() => {});
+    }
+    if (!(bot.state && bot.state.voice)) {
+      note("not in a voice channel");
+      return say("I'm not in a voice channel yet: put me in one from Sour Player (Discord Bot) first.");
+    }
+    if (cmd.cmd === "play") {
+      const hit = earsFind(cmd.query, cmd.artist);
+      if (!hit) { note(`found nothing for "${cmd.query}"`); return say(`I couldn't find "${cmd.query}"${cmd.artist ? ` by ${cmd.artist}` : ""}.`); }
+      if (!hit.duration) hit.duration = await botDuration(hit.file).catch(() => 0);
+      if (cmd.later) await botCall("enqueue", { items: [hit], next: false });
+      else await botCall("play", { items: [hit], start: 0 });
+      note(`${cmd.later ? "queued" : "played"} ${hit.title}`);
+      return say(`${cmd.later ? "Queued" : "Playing"} ${hit.title}${hit.artist ? ` - ${hit.artist}` : ""} (asked by ${who})`);
+    }
+    const act = { pause: ["pause", "Paused"], resume: ["resume", "Playing"], skip: ["skip", "Skipped"], previous: ["previous", "Back one"], stop: ["stopMusic", "Stopped"] }[cmd.cmd];
+    if (act) { await botCall(act[0]); note(cmd.cmd); return say(`${act[1]} (asked by ${who})`); }
+    note(`didn't understand "${cmd.rest}"`);
+    if (m.typed) return say("I know: play <song>, queue <song>, pause, resume, skip, back, stop");
+  } catch (e) { note(e.message); return say(e.message); }
+}
+// ---------- (3.17) the bot's watch page (/watch/): the music video of the song the bot is playing, in step
+// with it and silent (the sound is the bot's, in the call). For a TV, for sharing in the call with Discord's
+// own screen share, or as a Discord Activity (its page says hello to Discord by itself). Bots can't send
+// video into a call themselves - Discord doesn't let them.
+let WATCH_PAGE = "";
+try { WATCH_PAGE = fs.readFileSync(path.join(__dirname, "watch.html"), "utf8"); } catch { WATCH_PAGE = "<p>The watch page comes with Hermes Music 3.17.</p>"; }
+function botNow() {
+  const s = bot.state, m = s && s.music, cur = m && m.current;
+  const out = { online: !!(s && s.online), channel: s && s.voice ? s.voice.channelName : null, current: null, position: 0, paused: true, video: null };
+  if (!cur) return out;
+  out.current = { title: cur.title, artist: cur.artist || "", duration: cur.duration || 0 };
+  out.paused = !!m.paused;
+  out.position = Math.round((m.position + (m.paused ? 0 : Math.min(5, Math.max(0, (Date.now() - (bot.stateAt || Date.now())) / 1000)))) * 100) / 100;
+  const v = videos[songKey(cur.artist || "", cur.title)];
+  if (v && v.videoId) out.video = { id: v.videoId, offset: v.offset || 0, status: prepareVideo(v.videoId).status };
+  return out;
+}
+function watchRoute(req, res, p, url) {
+  if (p === "/watch") { res.writeHead(302, { location: "/watch/" }); return res.end(); }
+  if (p === "/watch/") return send(res, 200, WATCH_PAGE, "text/html; charset=utf-8", { "cache-control": "no-cache" });
+  if (p === "/watch/api/now" || p === "/watch/.proxy/api/now") return send(res, 200, botNow(), "application/json", { "access-control-allow-origin": "*", "cache-control": "no-store" });
+  if (p === "/watch/api/video" || p === "/watch/.proxy/api/video") {
+    const id = String(url.searchParams.get("id") || "");
+    if (!/^[\w-]{11}$/.test(id)) return send(res, 400, { error: "bad video id" });
+    const st = prepareVideo(id);
+    if (st.status !== "ready") return send(res, st.status === "failed" ? 502 : 202, st);
+    return sendRanged(req, res, videoFile(id), "video/mp4");
+  }
+  return send(res, 404, { error: "not found" });
+}
+const earsView = () => {
+  const s = bot.state || {};
+  return { on: !!config.botEars, state: config.botEars ? EARS.state : "off", note: EARS.note, listening: !!(config.botEars && s.ears && s.ears.on && s.ears.ready), words: EARS.words, last: EARS.last };
+};
+
 async function botDo(b) {
   const a = String(b.action || "");
   const one = (id) => botResolve([id])[0];
@@ -833,6 +1046,18 @@ async function botRoute(req, res, p, url) {
       case "/api/discord-bot/state": return send(res, 200, botStateView());
       case "/api/discord-bot/library": return send(res, 200, botLibView());
       case "/api/discord-bot/do": await botDo(b); return send(res, 200, botStateView());
+      case "/api/discord-bot/ears": { // (3.17) "Hey Sour Box" on or off (the tools download the first time)
+        config.botEars = !!b.on;
+        fs.writeFileSync(CFG, JSON.stringify(config, null, 1));
+        if (config.botEars && EARS.state === "failed") EARS.state = "off"; // try the download again
+        EARS.synced = "";
+        earsSync().catch(() => {});
+        return send(res, 200, botStateView());
+      }
+      case "/api/discord-bot/heard": // tests: as if someone had said (or typed) this
+        if (!EARS_FAKE) return send(res, 404, { error: "not found" });
+        await botHeard({ user: { id: "test", name: me.name }, text: String(b.text || ""), typed: !!b.typed });
+        return send(res, 200, botStateView());
       case "/api/discord-bot/copy": {
         const added = await botCopySongs(b.songs, b.kind, me.name, b.playlist);
         return send(res, 200, { ...botLibView(), added: added.length });
@@ -4426,33 +4651,76 @@ const hashKey = (k) => crypto.createHash("sha256").update(String(k)).digest("hex
 // ---- Sour Player in the browser, at /app/: on an iPhone, Safari > Share > Add to Home Screen makes it an
 // app (no App Store needed). The web build comes from the newest Sour Player release (sour-web.tar.gz).
 const WEB_DIR = "/data/sour-web";
+// (3.17) Updates in rings: admins get a Sour Player release as soon as it's published, everyone else from the
+// first Saturday on or after that day (and any day after it). While a release is still early, the web app is
+// here twice: the early copy for admins (their Sour Player says so with the sour_early cookie), the one from
+// before for everyone else. Sour Player 0.16.0 itself and everything older is never held back.
+const WEB_EARLY_DIR = "/data/sour-web-early";
+const RELEASES_URL = process.env.SOUR_RELEASES_URL || "https://api.github.com/repos/Urmomnumber1/feishin/releases";
+const FIRST_STAGED = process.env.SOUR_FIRST_STAGED || "0.16.0";
+const WEB_CHECK_MS = Number(process.env.SOUR_WEB_CHECK_MS) || 5 * 60 * 1000;
+const verParts = (v) => (String(v).match(/\d+/g) || []).map(Number);
+const verNewer = (a, b) => { const x = verParts(a), y = verParts(b); for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0); return false; };
+// Saturday where the admins are: the time zone of the admin who was here last (minutes behind UTC)
+const groupTz = () => {
+  const a = Object.values(profiles).filter((x) => isAdmin(x) && Number.isFinite(x.tz)).sort((x, y) => (y.lastSeen || 0) - (x.lastSeen || 0))[0];
+  return a ? a.tz : 0;
+};
+function opensForEveryone(publishedAt, tz = groupTz()) {
+  const t = new Date(publishedAt).getTime();
+  if (!t) return 0;
+  const local = new Date(t - tz * 60000); // their clock, read through the UTC fields
+  const day = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate());
+  return day + ((6 - new Date(day).getUTCDay() + 7) % 7) * 86400000 + tz * 60000;
+}
+const releaseOpen = (rel, now = Date.now()) => !verNewer(rel.tag_name, FIRST_STAGED) || now >= opensForEveryone(rel.published_at);
+let webRings = { newest: null, everyone: null, at: 0 }; // { tag, publishedAt, opensAt } of each, for /api/updates
+const webVersion = (dir) => { try { return fs.readFileSync(path.join(dir, ".version"), "utf8").split(":")[0]; } catch { return ""; } };
 let webChecking = false;
 let webCheckedAt = 0;
+// one release's web build into a folder (nothing to do when it's the one already there)
+async function fetchWebBuild(rel, dir) {
+  const asset = (rel.assets || []).find((a) => a.name === "sour-web.tar.gz");
+  if (!asset) return false;
+  const mark = path.join(dir, ".version");
+  const stamp = `${rel.tag_name}:${asset.id}`; // a re-uploaded web build counts as new
+  if (fs.existsSync(mark) && fs.readFileSync(mark, "utf8") === stamp) return true;
+  const tmp = dir + ".new";
+  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.mkdirSync(tmp, { recursive: true });
+  const tgz = path.join(tmp, "web.tgz");
+  const dl = await fetch(asset.browser_download_url, { signal: AbortSignal.timeout(5 * 60 * 1000) });
+  if (!dl.ok) return false;
+  fs.writeFileSync(tgz, Buffer.from(await dl.arrayBuffer()));
+  const t = await run("tar", ["-xzf", tgz, "-C", tmp], { timeout: 120000 });
+  fs.rmSync(tgz, { force: true });
+  if (t.code !== 0 || !fs.existsSync(path.join(tmp, "index.html"))) { console.warn("Sour Player web app: unpacking failed", t.err || t.out || ""); return false; }
+  fs.writeFileSync(path.join(tmp, ".version"), stamp);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.renameSync(tmp, dir);
+  console.log(`Sour Player web app${dir === WEB_EARLY_DIR ? " (early, for admins)" : ""} updated to`, rel.tag_name);
+  return true;
+}
 async function updateWebApp() {
   if (webChecking) return;
   webChecking = true;
   try {
-    const r = await fetch("https://api.github.com/repos/Urmomnumber1/feishin/releases/latest", { headers: { "user-agent": "hermes-music" }, signal: AbortSignal.timeout(15000) });
-    const rel = await r.json();
-    const asset = (rel.assets || []).find((a) => a.name === "sour-web.tar.gz");
-    if (!asset) return;
-    const mark = path.join(WEB_DIR, ".version");
-    const stamp = `${rel.tag_name}:${asset.id}`; // a re-uploaded web build counts as new
-    if (fs.existsSync(mark) && fs.readFileSync(mark, "utf8") === stamp) return;
-    const tmp = WEB_DIR + ".new";
-    fs.rmSync(tmp, { recursive: true, force: true });
-    fs.mkdirSync(tmp, { recursive: true });
-    const tgz = path.join(tmp, "web.tgz");
-    const dl = await fetch(asset.browser_download_url, { signal: AbortSignal.timeout(5 * 60 * 1000) });
-    if (!dl.ok) return;
-    fs.writeFileSync(tgz, Buffer.from(await dl.arrayBuffer()));
-    const t = await run("tar", ["-xzf", tgz, "-C", tmp], { timeout: 120000 });
-    fs.rmSync(tgz, { force: true });
-    if (t.code !== 0 || !fs.existsSync(path.join(tmp, "index.html"))) { console.warn("Sour Player web app: unpacking failed", t.err || t.out || ""); return; }
-    fs.writeFileSync(path.join(tmp, ".version"), stamp);
-    fs.rmSync(WEB_DIR, { recursive: true, force: true });
-    fs.renameSync(tmp, WEB_DIR);
-    console.log("Sour Player web app updated to", rel.tag_name);
+    const r = await fetch(`${RELEASES_URL}?per_page=20`, { headers: { "user-agent": "hermes-music" }, signal: AbortSignal.timeout(15000) });
+    const list = await r.json();
+    if (!Array.isArray(list)) return;
+    // the computer releases (v0.16.1...) carry the web build; newest first
+    const web = list.filter((x) => /^v\d/.test(x.tag_name || "") && !x.draft && !x.prerelease && (x.assets || []).some((a) => a.name === "sour-web.tar.gz"))
+      .sort((a, b) => (verNewer(a.tag_name, b.tag_name) ? -1 : verNewer(b.tag_name, a.tag_name) ? 1 : 0));
+    if (!web.length) return;
+    const newest = web[0];
+    const open = web.find((x) => releaseOpen(x)) || web[web.length - 1];
+    const ring = (x) => ({ tag: x.tag_name, version: x.tag_name.replace(/^v/, ""), publishedAt: new Date(x.published_at).getTime() || 0, opensAt: verNewer(x.tag_name, FIRST_STAGED) ? opensForEveryone(x.published_at) : 0 });
+    webRings = { newest: ring(newest), everyone: ring(open), at: Date.now() };
+    // everyone's copy never goes back to an older release (a Hermes Music updated in the middle of a week)
+    const have = webVersion(WEB_DIR);
+    if (!have || !verNewer(have, open.tag_name)) await fetchWebBuild(open, WEB_DIR);
+    if (newest !== open && verNewer(newest.tag_name, webVersion(WEB_DIR))) await fetchWebBuild(newest, WEB_EARLY_DIR);
+    else if (fs.existsSync(WEB_EARLY_DIR)) fs.rmSync(WEB_EARLY_DIR, { recursive: true, force: true });
   } catch (e) {
     console.warn("Sour Player web app update failed:", e.message);
   } finally {
@@ -4467,10 +4735,12 @@ const WEB_TYPES = { ".html": "text/html; charset=utf-8", ".js": "text/javascript
 // name under the icon
 const APPLE_META = '<link rel="apple-touch-icon" href="assets/512x512.png"><meta name="apple-mobile-web-app-capable" content="yes">'
   + '<meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-status-bar-style" content="black"><meta name="apple-mobile-web-app-title" content="Sour Player">';
-function serveWebApp(p, res) {
+function serveWebApp(p, res, req) {
   if (p === "/app") { res.writeHead(302, { location: "/app/" }); return res.end(); }
+  // (3.17) admins (their Sour Player sets the sour_early cookie) get the early copy while there is one
+  const early = fs.existsSync(path.join(WEB_EARLY_DIR, "index.html")) && /(?:^|;\s*)sour_early=1(?:;|$)/.test((req && req.headers.cookie) || "");
   // a newer Sour Player build is picked up within minutes of someone opening the app
-  if (Date.now() - webCheckedAt > 5 * 60 * 1000) { webCheckedAt = Date.now(); updateWebApp(); }
+  if (Date.now() - webCheckedAt > WEB_CHECK_MS) { webCheckedAt = Date.now(); updateWebApp(); }
   if (!fs.existsSync(path.join(WEB_DIR, "index.html"))) {
     updateWebApp();
     res.writeHead(503, { "content-type": "text/html; charset=utf-8", "retry-after": "60" });
@@ -4482,12 +4752,15 @@ function serveWebApp(p, res) {
   if (rel && rel.endsWith("/")) { res.writeHead(302, { location: "/app/" }); return res.end(); }
   if (!rel) rel = "index.html";
   if (rel === "settings.js") { res.writeHead(200, { "content-type": "text/javascript", "cache-control": "no-cache" }); return res.end("// set by Hermes Music\n"); }
-  const root = path.resolve(WEB_DIR);
-  const file = path.resolve(root, rel);
-  if (!file.startsWith(root + path.sep) || !fs.existsSync(file) || fs.statSync(file).isDirectory()) {
+  // the page itself from the copy this person gets; its files from whichever copy has them (their names
+  // carry a fingerprint of their content, so the two copies never disagree about a file)
+  const roots = (early ? [WEB_EARLY_DIR, WEB_DIR] : [WEB_DIR, WEB_EARLY_DIR]).map((d) => path.resolve(d));
+  const usable = (root) => { const f = path.resolve(root, rel); return f.startsWith(root + path.sep) && fs.existsSync(f) && !fs.statSync(f).isDirectory() ? f : null; };
+  const file = rel === "index.html" ? usable(roots[0]) : usable(roots[0]) || usable(roots[1]);
+  if (!file) {
     // the app's own pages (#/...) all start from index.html
     if (path.extname(rel)) { res.writeHead(404); return res.end(); }
-    return serveWebApp("/app/", res);
+    return serveWebApp("/app/", res, req);
   }
   const type = WEB_TYPES[path.extname(file).toLowerCase()] || "application/octet-stream";
   // the manifest sits in assets/, so its "./" start address meant /app/assets/ (a white screen on the
@@ -4503,12 +4776,76 @@ function serveWebApp(p, res) {
   }
   if (file.endsWith("index.html")) {
     const html = fs.readFileSync(file, "utf8").replace("</head>", APPLE_META + "</head>");
-    res.writeHead(200, { "content-type": type, "cache-control": "no-cache" });
+    res.writeHead(200, { "content-type": type, "cache-control": "no-cache", vary: "cookie" });
     return res.end(html);
   }
   res.writeHead(200, { "content-type": type, "cache-control": /assets\//.test(file.replace(/\\/g, "/")) ? "public, max-age=31536000, immutable" : "no-cache" });
   fs.createReadStream(file).pipe(res);
 }
+// ---- (3.17) The admins' test log. Each Sour Player release can carry a list of things to check, written
+// into its release notes as a hidden block (<!-- test-log [ { "area": "...", "text": "..." } ] -->). Admins get
+// updates before everyone else, see the list in Sour Player (Sour > Test log), and mark each thing as working
+// or broken; the marks are kept here so all admins see them. A "broken" with a note also lands in the bug
+// reports.
+const TESTLOG = "/data/testlog.json";
+let testMarks = readJson(TESTLOG, {}); // version -> item -> profile -> { ok, note, at, name, on, reported }
+const testLists = new Map(); // version -> { at, items, publishedAt }
+const testId = (text) => "t" + crypto.createHash("sha1").update(String(text)).digest("hex").slice(0, 8);
+async function testList(version) {
+  const had = testLists.get(version);
+  if (had && Date.now() - had.at < 10 * 60000) return had;
+  let out = { at: Date.now(), items: [], publishedAt: 0 };
+  try {
+    const r = await fetch(`${RELEASES_URL}/tags/v${encodeURIComponent(version)}`, { headers: { "user-agent": "hermes-music" }, signal: AbortSignal.timeout(15000) });
+    const rel = r.ok ? await r.json() : null;
+    const m = rel && /<!--\s*test-log\s*([\s\S]*?)-->/.exec(String(rel.body || ""));
+    const list = m ? JSON.parse(m[1]) : [];
+    out = { at: Date.now(), publishedAt: rel ? new Date(rel.published_at).getTime() || 0 : 0,
+      items: (Array.isArray(list) ? list : []).slice(0, 80).map((x) => ({ id: /^[\w-]{1,24}$/.test(String(x.id || "")) ? String(x.id) : testId(x.text), area: clean1(x.area, 40), text: clean1(x.text, 300),
+        on: Array.isArray(x.on) ? x.on.map((o) => clean1(o, 12)).slice(0, 5) : [] })).filter((x) => x.text) };
+  } catch (e) {
+    if (had) return had; // GitHub didn't answer: the list from before
+    console.warn("test log:", e.message);
+  }
+  testLists.set(version, out);
+  return out;
+}
+async function testLogRoute(req, res, p, get, post, url) {
+  const b = post ? await readBody(req, 20000) : {};
+  const who = ownProfile(String((post ? b.profile : url.searchParams.get("profile")) || ""), post ? b.key : url.searchParams.get("key"));
+  if (!who || !isAdmin(who)) return send(res, 403, { error: "the test log is for admins" });
+  const version = String((post ? b.version : url.searchParams.get("version")) || "");
+  if (!/^\d+\.\d+\.\d+$/.test(version)) return send(res, 400, { error: "which version?" });
+  const list = await testList(version);
+  if (post && b.item !== undefined) { // { item, ok: true | false | null (not checked after all), note, on }; without item: just the list
+    const item = list.items.find((x) => x.id === String(b.item || ""));
+    if (!item) return send(res, 404, { error: "that isn't on this version's list" });
+    const marks = ((testMarks[version] ??= {})[item.id] ??= {});
+    const before = marks[who.id];
+    if (b.ok === null || b.ok === undefined) delete marks[who.id];
+    else {
+      const note = clean1(b.note, 500).trim();
+      marks[who.id] = { ok: !!b.ok, note, at: Date.now(), name: who.name, on: clean1(b.on, 20), reported: !!(before && before.reported) };
+      // broken, with what went wrong: a bug report too (once)
+      if (!b.ok && note && !marks[who.id].reported) {
+        feedback.unshift({ id: sid(), kind: "bug", text: `Test log ${version}: ${item.text} - ${note}`, by: who.id, byName: who.name, at: Date.now(), version, platform: clean1(b.on, 40), done: false });
+        feedback = feedback.slice(0, 500);
+        fs.writeFileSync(FEEDBACK, JSON.stringify(feedback));
+        marks[who.id].reported = true;
+      }
+    }
+    // only the last few versions are kept
+    const kept = Object.keys(testMarks).sort((x, y) => (verNewer(x, y) ? -1 : 1)).slice(0, 12);
+    for (const v of Object.keys(testMarks)) if (!kept.includes(v)) delete testMarks[v];
+    fs.writeFileSync(TESTLOG, JSON.stringify(testMarks));
+  }
+  const marks = {};
+  for (const [id, by] of Object.entries(testMarks[version] || {})) marks[id] = Object.entries(by).map(([profile, x]) => ({ profile, name: x.name, ok: x.ok, note: x.note, at: x.at, on: x.on }));
+  const staged = verNewer(version, FIRST_STAGED);
+  const opensAt = staged && list.publishedAt ? opensForEveryone(list.publishedAt) : 0;
+  return send(res, 200, { version, items: list.items, marks, opensAt, early: !!opensAt && Date.now() < opensAt });
+}
+
 let androidApk = null; // newest Android release, looked up at most every 30 minutes
 const ONLINE_MS = 45000;
 const cleanColor = (v) => (typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v) ? v.toLowerCase() : null);
@@ -4832,6 +5169,7 @@ function publicProfile(p, self = false) {
     on: online && !priv.hideListening ? p.on || "computer" : null,
     speed: online && !priv.hideListening ? p.speed || 1 : 1, karaoke: online && !priv.hideListening ? !!p.karaoke : false,
     video: online && !priv.hideListening ? !!p.video : false,
+    version: online && !priv.hideListening ? p.version || null : null, vshift: online && !priv.hideListening ? p.vshift || 0 : 0,
     position: online && !priv.hideListening ? p.position || 0 : 0, positionAt: p.positionAt || 0,
     group: online && !priv.hideListening ? p.group || null : null,
     // listen along: who they follow, who follows them, and what they played lately
@@ -5374,13 +5712,16 @@ async function sourRoute(req, res, p, get, post, url) {
       if (b.playing) pt.max = Math.max(pt.max, Math.min(pos, (pt.max || 0) + 60)); // no jumping to the end for a point
     }
     const speed = Math.min(2, Math.max(0.5, Number(b.speed) || 1));
+    // (3.17) the version of the song they hear, and how far their player's own version sits from the original
+    const hearing = typeof b.version === "string" && VERSION_ID.test(b.version) ? b.version : null;
     me.devices[dev] = { listening: song, playing: !!b.playing, position: Number(b.position) || 0, at: now, on: b.on === "phone" ? "phone" : "computer",
-      speed, karaoke: !!b.karaoke, video: !!b.video, pt };
+      speed, karaoke: !!b.karaoke, video: !!b.video, pt, version: hearing, vshift: Math.max(-600, Math.min(600, Number(b.vshift) || 0)) };
     for (const [k, d] of Object.entries(me.devices)) if (!d || now - (d.at || 0) > ONLINE_MS) delete me.devices[k];
     const devs = Object.values(me.devices).sort((x, y) => y.at - x.at);
     const best = devs.find((d) => d.playing && d.listening) || devs.find((d) => d.listening) || me.devices[dev];
     if (!isInvisible(me)) me.lastOfflineSeen = now;
     me.lastSeen = now;
+    if (Number.isFinite(Number(b.tz))) me.tz = Math.max(-840, Math.min(840, Number(b.tz))); // minutes behind UTC (3.17: the day updates open)
     me.privateSession = !!b.private; // private session: friends see nothing playing
     me.listening = me.privateSession ? null : best.listening;
     me.playing = best.playing;
@@ -5388,6 +5729,8 @@ async function sourRoute(req, res, p, get, post, url) {
     me.speed = best.speed || 1; // slowed / normal / nightcore, so listen along matches it
     me.karaoke = !!best.karaoke;
     me.video = !!best.video; // watching the music video (listen along opens it too)
+    me.version = best.version || null; // (3.17) listen along plays the same version
+    me.vshift = best.vshift || 0;
     me.position = best.position;
     me.positionAt = best.at;
     me.group = b.group && typeof b.group.code === "string" ? { code: clean1(b.group.code, 5), name: clean1(b.group.name, 60) } : null;
@@ -6283,7 +6626,8 @@ http.createServer(async (req, res) => {
   const isSour = SOUR_PREFIXES.some((x) => p.startsWith(x)) || SOUR_ROUTES.includes(p);
   if (p.startsWith("/api/group/") || p.startsWith("/api/videos") || p.startsWith("/api/lyrics") || p.startsWith("/api/requests") || p.startsWith("/api/library") || p.startsWith("/api/duplicates") || isSour
     || ["/api/status", "/api/now", "/api/bump", "/api/storage", "/api/song-dna", "/api/announcement", "/api/liner-notes"].includes(p) || p.startsWith("/api/admin/")
-    || p.startsWith("/api/discord-bot/") || p.startsWith("/api/podcasts/") || p.startsWith("/api/radio/") || p.startsWith("/api/versions")) { // used by Sour Player (the custom Feishin)
+    || p.startsWith("/api/discord-bot/") || p.startsWith("/api/podcasts/") || p.startsWith("/api/radio/") || p.startsWith("/api/versions")
+    || p === "/api/testlog" || p === "/api/updates") { // used by Sour Player (the custom Feishin)
     res.setHeader("access-control-allow-origin", "*");
     if (req.method === "OPTIONS") {
       // the Discord bot's uploads say who sends them (and the file's name) in headers
@@ -6296,11 +6640,17 @@ http.createServer(async (req, res) => {
   if (p.startsWith("/api/podcasts/")) return podcastRoute(req, res, p, url);
   if (p.startsWith("/api/radio/")) return radioRoute(req, res, p, url);
   if (p.startsWith("/api/versions")) return versionsRoute(req, res, p, get, post, url);
+  if (p === "/api/testlog") return testLogRoute(req, res, p, get, post, url);
+  if (get && p === "/api/updates") { // (3.17) what's out, and when it opens for everyone (Sour Player shows it to admins)
+    if (Date.now() - webRings.at > 30 * 60000) updateWebApp();
+    return send(res, 200, { newest: webRings.newest, everyone: webRings.everyone, firstStaged: FIRST_STAGED });
+  }
   if (isSour) return sourRoute(req, res, p, get, post, url);
 
   if (get && p === "/") return send(res, 200, PAGE, "text/html");
 
-  if (get && (p === "/app" || p.startsWith("/app/"))) return serveWebApp(p, res);
+  if (get && (p === "/watch" || p.startsWith("/watch/"))) return watchRoute(req, res, p, url);
+  if (get && (p === "/app" || p.startsWith("/app/"))) return serveWebApp(p, res, req);
   // ---- Sour Player TV ----
   if (get && p === "/tv") { res.writeHead(302, { location: "/tv/" }); return res.end(); }
   if (get && p === "/tv/") return send(res, 200, TV_PAGE, "text/html", { "cache-control": "no-cache" });
@@ -6397,12 +6747,12 @@ tick();setInterval(tick,5000)</script>`, "text/html; charset=utf-8");
     if (p === "/api/admin/log") return send(res, 200, adminLogList.slice(0, 200));
     if (p === "/api/admin/backup") { // everything Sour Player keeps, as one file
       const pack = {};
-      for (const f of [PROFILES, SOCIAL, SHOP_FILE, ROOMS, CFG, "/data/karaoke.json", "/data/lyric-offsets.json", "/data/video-misses.json", "/data/versions.json", "/data/version-plays.json", "/data/not-versions.json", "/data/karaoke-off.json", "/data/version-favs.json"]) { try { pack[f] = fs.readFileSync(f, "utf8"); } catch {} }
+      for (const f of [PROFILES, SOCIAL, SHOP_FILE, ROOMS, CFG, "/data/karaoke.json", "/data/lyric-offsets.json", "/data/video-misses.json", "/data/versions.json", "/data/version-plays.json", "/data/not-versions.json", "/data/karaoke-off.json", "/data/version-favs.json", "/data/testlog.json"]) { try { pack[f] = fs.readFileSync(f, "utf8"); } catch {} }
       return send(res, 200, { made: new Date().toISOString(), version: process.env.HM_VERSION || null, files: pack }, "application/json", { "content-disposition": `attachment; filename="hermes-backup-${dayKey()}.json"` });
     }
     if (p === "/api/admin/restore") { // put a backup back (Hermes restarts to load it)
       const files = b.backup && b.backup.files;
-      const allowed = [PROFILES, SOCIAL, SHOP_FILE, ROOMS, CFG, "/data/karaoke.json", "/data/lyric-offsets.json", "/data/video-misses.json", "/data/versions.json", "/data/version-plays.json", "/data/not-versions.json", "/data/karaoke-off.json", "/data/version-favs.json"];
+      const allowed = [PROFILES, SOCIAL, SHOP_FILE, ROOMS, CFG, "/data/karaoke.json", "/data/lyric-offsets.json", "/data/video-misses.json", "/data/versions.json", "/data/version-plays.json", "/data/not-versions.json", "/data/karaoke-off.json", "/data/version-favs.json", "/data/testlog.json"];
       if (!files || typeof files !== "object") return send(res, 400, { error: "that isn't a Hermes Music backup" });
       let n = 0;
       for (const [f, text] of Object.entries(files)) { if (!allowed.includes(f) || typeof text !== "string") continue; try { JSON.parse(text); fs.writeFileSync(f, text); n++; } catch {} }
