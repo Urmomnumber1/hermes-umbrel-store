@@ -195,7 +195,8 @@ const busy = () => (st.music && !st.paused) || st.ambience.size > 0 || st.sfx.si
 const idle = () => !busy() && idleSince && Date.now() - idleSince > 1000;
 
 // ---------- the music queue ----------
-function startSong(i, from = 0) {
+// again: the same song once more (a seek, a restart, loop one) - not a new song for anyone
+function startSong(i, from = 0, again = false) {
   if (st.music) st.music.kill();
   st.music = null;
   st.index = i;
@@ -205,11 +206,12 @@ function startSong(i, from = 0) {
   st.paused = false;
   wake();
   changed();
+  if (!again) send({ type: "song", item: view(item) }); // (3.17.1) Hermes Music may post its music video's link
 }
 
 function advance(dir, ended = false) {
   if (!st.queue.length) return startSong(-1);
-  if (ended && st.loop === "one") return startSong(st.index);
+  if (ended && st.loop === "one") return startSong(st.index, 0, true);
   let i;
   if (dir > 0 && st.shuffle && st.queue.length > 1) {
     const left = st.queue.map((_, n) => n).filter((n) => n !== st.index && !st.history.includes(n));
@@ -257,6 +259,7 @@ let voiceLib = null;
 // ---------- (3.17) ears ----------
 const ears = { on: false, cfg: null, proc: null, ready: false, seq: 0, waiting: new Map(), buf: "", streams: new Map(), restarts: 0, watched: new WeakSet() };
 const replies = new Map(); // typed commands waiting for their answer: reply id -> { interaction | message, at }
+const fakePosts = []; // the pretend bot: what it wrote into the voice channel's chat
 
 function earsLine(line) {
   let m;
@@ -338,8 +341,12 @@ async function earsSaid(who, pcm) {
   if (armed) ears.armed = null;
   const heard = await earsHear(pcm, armed);
   if (!heard || !heard.wake || !ears.on) return;
-  const text = String(heard.text || "");
-  send({ type: "heard", user: who, text: armed && !/sour box/.test(text) ? "sour box " + text : text });
+  // "Sour Box" was heard by the first pass (or answered with the chime a moment ago): this is for the bot,
+  // also when the second pass lost those words. Its other readings go along (3.17.1).
+  const mark = (t) => (/sour box/.test(t) ? t : "sour box " + t);
+  const text = mark(String(heard.text || ""));
+  const alts = (Array.isArray(heard.alts) ? heard.alts : []).map((t) => mark(String(t || ""))).filter((t) => t !== text).slice(0, 10);
+  send({ type: "heard", user: who, text, alts });
 }
 // each person in the channel, one sentence at a time (a new one starts when they speak again)
 function earsWatch(connection, guildId) {
@@ -462,6 +469,7 @@ function state() {
       queue: st.queue.map(view),
     },
     ears: { on: ears.on, ready: FAKE ? ears.on : ears.ready },
+    ...(FAKE ? { posts: fakePosts.slice(-20) } : {}),
     ambience: [...st.ambience.values()].filter((a) => !a.stopping).map((a) => ({ ...view(a.item), volume: a.gain })),
     sfx: [...st.sfx].filter((s) => !s.stopping).map((s) => view(s.item)),
     volumes: st.volumes,
@@ -753,11 +761,11 @@ const commands = {
   },
   skip: () => { advance(+1); return null; },
   previous: () => {
-    if (st.music && st.music.position > 3) startSong(st.index);
+    if (st.music && st.music.position > 3) startSong(st.index, 0, true);
     else advance(-1);
     return null;
   },
-  seek: ({ seconds }) => { if (st.index >= 0) startSong(st.index, clamp(seconds, 0, 24 * 3600)); return null; },
+  seek: ({ seconds }) => { if (st.index >= 0) startSong(st.index, clamp(seconds, 0, 24 * 3600), true); return null; },
   stopMusic: () => {
     if (st.music) { st.music.stopping = true; st.music.step = 1 / 15; const m = st.music; setTimeout(() => m.kill(), 600); }
     st.music = null;
@@ -846,6 +854,19 @@ const commands = {
     } catch {}
     return null;
   },
+  // (3.17.1) a message into the chat of the voice channel the bot is in (a song's music video link)
+  post: async ({ text }) => {
+    const msg = String(text || "").slice(0, 800);
+    if (!msg || !voice) return { sent: false };
+    if (FAKE) { fakePosts.push(msg); if (fakePosts.length > 40) fakePosts.shift(); changed(); return { sent: true }; }
+    if (!client) return { sent: false };
+    const g = client.guilds.cache.get(voice.guildId);
+    const c = g && g.channels.cache.get(voice.channelId);
+    if (!c || !c.isTextBased || !c.isTextBased()) throw new Error("that voice channel has no chat to write in");
+    try { await c.send({ content: msg, allowedMentions: { parse: [] } }); }
+    catch (e) { throw new Error(/permission|access/i.test(String(e && e.message)) ? `the bot may not write in the chat of ${c.name}: give it Send Messages and Embed Links there` : String((e && e.message) || e)); }
+    return { sent: true };
+  },
   chime: ({ arm }) => {
     if (arm) ears.armed = { id: String(arm), until: Date.now() + 9000 };
     if (!voice) return null;
@@ -856,9 +877,9 @@ const commands = {
     return null;
   },
   // tests: as if someone in the voice channel had said this (no speech recognition involved)
-  hear: ({ text, name }) => {
+  hear: ({ text, name, alts }) => {
     if (!ears.on) throw new Error("the ears are off");
-    send({ type: "heard", user: { id: "test", name: String(name || "Tester") }, text: String(text || "") });
+    send({ type: "heard", user: { id: "test", name: String(name || "Tester") }, text: String(text || ""), alts: Array.isArray(alts) ? alts.map(String) : [] });
     return null;
   },
   // tests (on a machine with the real helper): a sound file through the same path Discord's voices take,

@@ -586,6 +586,7 @@ async function startBot() {
       return;
     }
     if (m.type === "heard") { botHeard(m).catch((e) => console.warn("Hey Sour Box:", e.message)); return; }
+    if (m.type === "song") { botSongStarted(m.item).catch(() => {}); return; }
     if (m.type === "log") { console.log("Discord bot:", m.text); return; }
     if (m.state) bot.state = m.state;
     const w = bot.pending.get(m.id);
@@ -629,7 +630,7 @@ function botCall(cmd, args = {}, timeout = 30000) {
 function botInvite() {
   let id = bot.state && bot.state.user && /^\d{15,22}$/.test(bot.state.user.id) ? bot.state.user.id : "";
   if (!id) { try { const s = Buffer.from(String(config.discordToken || "").split(".")[0], "base64").toString(); if (/^\d{15,22}$/.test(s)) id = s; } catch {} }
-  return id ? `https://discord.com/oauth2/authorize?client_id=${id}&scope=bot&permissions=3146752` : "";
+  return id ? `https://discord.com/oauth2/authorize?client_id=${id}&scope=bot&permissions=3165184` : "";
 }
 function botSummary() {
   const s = bot.state;
@@ -640,16 +641,75 @@ const botStateView = () => {
   const s = bot.state || {};
   return { ...botSummary(), fake: !!s.fake, guilds: s.guilds || [], voice: s.voice || null,
     music: s.music || { current: null, index: -1, position: 0, paused: true, loop: "off", shuffle: false, queue: [] },
-    ambience: s.ambience || [], sfx: s.sfx || [], volumes: s.volumes || { master: 0.9, music: 0.7, ambience: 0.5, sfx: 0.9 }, ears: earsView() };
+    ambience: s.ambience || [], sfx: s.sfx || [], volumes: s.volumes || { master: 0.9, music: 0.7, ambience: 0.5, sfx: 0.9 }, ears: earsView(),
+    links: { on: config.botLinks !== false, note: botLinks.note }, ...(s.posts ? { posts: s.posts } : {}) };
 };
 const botItemView = (it) => ({ id: it.id, kind: it.kind, title: it.title, artist: it.artist || "", album: it.album || "", duration: it.duration || 0,
   status: it.status || "ready", note: it.note || "", by: it.by || "", added: it.added || 0 });
 const botLibView = () => ({ items: botLib.items.map(botItemView),
   playlists: botLib.playlists.map((pl) => ({ id: pl.id, name: pl.name, by: pl.by || "", items: pl.items.filter((id) => botLib.items.some((x) => x.id === id)) })) });
-// library ids -> what the bot plays (with the file)
-const botResolve = (ids) => (Array.isArray(ids) ? ids : []).slice(0, 500).map((id) => botLib.items.find((x) => x.id === id))
-  .filter((it) => it && it.status === "ready" && it.file)
-  .map((it) => ({ id: it.id, title: it.title, artist: it.artist || "", duration: it.duration || 0, file: path.join(BOT_FILES, it.file) }));
+// (3.17.1) songs of the music library, played from where they are (no copy): "lib-" and a short hash of the file
+const botLibId = (file) => "lib-" + crypto.createHash("sha1").update(file).digest("hex").slice(0, 12);
+let botLibFiles = null, botLibFilesN = -1;
+function botLibFile(id) {
+  const n = Object.keys(libCache).length;
+  if (!botLibFiles || botLibFilesN !== n || !botLibFiles.has(id)) { botLibFiles = new Map(Object.keys(libCache).map((f) => [botLibId(f), f])); botLibFilesN = n; }
+  const f = botLibFiles.get(id);
+  return f && fs.existsSync(f) ? f : null;
+}
+const botLibTrack = (file, s = {}) => {
+  const c = libCache[file] || {};
+  return { id: botLibId(file), title: clean1(s.title, 200) || c.t || path.basename(file, path.extname(file)), artist: clean1(s.artist, 200) || c.a || c.aa || "",
+    duration: Math.round(Number(s.duration) || 0), file };
+};
+// ids -> what the bot plays (with the file): the bot's own sounds, and songs of the music library ("lib-...")
+const botResolve = (ids) => (Array.isArray(ids) ? ids : []).slice(0, 500).map((id) => {
+  if (String(id).startsWith("lib-")) { const f = botLibFile(String(id)); return f ? botLibTrack(f) : null; }
+  const it = botLib.items.find((x) => x.id === id);
+  return it && it.status === "ready" && it.file ? { id: it.id, title: it.title, artist: it.artist || "", duration: it.duration || 0, file: path.join(BOT_FILES, it.file) } : null;
+}).filter(Boolean);
+// songs the way Sour Player names them (path, artist, title) -> what the bot plays
+function botSongs(songs) {
+  const out = [];
+  for (const s of (Array.isArray(songs) ? songs : []).slice(0, 1000)) {
+    let file;
+    try { file = songFile({ file: s && s.path, artist: s && s.artist, title: s && s.title, album: s && s.album }); } catch { continue; }
+    out.push(botLibTrack(file, s));
+  }
+  if (!out.length) throw new Error("couldn't find those songs' files in the library");
+  return out;
+}
+// the length of the first few songs that came without one (the bar under the song needs it)
+async function botLengths(items) {
+  let n = 0;
+  for (const it of items) if (!it.duration && n++ < 12) it.duration = await botDuration(it.file).catch(() => 0);
+  return items;
+}
+// the Discord Bot tab's search of the music library: every word typed is in the song (title, artist or album)
+function botSearchLibrary(q) {
+  const want = earsTokens(q).slice(0, 12);
+  if (!want.length) return [];
+  const out = [], seen = new Set();
+  for (const [file, c] of Object.entries(libCache)) {
+    if (!c || !c.t || c.karaoke) continue;
+    const album = c.al || path.basename(path.dirname(file)); // no album tag: the folder it sits in
+    const t = earsTokens(c.t), a = earsTokens(c.a || c.aa), al = earsTokens(album);
+    const text = ` ${t.join(" ")} | ${a.join(" ")} | ${al.join(" ")}`;
+    let s = 0;
+    for (const w of want) {
+      const one = t.includes(w) ? 3 : a.includes(w) ? 2 : al.includes(w) ? 1 : text.includes(" " + w) ? 0.6 : text.includes(w) ? 0.3 : 0;
+      if (!one) { s = 0; break; }
+      s += one;
+    }
+    if (!s) continue;
+    if (t.join(" ") === want.join(" ")) s += 5;
+    const same = `${t.join(" ")}|${a.join(" ")}|${al.join(" ")}`;
+    if (seen.has(same)) continue;
+    seen.add(same);
+    out.push({ s, id: botLibId(file), title: c.t, artist: c.a || c.aa || "", album });
+  }
+  return out.sort((x, y) => y.s - x.s || x.title.localeCompare(y.title)).slice(0, 80).map(({ s, ...x }) => x);
+}
 async function botDuration(file) {
   const r = await run("ffprobe", ["-v", "quiet", "-print_format", "json", "-show_format", file], { timeout: 30000 });
   try { return Math.round((Number(JSON.parse(r.out).format.duration) || 0) * 10) / 10; } catch { return 0; }
@@ -856,15 +916,37 @@ async function ensureEars() {
 }
 // words as they are compared: lower case, no accents, any alphabet (typed commands can be in any)
 const earsTokens = (s) => deaccent(String(s || "")).toLowerCase().replace(/&/g, " and ").replace(/[^\p{L}\p{N}' ]+/gu, " ").split(/\s+/).filter(Boolean);
-const EARS_COMMANDS = ["hey", "sour", "box", "play", "put", "on", "queue", "add", "pause", "resume", "continue", "skip", "next", "previous", "back", "go", "stop", "by", "the", "a", "song", "some", "music", "please"];
-// the words the recognizer may hear after "Sour Box": the commands, and every word of the songs' titles and
-// artists that it can know (plain a-z words; it is an English recognizer)
-function earsWords() {
-  const words = new Set(EARS_COMMANDS);
-  const add = (s) => { for (const w of earsTokens(s)) if (/^[a-z']{1,24}$/.test(w)) words.add(w); };
-  for (const it of botLib.items) if (it.kind === "music" && it.status === "ready") { add(it.title); add(it.artist); }
-  for (const c of Object.values(libCache)) { if (words.size > 30000) break; add(c.t); add(c.a); }
-  return [...words];
+// (3.17.1) words the recognizer mixes up with a command when they come first: "paws" is "pause"
+const EARS_ALIKE = { paws: "pause", pours: "pause", pores: "pause", pauses: "pause", paused: "pause", "paul's": "pause", pas: "pause", pos: "pause",
+  plays: "play", played: "play", lay: "play", clay: "play", pray: "play", skipped: "skip", skips: "skip", skit: "skip", stopped: "stop", stops: "stop",
+  necks: "next", cue: "queue", cues: "queue", q: "queue", kew: "queue", queued: "queue", queues: "queue", ad: "add", adds: "add", added: "add",
+  resumed: "resume", resumes: "resume", bag: "back", pack: "back" };
+const EARS_WAKE = ["hey sour box", "sour box"];
+const EARS_SIMPLE = ["pause", "resume", "continue", "keep going", "skip", "next", "previous", "back", "go back", "stop", "play", "please"];
+const EARS_VERBS = ["play", "play the song", "play some", "put on", "queue", "add"];
+// What the recognizer may hear after "Sour Box", as whole sentences (3.17.1; it used to get loose words). It
+// learns from them which word follows which, so "play the world revolving" wins over "through world
+// revolving". The commands, and every song with its artist; only plain a-z words (it is an English
+// recognizer).
+function earsPhrases() {
+  const plain = (s) => earsTokens(s).filter((w) => /^[a-z']{1,24}$/.test(w)).join(" ");
+  const out = new Set();
+  for (const w of EARS_WAKE) { out.add(w); for (const c of [...EARS_SIMPLE, ...EARS_VERBS]) out.add(`${w} ${c}`); }
+  for (const c of [...EARS_SIMPLE, ...EARS_VERBS]) out.add(c);
+  let songs = 0;
+  const seen = new Set();
+  const song = (title, artist) => {
+    const t = plain(title), a = plain(artist);
+    if (!t || songs >= 12000 || seen.has(`${t}|${a}`)) return;
+    seen.add(`${t}|${a}`);
+    songs++;
+    out.add(`hey sour box play ${t}`);
+    out.add(a ? `play ${t} by ${a}` : `play ${t}`);
+    out.add(`queue ${t}`);
+  };
+  for (const it of botLib.items) if (it.kind === "music" && it.status === "ready") song(it.title, it.artist);
+  for (const c of Object.values(libCache)) if (c && c.t && !c.karaoke) song(c.t, c.a || c.aa);
+  return [...out];
 }
 // tell the bot (again) how to listen: when it comes online, when the switch changes, when the library grew
 async function earsSync() {
@@ -879,21 +961,23 @@ async function earsSync() {
       return;
     }
     if (!(await ensureEars())) return;
-    const words = EARS_FAKE ? [] : earsWords();
-    const sig = String(words.length);
+    const words = EARS_FAKE ? [] : earsPhrases();
+    const sig = `${words.length}:${crypto.createHash("sha1").update(words.join("\n")).digest("hex").slice(0, 12)}`;
     if (on && EARS.synced === sig) return;
     EARS.words = words.length;
     await botCall("ears", { on: true, python: earsPython(), script: path.join(__dirname, "sour-ears.py"), model: earsModel(), words }, 60000)
       .then(() => { EARS.synced = sig; }, (e) => { EARS.note = e.message; });
   } finally { EARS.busy = false; }
 }
-// "sour box play retry now by nakiso" -> { cmd: "play", query: "retry now", artist: "nakiso" } (null: not for us)
+// "sour box play retry now by nakiso" -> { cmd: "play", said: "retry now by nakiso" } (null: not for us)
 function earsParse(text) {
   const t = earsTokens(text).join(" ");
   const m = /(?:^|\s)sour box\b\s*(.*)$/.exec(t);
   if (!m) return null;
-  const rest = m[1].replace(/^(?:please|can you|could you)\s+/, "").replace(/\s+please$/, "").trim();
+  let rest = m[1].replace(/^(?:please|can you|could you|hey)\s+/, "").replace(/\s+please$/, "").trim();
   if (!rest) return { cmd: "wake" };
+  // the first word is the command, also when it only sounds like one ("paws")
+  rest = rest.replace(/^\S+/, (w) => EARS_ALIKE[w] || w);
   if (/^(?:pause|hold on)\b/.test(rest)) return { cmd: "pause" };
   if (/^(?:resume|continue|keep going|unpause)\b/.test(rest) || rest === "play") return { cmd: "resume" };
   if (/^(?:skip|next)\b/.test(rest)) return { cmd: "skip" };
@@ -901,26 +985,87 @@ function earsParse(text) {
   if (/^stop\b/.test(rest)) return { cmd: "stop" };
   const p = /^(play|put on|queue|add)\s+(.+)$/.exec(rest);
   if (!p) return { cmd: "unknown", rest };
-  let query = p[2].replace(/^(?:the song|a song called|some|me)\s+/, "").trim();
-  let artist = "";
-  const by = /^(.+?)\s+by\s+(.+)$/.exec(query);
-  if (by) { query = by[1]; artist = by[2]; }
-  return { cmd: "play", query, artist, later: p[1] === "queue" || p[1] === "add" };
+  return { cmd: "play", said: p[2], later: p[1] === "queue" || p[1] === "add" };
 }
-// the song that was meant: the bot's own music first, then the library
+// how a word sounds, roughly (3.17.1): "whirled" and "world" get the same key, and so do "paws" and "pause"
+const soundKeys = new Map();
+const soundKey = (w) => {
+  const had = soundKeys.get(w);
+  if (had !== undefined) return had;
+  let s = String(w).replace(/[^a-z]/g, "");
+  if (s.length >= 3) {
+    s = s.replace(/^(?:kn|gn|pn|wr)/, (x) => x[1]).replace(/^wh/, "w").replace(/^x/, "s")
+      .replace(/ph/g, "f").replace(/ght/g, "t").replace(/gh/g, "").replace(/ck/g, "k").replace(/sch/g, "sk").replace(/tch/g, "ch")
+      .replace(/c(?=[eiy])/g, "s").replace(/c/g, "k").replace(/q/g, "k").replace(/x/g, "ks").replace(/z/g, "s")
+      .replace(/dg(?=[eiy])/g, "j").replace(/d/g, "t").replace(/b/g, "p").replace(/v/g, "f").replace(/y/g, "i");
+    s = (s[0] || "") + s.slice(1).replace(/[aeiouhw]/g, "");
+    s = s.replace(/(.)\1+/g, "$1");
+  }
+  if (soundKeys.size > 60000) soundKeys.clear();
+  soundKeys.set(w, s);
+  return s;
+};
+// a title or an artist as compared words (kept: every command goes through the whole library)
+const earsSongWords = new Map();
+const earsWordsOf = (s) => {
+  let w = earsSongWords.get(s);
+  if (!w) {
+    if (earsSongWords.size > 80000) earsSongWords.clear();
+    const t = earsTokens(s);
+    w = { t, k: t.map(soundKey) };
+    earsSongWords.set(s, w);
+  }
+  return w;
+};
+// how much a word tells about which song is meant (3.17.1): long and rare words a lot, "the" and "in" next
+// to nothing
+const EARS_SMALL = new Set(["the", "a", "an", "of", "in", "on", "to", "and", "for", "it", "is", "at", "my", "me", "i", "you", "by", "oh"]);
+let earsCounts = null, earsCountsN = -1;
+function earsWordCounts() {
+  const n = Object.keys(libCache).length + botLib.items.length;
+  if (earsCounts && earsCountsN === n) return earsCounts;
+  const df = new Map();
+  let songs = 0;
+  const add = (title) => { songs++; for (const w of new Set(earsTokens(title))) df.set(w, (df.get(w) || 0) + 1); };
+  for (const it of botLib.items) if (it.kind === "music" && it.status === "ready") add(it.title);
+  for (const c of Object.values(libCache)) if (c && c.t && !c.karaoke) add(c.t);
+  earsCounts = { df, songs, weights: new Map() };
+  earsCountsN = n;
+  return earsCounts;
+}
+const earsWeight = (w) => {
+  if (EARS_SMALL.has(w)) return 0.15;
+  const { df, songs, weights } = earsWordCounts();
+  let x = weights.get(w);
+  if (x === undefined) {
+    const long = Math.min(1.3, Math.max(0.4, w.length / 6));
+    const rare = songs > 1 ? Math.log((songs + 1) / ((df.get(w) || 1) + 0.5)) / Math.log((songs + 1) / 1.5) : 1;
+    x = long * (0.6 + 0.4 * Math.max(0, Math.min(1, rare)));
+    weights.set(w, x);
+  }
+  return x;
+};
+// the song that was meant: the bot's own music first, then the library. A word that only sounds like the
+// right one counts too, for a little less (3.17.1).
 function earsFind(query, artist) {
-  const q = earsTokens(query), qa = earsTokens(artist);
-  if (!q.length) return null;
+  const q = earsWordsOf(String(query || "")), qa = earsTokens(artist);
+  if (!q.t.length) return null;
+  const qw = q.t.map(earsWeight), qsum = qw.reduce((a, b) => a + b, 0) || 1;
+  const hit = (w, k, words, keys) => (words.includes(w) ? 1 : w.length >= 3 && k.length >= 2 && keys.includes(k) ? 0.8 : 0);
   const score = (title, by) => {
-    const tt = earsTokens(title), ta = earsTokens(by);
-    if (!tt.length) return 0;
-    const all = new Set([...tt, ...ta]);
-    const said = q.filter((w) => all.has(w)).length / q.length; // how much of what was said is in the song
+    const tt = earsWordsOf(String(title || "")), ta = earsWordsOf(String(by || ""));
+    if (!tt.t.length) return 0;
+    const all = tt.t.concat(ta.t), allKeys = tt.k.concat(ta.k);
+    let said = 0;
+    for (let i = 0; i < q.t.length; i++) said += qw[i] * hit(q.t[i], q.k[i], all, allKeys);
+    said /= qsum; // how much of what was said is in the song
     if (said < 0.6) return 0;
-    const covered = tt.filter((w) => q.includes(w)).length / tt.length; // how much of the title was said
+    let covered = 0, whole = 0;
+    for (let i = 0; i < tt.t.length; i++) { const w = earsWeight(tt.t[i]); whole += w; covered += w * hit(tt.t[i], tt.k[i], q.t, q.k); }
+    covered /= whole || 1; // how much of the title was said
     let s = said * 0.55 + covered * 0.45;
-    if (tt.join(" ") === q.join(" ")) s += 0.3; // the title, word for word
-    if (qa.length) s += (qa.filter((w) => ta.includes(w)).length / qa.length) * 0.4 - 0.2;
+    if (tt.t.join(" ") === q.t.join(" ")) s += 0.3; // the title, word for word
+    if (qa.length) s += (qa.filter((w) => ta.t.includes(w)).length / qa.length) * 0.4 - 0.2;
     return s;
   };
   let best = null;
@@ -930,16 +1075,69 @@ function earsFind(query, artist) {
     consider(score(it.title, it.artist) + 0.05, () => ({ id: it.id, title: it.title, artist: it.artist || "", duration: it.duration || 0, file: path.join(BOT_FILES, it.file) }));
   }
   for (const [file, c] of Object.entries(libCache)) {
-    if (!c || !c.t) continue;
-    consider(score(c.t, c.a || c.aa), () => ({ id: "lib-" + crypto.createHash("sha1").update(file).digest("hex").slice(0, 12), title: c.t, artist: c.a || c.aa || "", duration: 0, file }));
+    if (!c || !c.t || c.karaoke) continue;
+    consider(score(c.t, c.a || c.aa), () => ({ id: botLibId(file), title: c.t, artist: c.a || c.aa || "", duration: 0, file }));
   }
-  return best && best.s >= 0.6 ? best.make() : null;
+  return best && best.s >= 0.6 ? { ...best.make(), score: best.s } : null;
+}
+// what was said after "play": a title, or a title "by" an artist (whichever fits a song better)
+function earsFindSaid(said) {
+  const text = String(said || "").replace(/^(?:the song|a song called|song|some|me)\s+/, "").trim();
+  const by = /^(.+?)\s+by\s+(.+)$/.exec(text);
+  const a = by ? earsFind(by[1], by[2]) : null, b = earsFind(text, "");
+  return a && (!b || a.score >= b.score) ? a : b;
+}
+// (3.17.1) nothing that starts with a command: most likely a song was asked for and "play" was lost on the
+// way ("through world revolving"). A song that fits what was said, or the end of it, is taken as "play".
+function earsGuess(rest) {
+  const w = String(rest || "").split(" ").filter(Boolean);
+  const tries = [];
+  // a command further in ("... hey play golden hour")
+  const at = w.findIndex((x, i) => i > 0 && ["play", "queue", "add"].includes(EARS_ALIKE[x] || x));
+  if (at > 0 && at < w.length - 1) tries.push({ words: w.slice(at + 1), later: (EARS_ALIKE[w[at]] || w[at]) !== "play", plus: 0.1 });
+  for (let drop = 0; drop <= Math.min(2, w.length - 1); drop++) tries.push({ words: w.slice(drop), later: false, plus: -0.03 * drop });
+  let best = null;
+  for (const t of tries) {
+    const hit = earsFindSaid(t.words.join(" "));
+    if (!hit) continue;
+    // one loose word is not much to go on: it has to be a whole title, or a long word only one song has
+    if (t.words.length < 2 && earsTokens(hit.title).join(" ") !== t.words[0]
+      && !(t.words[0].length >= 6 && earsWordCounts().df.get(t.words[0]) === 1)) continue;
+    const s = hit.score + t.plus;
+    if (!best || s > best.s) best = { s, hit, later: t.later };
+  }
+  return best && best.s >= 0.75 ? best : null;
+}
+// What was meant, from everything the recognizer thinks it could have been (the likeliest first): the
+// likeliest when it makes full sense; else the song that fits best among all of them; else a plain command
+// one of the others holds; else the likeliest as it is.
+function earsUnderstand(texts) {
+  let first = null, song = null, simple = null;
+  for (let rank = 0; rank < texts.length; rank++) {
+    const cmd = earsParse(texts[rank]);
+    if (!cmd) continue;
+    if (!first) { first = cmd; if (cmd.cmd === "wake") return cmd; }
+    if (cmd.cmd === "wake") continue;
+    const less = rank * 0.02;
+    if (cmd.cmd === "play") {
+      const hit = earsFindSaid(cmd.said);
+      if (hit && rank === 0 && hit.score >= 0.8) return { ...cmd, hit };
+      if (hit && (!song || hit.score - less > song.s)) song = { s: hit.score - less, cmd: { ...cmd, hit } };
+    } else if (cmd.cmd === "unknown") {
+      const g = earsGuess(cmd.rest);
+      if (g && (!song || g.s - 0.1 - less > song.s)) song = { s: g.s - 0.1 - less, cmd: { cmd: "play", said: cmd.rest, later: g.later, hit: g.hit, guessed: true } };
+    } else if (rank === 0) return cmd;
+    else if (!simple) simple = cmd;
+  }
+  return song ? song.cmd : simple || first;
 }
 // the bot heard (or was typed) something with "Sour Box" in it
 async function botHeard(m) {
   const who = clean1((m.user && m.user.name) || "Someone", 40);
-  const cmd = earsParse(m.text);
-  if (!cmd || (!m.typed && !config.botEars)) return;
+  const texts = [m.text, ...(Array.isArray(m.alts) ? m.alts : [])].map((t) => String(t || "")).filter(Boolean).slice(0, 12);
+  if (!m.typed && !config.botEars) return;
+  const cmd = earsUnderstand(texts);
+  if (!cmd) return;
   const note = (did) => { EARS.last = [{ at: Date.now(), by: who, text: clean1(m.text, 160), did, typed: !!m.typed }, ...EARS.last].slice(0, 12); };
   const say = (text) => botCall("say", { text, reply: m.reply }).catch(() => {});
   try {
@@ -953,12 +1151,12 @@ async function botHeard(m) {
       return say("I'm not in a voice channel yet: put me in one from Sour Player (Discord Bot) first.");
     }
     if (cmd.cmd === "play") {
-      const hit = earsFind(cmd.query, cmd.artist);
-      if (!hit) { note(`found nothing for "${cmd.query}"`); return say(`I couldn't find "${cmd.query}"${cmd.artist ? ` by ${cmd.artist}` : ""}.`); }
-      if (!hit.duration) hit.duration = await botDuration(hit.file).catch(() => 0);
-      if (cmd.later) await botCall("enqueue", { items: [hit], next: false });
-      else await botCall("play", { items: [hit], start: 0 });
-      note(`${cmd.later ? "queued" : "played"} ${hit.title}`);
+      const hit = cmd.hit || earsFindSaid(cmd.said);
+      if (!hit) { note(`found nothing for "${cmd.said}"`); return say(`I couldn't find "${cmd.said}".`); }
+      const track = { id: hit.id, title: hit.title, artist: hit.artist, duration: hit.duration || await botDuration(hit.file).catch(() => 0), file: hit.file };
+      if (cmd.later) await botCall("enqueue", { items: [track], next: false });
+      else await botCall("play", { items: [track], start: 0 });
+      note(`${cmd.later ? "queued" : "played"} ${hit.title}${cmd.guessed ? " (its best guess)" : ""}`);
       return say(`${cmd.later ? "Queued" : "Playing"} ${hit.title}${hit.artist ? ` - ${hit.artist}` : ""} (asked by ${who})`);
     }
     const act = { pause: ["pause", "Paused"], resume: ["resume", "Playing"], skip: ["skip", "Skipped"], previous: ["previous", "Back one"], stop: ["stopMusic", "Stopped"] }[cmd.cmd];
@@ -973,6 +1171,34 @@ async function botHeard(m) {
 // video into a call themselves - Discord doesn't let them.
 let WATCH_PAGE = "";
 try { WATCH_PAGE = fs.readFileSync(path.join(__dirname, "watch.html"), "utf8"); } catch { WATCH_PAGE = "<p>The watch page comes with Hermes Music 3.17.</p>"; }
+// ---------- (3.17.1) a song starts in the bot's voice channel: the link of its music video goes into that
+// channel's chat. The video is the one saved for the song (the same the video window shows); a song without
+// one is looked for once, the way the video manager does. Switched off in the Discord Bot tab.
+const botLinks = { last: "", posted: false, note: "", looking: new Set() };
+const mdPlain = (s) => String(s || "").replace(/([\\*_~`|])/g, "\\$1");
+async function botSongStarted(item) {
+  if (!item || !item.title || !(bot.state && bot.state.voice)) return;
+  const key = songKey(item.artist || "", item.title);
+  if (config.botLinks !== false && !videos[key] && !videoMisses[key] && !botLinks.looking.has(key) && ready()) {
+    botLinks.looking.add(key);
+    try { await findOneVideo(item.artist || "", item.title); } catch {} finally { botLinks.looking.delete(key); }
+  }
+  // a moment, so skipping through songs doesn't fill the chat (and the bot's own report of the song is in)
+  await new Promise((ok) => setTimeout(ok, Number(process.env.HERMES_BOT_LINK_WAIT) || 1500));
+  const s = bot.state, cur = s && s.music && s.music.current;
+  if (!s || !s.voice || !cur || cur.id !== item.id) return; // another song by now, or the bot left
+  const mark = `${s.voice.channelId}|${item.id}`;
+  const again = botLinks.last === mark; // the song that started there last, once more
+  botLinks.last = mark;
+  const v = videos[key];
+  if (config.botLinks === false || !v || !/^[\w-]{11}$/.test(String(v.videoId || ""))) { botLinks.posted = false; return; }
+  if (again && botLinks.posted) return; // its link is the last thing posted there already
+  botLinks.posted = true;
+  try {
+    await botCall("post", { text: `🎬 **${mdPlain(item.title)}**${item.artist ? ` · ${mdPlain(item.artist)}` : ""}\nhttps://www.youtube.com/watch?v=${v.videoId}` });
+    botLinks.note = "";
+  } catch (e) { botLinks.note = e.message; botLinks.posted = false; }
+}
 function botNow() {
   const s = bot.state, m = s && s.music, cur = m && m.current;
   const out = { online: !!(s && s.online), channel: s && s.voice ? s.voice.channelName : null, current: null, position: 0, paused: true, video: null };
@@ -1007,14 +1233,20 @@ async function botDo(b) {
   const one = (id) => botResolve([id])[0];
   switch (a) {
     case "join": return botCall("join", { guildId: String(b.guildId || ""), channelId: String(b.channelId || "") }, 30000);
-    case "play": return botCall("play", { items: botResolve(b.ids), start: Number(b.start) || 0 });
+    case "play": return botCall("play", { items: await botLengths(botResolve(b.ids)), start: Number(b.start) || 0 });
+    case "playSongs": { // (3.17.1) songs of the music library, from where they are
+      const items = botSongs(b.songs);
+      if (b.shuffle != null) await botCall("shuffle", { on: !!b.shuffle });
+      return botCall("play", { items: await botLengths(items), start: Math.min(items.length - 1, Math.max(0, Number(b.start) || 0)) });
+    }
+    case "enqueueSongs": return botCall("enqueue", { items: await botLengths(botSongs(b.songs)), next: !!b.next });
     case "playlist": {
       const pl = botLib.playlists.find((x) => x.id === b.id);
       if (!pl) throw new Error("that playlist is gone");
       await botCall("shuffle", { on: !!b.shuffle });
       return botCall("play", { items: botResolve(pl.items), start: 0 });
     }
-    case "enqueue": return botCall("enqueue", { items: botResolve(b.ids), next: !!b.next });
+    case "enqueue": return botCall("enqueue", { items: await botLengths(botResolve(b.ids)), next: !!b.next });
     case "ambience": case "sfx": {
       const it = one(b.id);
       if (!it) throw new Error("that sound is gone");
@@ -1056,7 +1288,12 @@ async function botRoute(req, res, p, url) {
       }
       case "/api/discord-bot/heard": // tests: as if someone had said (or typed) this
         if (!EARS_FAKE) return send(res, 404, { error: "not found" });
-        await botHeard({ user: { id: "test", name: me.name }, text: String(b.text || ""), typed: !!b.typed });
+        await botHeard({ user: { id: "test", name: me.name }, text: String(b.text || ""), alts: Array.isArray(b.alts) ? b.alts : [], typed: !!b.typed });
+        return send(res, 200, botStateView());
+      case "/api/discord-bot/songs": return send(res, 200, { songs: botSearchLibrary(String(b.q || "")) }); // (3.17.1) the music library, for the bot to play
+      case "/api/discord-bot/links": // (3.17.1) the music video's link in the chat of the voice channel: on or off
+        config.botLinks = !!b.on;
+        fs.writeFileSync(CFG, JSON.stringify(config, null, 1));
         return send(res, 200, botStateView());
       case "/api/discord-bot/copy": {
         const added = await botCopySongs(b.songs, b.kind, me.name, b.playlist);
@@ -4673,7 +4910,21 @@ function opensForEveryone(publishedAt, tz = groupTz()) {
   const day = Date.UTC(local.getUTCFullYear(), local.getUTCMonth(), local.getUTCDate());
   return day + ((6 - new Date(day).getUTCDay() + 7) % 7) * 86400000 + tz * 60000;
 }
-const releaseOpen = (rel, now = Date.now()) => !verNewer(rel.tag_name, FIRST_STAGED) || now >= opensForEveryone(rel.published_at);
+// (3.17.1) Held back or not goes by the line (0.17, 0.18...): a line opens for everyone on the first Saturday
+// on or after the day its first release came out, and its later releases (0.17.1...) are open the moment the
+// line is - a small update to a version everyone has needs no test week. Lines up to FIRST_STAGED's are never
+// held back, and neither is a release whose notes carry <!-- no-wait -->.
+const NO_WAIT = /<!--\s*no-wait\s*-->/i;
+const lineOf = (v) => verParts(v).slice(0, 2).join(".");
+const lineNewer = (a, b) => verNewer(lineOf(a), lineOf(b));
+const ownOpensAt = (rel) => (NO_WAIT.test(String(rel.body || "")) ? 0 : opensForEveryone(rel.published_at));
+function releaseOpensAt(rel, list = []) {
+  if (!lineNewer(rel.tag_name, FIRST_STAGED)) return 0;
+  const line = lineOf(rel.tag_name);
+  return Math.min(ownOpensAt(rel), ...list.filter((x) => x !== rel && lineOf(x.tag_name) === line && !verNewer(x.tag_name, rel.tag_name)).map(ownOpensAt));
+}
+const releaseOpen = (rel, list, now = Date.now()) => now >= releaseOpensAt(rel, list);
+let webList = []; // the computer releases GitHub listed last (newest first)
 let webRings = { newest: null, everyone: null, at: 0 }; // { tag, publishedAt, opensAt } of each, for /api/updates
 const webVersion = (dir) => { try { return fs.readFileSync(path.join(dir, ".version"), "utf8").split(":")[0]; } catch { return ""; } };
 let webChecking = false;
@@ -4713,8 +4964,9 @@ async function updateWebApp() {
       .sort((a, b) => (verNewer(a.tag_name, b.tag_name) ? -1 : verNewer(b.tag_name, a.tag_name) ? 1 : 0));
     if (!web.length) return;
     const newest = web[0];
-    const open = web.find((x) => releaseOpen(x)) || web[web.length - 1];
-    const ring = (x) => ({ tag: x.tag_name, version: x.tag_name.replace(/^v/, ""), publishedAt: new Date(x.published_at).getTime() || 0, opensAt: verNewer(x.tag_name, FIRST_STAGED) ? opensForEveryone(x.published_at) : 0 });
+    webList = web;
+    const open = web.find((x) => releaseOpen(x, web)) || web[web.length - 1];
+    const ring = (x) => ({ tag: x.tag_name, version: x.tag_name.replace(/^v/, ""), publishedAt: new Date(x.published_at).getTime() || 0, opensAt: releaseOpensAt(x, web) });
     webRings = { newest: ring(newest), everyone: ring(open), at: Date.now() };
     // everyone's copy never goes back to an older release (a Hermes Music updated in the middle of a week)
     const have = webVersion(WEB_DIR);
@@ -4794,13 +5046,13 @@ const testId = (text) => "t" + crypto.createHash("sha1").update(String(text)).di
 async function testList(version) {
   const had = testLists.get(version);
   if (had && Date.now() - had.at < 10 * 60000) return had;
-  let out = { at: Date.now(), items: [], publishedAt: 0 };
+  let out = { at: Date.now(), items: [], publishedAt: 0, noWait: false };
   try {
     const r = await fetch(`${RELEASES_URL}/tags/v${encodeURIComponent(version)}`, { headers: { "user-agent": "hermes-music" }, signal: AbortSignal.timeout(15000) });
     const rel = r.ok ? await r.json() : null;
     const m = rel && /<!--\s*test-log\s*([\s\S]*?)-->/.exec(String(rel.body || ""));
     const list = m ? JSON.parse(m[1]) : [];
-    out = { at: Date.now(), publishedAt: rel ? new Date(rel.published_at).getTime() || 0 : 0,
+    out = { at: Date.now(), publishedAt: rel ? new Date(rel.published_at).getTime() || 0 : 0, noWait: !!rel && NO_WAIT.test(String(rel.body || "")),
       items: (Array.isArray(list) ? list : []).slice(0, 80).map((x) => ({ id: /^[\w-]{1,24}$/.test(String(x.id || "")) ? String(x.id) : testId(x.text), area: clean1(x.area, 40), text: clean1(x.text, 300),
         on: Array.isArray(x.on) ? x.on.map((o) => clean1(o, 12)).slice(0, 5) : [] })).filter((x) => x.text) };
   } catch (e) {
@@ -4841,8 +5093,10 @@ async function testLogRoute(req, res, p, get, post, url) {
   }
   const marks = {};
   for (const [id, by] of Object.entries(testMarks[version] || {})) marks[id] = Object.entries(by).map(([profile, x]) => ({ profile, name: x.name, ok: x.ok, note: x.note, at: x.at, on: x.on }));
-  const staged = verNewer(version, FIRST_STAGED);
-  const opensAt = staged && list.publishedAt ? opensForEveryone(list.publishedAt) : 0;
+  // (3.17.1) when this version opens for everyone goes by its line (see releaseOpensAt)
+  const mine = webList.find((x) => x.tag_name === `v${version}`)
+    || { tag_name: `v${version}`, published_at: list.publishedAt ? new Date(list.publishedAt).toISOString() : "", body: list.noWait ? "<!-- no-wait -->" : "" };
+  const opensAt = releaseOpensAt(mine, webList);
   return send(res, 200, { version, items: list.items, marks, opensAt, early: !!opensAt && Date.now() < opensAt });
 }
 
